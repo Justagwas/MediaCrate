@@ -71,10 +71,13 @@ class MediaDownloader:
             'disable_warnings': False,
             'allow_batch_downloads': False,
             'disable_already_downloaded_prompts': False,
+            'auto_check_updates': True,
             'download_location': self._default_download_dir(),
             'batch_concurrency': self._default_batch_concurrency(),
             'batch_retry_attempts': 1,
-            'preserve_batch_links': False
+            'preserve_batch_links': False,
+            'max_batch_lines': self._default_batch_line_limit(),
+            'disable_char_limits': False
         }
         if os.path.exists(self.config_path):
             try:
@@ -84,6 +87,7 @@ class MediaDownloader:
                     if k not in config:
                         config[k] = v
                 config['batch_concurrency'] = self._normalize_batch_concurrency(config.get('batch_concurrency'))
+                config['max_batch_lines'] = self._normalize_batch_line_limit(config.get('max_batch_lines'))
                 self.config = config
             except Exception:
                 self.config = default_config
@@ -106,6 +110,9 @@ class MediaDownloader:
     def _default_batch_concurrency(self):
         cpu_count = os.cpu_count() or 2
         return max(2, min(8, cpu_count))
+
+    def _default_batch_line_limit(self):
+        return 64
 
     def _default_download_dir(self):
         return os.path.join(os.path.expanduser("~"), "Downloads", "MediaCrate")
@@ -133,6 +140,13 @@ class MediaDownloader:
         except (TypeError, ValueError):
             return self._default_batch_concurrency()
         return max(1, min(16, value))
+
+    def _normalize_batch_line_limit(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return self._default_batch_line_limit()
+        return max(1, min(1024, value))
 
     def _normalize_batch_retries(self, value):
         try:
@@ -237,16 +251,67 @@ class MediaDownloader:
         self.run_on_ui_thread(self._mark_progress_complete)
 
     def _mark_progress_complete(self):
-        if self.progress:
-            self.progress.configure(style="Modern.Complete.Horizontal.TProgressbar")
-            self.progress["value"] = 100
-            self.progress.update_idletasks()
+        if self.progress and isinstance(self.progress, tk.Canvas):
+            self._set_progress_style("complete")
+            self._set_progress_value(100)
+            self._set_progress_text("100%")
 
     def _reset_progress_bar(self):
-        if self.progress:
-            self.progress.configure(style="Modern.Horizontal.TProgressbar")
-            self.progress["value"] = 0
-            self.progress.update_idletasks()
+        if self.progress and isinstance(self.progress, tk.Canvas):
+            self._set_progress_style("normal")
+            self._set_progress_value(0)
+            self._set_progress_text("0%")
+
+    def _set_progress_text(self, text):
+        if self._last_progress_text == text:
+            return
+        self._last_progress_text = text
+        self._update_progress_canvas()
+
+    def _set_progress_value(self, value):
+        try:
+            val = float(value)
+        except Exception:
+            val = 0.0
+        val = max(0.0, min(100.0, val))
+        if getattr(self, "_progress_value", None) == val:
+            return
+        self._progress_value = val
+        self._update_progress_canvas()
+
+    def _set_progress_style(self, style_name):
+        if not self.progress or not isinstance(self.progress, tk.Canvas):
+            return
+        theme = self.theme
+        if style_name == "complete":
+            self._progress_fill_color = theme["success"]
+        elif style_name == "disabled":
+            self._progress_fill_color = theme["disabled_fg"]
+        else:
+            self._progress_fill_color = theme["accent"]
+        self._update_progress_canvas()
+
+    def _update_progress_canvas(self):
+        canvas = self.progress
+        if not canvas or not isinstance(canvas, tk.Canvas) or not canvas.winfo_exists():
+            return
+        if not getattr(self, "progress_fill_id", None) or not getattr(self, "progress_text_id", None):
+            return
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        value = getattr(self, "_progress_value", 0.0)
+        fill_width = int(width * (value / 100.0))
+        canvas.coords(self.progress_fill_id, 0, 0, fill_width, height)
+        canvas.itemconfig(self.progress_fill_id, fill=self._progress_fill_color)
+        canvas.coords(self.progress_text_id, width / 2, height / 2)
+        text = self._last_progress_text
+        if text is None:
+            text = f"{int(value)}%"
+        canvas.itemconfig(self.progress_text_id, text=text)
+        text_color = self.theme["bg"] if value >= 50 else self.theme["text"]
+        canvas.itemconfig(self.progress_text_id, fill=text_color)
 
     def _is_descendant(self, widget, ancestor):
         try:
@@ -304,7 +369,7 @@ class MediaDownloader:
                 self._transitioning = False
                 return
             if i < steps:
-                self.root.after(delay, lambda: step(i + 1))
+                self._after(delay, lambda: step(i + 1))
             else:
                 try:
                     overlay = getattr(self, "_transition_overlay", None)
@@ -454,23 +519,45 @@ class MediaDownloader:
         btn.bind("<Leave>", on_leave)
 
     def run_on_ui_thread(self, func, *args, **kwargs):
-        if threading.current_thread() is threading.main_thread():
+        if threading.current_thread() is threading.main_thread() and not getattr(self, "_resizing_ui", False):
             func(*args, **kwargs)
         else:
             self.gui_queue.put(lambda: func(*args, **kwargs))
+            self._schedule_gui_poll()
+
+    def _after(self, delay_ms, callback, *, widget=None):
+        target = widget or self.root
+        safe_delay = max(8, int(delay_ms))
+        return target.after(safe_delay, callback)
 
     def process_gui_queue(self):
+        if not self.status_polling:
+            self._gui_poll_scheduled = False
+            return
         try:
-            while True:
+            processed = 0
+            max_tasks = self._max_gui_tasks_per_tick
+            while processed < max_tasks:
                 func = self.gui_queue.get_nowait()
                 try:
                     func()
                 except Exception as e:
                     logging.error(f"Error running UI task: {e}")
+                processed += 1
         except queue.Empty:
             pass
-        if self.status_polling:
-            self.root.after(50, self.process_gui_queue)
+        if not self.gui_queue.empty():
+            self._after(20, self.process_gui_queue)
+        else:
+            self._gui_poll_scheduled = False
+
+    def _schedule_gui_poll(self):
+        if not self.status_polling:
+            return
+        if self._gui_poll_scheduled:
+            return
+        self._gui_poll_scheduled = True
+        self._after(16, self.process_gui_queue)
 
     def __init__(self, root):
         self.load_config()
@@ -486,18 +573,36 @@ class MediaDownloader:
             "mono": ("Cascadia Mono", 10),
         }
         self._geometry_initialized = False
-        self._geometry_mode = None
         self._active_part_targets = set()
         self._active_part_lock = threading.Lock()
         self._abort_notified = False
         self._percent_started = False
         self._batch_saved_links = None
         self._batch_wheel_bound = False
+        self._batch_min_extra = 240
+        self._resize_wrap_job = None
+        self._resize_wrap_active = False
+        self._console_wrap_before_resize = None
+        self._resizing_ui = False
+        self._last_progress_text = None
+        self._progress_value = 0.0
+        self._progress_fill_color = self.theme["accent"]
+        self._closing = False
         self.root.title("MediaCrate") #Version 1.0.0
         self.root.configure(bg=self.theme["bg"])
         self.root.resizable(True, True)
         self.configure_styles()
         self.configure_geometry(prefer_tall=self.config.get('allow_batch_downloads', False))
+        self._last_user_size = None
+        self._ignore_resize = False
+        self._gui_poll_scheduled = False
+        self._status_poll_scheduled = False
+        self._progress_poll_scheduled = False
+        self._max_gui_tasks_per_tick = 50
+        self._max_status_tasks_per_tick = 50
+        self._max_progress_updates_per_tick = 50
+        self.root.bind("<Configure>", self._on_root_configure)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self.status_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         self.gui_queue = queue.Queue()
@@ -505,10 +610,8 @@ class MediaDownloader:
         self.status_polling = True
         self.ydl = None
         self.abort_event = threading.Event()
-        self.root.after(100, self.poll_status_queue)
-        self.root.after(50, self.process_gui_queue)
         self.show_splash()
-        self.root.after(100, self.deferred_startup)
+        self._after(100, self.deferred_startup)
 
     def center_window(self, width, height):
         self.root.update_idletasks()
@@ -517,21 +620,97 @@ class MediaDownloader:
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def configure_geometry(self, prefer_tall=False):
+        min_w, min_h = self._base_minsize()
+        self.root.minsize(min_w, min_h)
+        if not self._geometry_initialized:
+            self._set_geometry_safe(min_w, min_h, center=True)
+            self._geometry_initialized = True
+            self._last_user_size = (min_w, min_h)
+
+    def _base_minsize(self):
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        target_w = int(max(600, min(960, screen_w * 0.50)))
-        if prefer_tall:
-            target_h = int(max(600, min(900, screen_h * 0.68)))
-            min_h = int(max(500, screen_h * 0.45))
+        min_w = int(max(480, screen_w * 0.3)) + 80
+        min_h = int(max(500, screen_h * 0.45))
+        return min_w, min_h
+
+    def _set_geometry_safe(self, width, height, *, center=False, manage_ignore=True):
+        if manage_ignore:
+            self._ignore_resize = True
+        if center:
+            self.center_window(width, height)
         else:
-            target_h = int(max(600, min(600, screen_h * 0.60)))
-            min_h = int(max(500, screen_h * 0.45))
-        min_w = int(max(480, screen_w * 0.3))
-        self.root.minsize(min_w, min_h)
-        if not self._geometry_initialized or self._geometry_mode != prefer_tall:
-            self.center_window(target_w, target_h)
-            self._geometry_initialized = True
-            self._geometry_mode = prefer_tall
+            self.root.geometry(f"{width}x{height}")
+        if manage_ignore:
+            self._after(120, lambda: setattr(self, "_ignore_resize", False))
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root:
+            return
+        if self._ignore_resize:
+            return
+        if self.root.state() != "normal":
+            return
+        if event.width < 1 or event.height < 1:
+            return
+        new_size = (event.width, event.height)
+        if self._last_user_size == new_size:
+            return
+        self._last_user_size = new_size
+        self._begin_resize_wrap()
+
+    def _begin_resize_wrap(self):
+        self._resizing_ui = True
+        if not self._resize_wrap_active:
+            self._set_console_wrap_during_resize(True)
+        if self._resize_wrap_job:
+            self.root.after_cancel(self._resize_wrap_job)
+        self._resize_wrap_job = self._after(200, self._end_resize_wrap)
+
+    def _end_resize_wrap(self):
+        self._resize_wrap_job = None
+        self._set_console_wrap_during_resize(False)
+        self._resizing_ui = False
+
+    def _set_console_wrap_during_resize(self, active):
+        console = getattr(self, "console", None)
+        console_frame = getattr(self, "console_frame", None)
+        if not console or not console.winfo_exists():
+            self._resize_wrap_active = False
+            return
+        if not console_frame or not console_frame.winfo_exists():
+            self._resize_wrap_active = False
+            return
+        try:
+            if active:
+                if not self._resize_wrap_active:
+                    self._console_wrap_before_resize = console.cget("wrap")
+                    self._resize_wrap_active = True
+                if console.cget("wrap") != "none":
+                    console.config(wrap="none")
+            else:
+                if self._resize_wrap_active:
+                    console.config(wrap=self._console_wrap_before_resize or "word")
+                self._resize_wrap_active = False
+        except Exception:
+            self._resize_wrap_active = False
+
+    def _apply_window_constraints(self, *, min_extra=0):
+        min_w, min_h = self._base_minsize()
+        target_min_h = min_h + min_extra
+        self._ignore_resize = True
+        self.root.minsize(min_w, target_min_h)
+        if self._last_user_size:
+            target_w = max(self._last_user_size[0], min_w)
+            target_h = max(self._last_user_size[1], target_min_h)
+        else:
+            target_w = max(self.root.winfo_width(), min_w)
+            target_h = max(self.root.winfo_height(), target_min_h)
+        current_w = self.root.winfo_width()
+        current_h = self.root.winfo_height()
+        if target_w != current_w or target_h != current_h:
+            self._set_geometry_safe(target_w, target_h, manage_ignore=False)
+        self._after(120, lambda: setattr(self, "_ignore_resize", False))
 
     def configure_styles(self):
         theme = self.theme
@@ -661,6 +840,20 @@ class MediaDownloader:
             background=[("active", theme["surface_alt_hover"]), ("pressed", theme["surface_alt_hover"])],
             arrowcolor=[("active", theme["text"]), ("pressed", theme["text"])],
         )
+        style.configure(
+            "Modern.Horizontal.TScrollbar",
+            background=theme["surface_alt"],
+            troughcolor=theme["surface"],
+            bordercolor=theme["border"],
+            arrowcolor=theme["text"],
+            lightcolor=theme["surface_alt"],
+            darkcolor=theme["surface_alt"],
+        )
+        style.map(
+            "Modern.Horizontal.TScrollbar",
+            background=[("active", theme["surface_alt_hover"]), ("pressed", theme["surface_alt_hover"])],
+            arrowcolor=[("active", theme["text"]), ("pressed", theme["text"])],
+        )
         self.root.option_add("*TCombobox*Listbox*Background", theme["surface"])
         self.root.option_add("*TCombobox*Listbox*Foreground", theme["text"])
         self.root.option_add("*TCombobox*Listbox*selectBackground", theme["accent"])
@@ -710,10 +903,10 @@ class MediaDownloader:
         def on_resize(event):
             if getattr(footer, "_resize_job", None):
                 footer.after_cancel(footer._resize_job)
-            footer._resize_job = footer.after(60, lambda: layout(event.width < min_width))
+            footer._resize_job = self._after(60, lambda: layout(event.width < min_width), widget=footer)
 
         footer.bind("<Configure>", on_resize)
-        footer.after(0, lambda: layout(footer.winfo_width() < min_width))
+        self._after(0, lambda: layout(footer.winfo_width() < min_width), widget=footer)
 
     def show_splash(self):
         theme = self.theme
@@ -730,7 +923,8 @@ class MediaDownloader:
         self.set_icon()
         def after_ffmpeg():
             def after_nodejs():
-                self.check_for_updates()
+                if self.config.get('auto_check_updates', True):
+                    self.check_for_updates()
                 self.show_main_ui()
             self._nodejs_callback = after_nodejs
             self.check_nodejs()
@@ -741,6 +935,10 @@ class MediaDownloader:
         if getattr(self, 'splash_frame', None):
             self.splash_frame.destroy()
         self.create_widgets()
+        is_batch = self.config.get('allow_batch_downloads', False)
+        self._after(0, lambda: self._apply_window_constraints(
+            min_extra=self._batch_min_extra if is_batch else 0
+        ))
 
     def set_icon(self):
         if not self._is_windows():
@@ -800,10 +998,10 @@ class MediaDownloader:
         ffmpeg_in_script_dir = os.path.exists(ffmpeg_path)
         ffmpeg_in_path = self.is_ffmpeg_installed()
         if not ffmpeg_in_script_dir and not ffmpeg_in_path:
-            self.root.after(0, lambda: self.prompt_ffmpeg_download(callback=getattr(self, '_ffmpeg_callback', None)))
+            self._after(0, lambda: self.prompt_ffmpeg_download(callback=getattr(self, '_ffmpeg_callback', None)))
         else:
             if hasattr(self, '_ffmpeg_callback') and self._ffmpeg_callback:
-                self.root.after(0, self._ffmpeg_callback)
+                self._after(0, self._ffmpeg_callback)
 
     def check_nodejs(self):
         node_name = "node.exe" if self._is_windows() else "node"
@@ -811,10 +1009,10 @@ class MediaDownloader:
         node_in_script_dir = os.path.exists(node_path)
         node_in_path = shutil.which("node") is not None
         if not node_in_script_dir and not node_in_path:
-            self.root.after(0, lambda: self.prompt_nodejs_download(callback=getattr(self, '_nodejs_callback', None)))
+            self._after(0, lambda: self.prompt_nodejs_download(callback=getattr(self, '_nodejs_callback', None)))
         else:
             if hasattr(self, '_nodejs_callback') and self._nodejs_callback:
-                self.root.after(0, self._nodejs_callback)
+                self._after(0, self._nodejs_callback)
 
     def is_ffmpeg_installed(self):
         ffmpeg_name = "ffmpeg.exe" if self._is_windows() else "ffmpeg"
@@ -986,7 +1184,7 @@ class MediaDownloader:
             self.proceed_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(self.proceed_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
             cancel_button = tk.Button(
-                button_frame, text="Cancel", command=self.abort,
+                button_frame, text="Cancel", command=on_confirm,
                 font=fonts["button"],
                 bg=theme["danger"], fg=theme["bg"],
                 activebackground=theme["danger_hover"], activeforeground=theme["bg"],
@@ -1058,7 +1256,7 @@ class MediaDownloader:
             ).pack(pady=10)
 
             ok_button = tk.Button(
-                self.root, text="OK", command=self.abort,
+                self.root, text="OK", command=self.terminate_program,
                 font=fonts["button"],
                 bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
@@ -1332,9 +1530,11 @@ class MediaDownloader:
             self._begin_transition()
         self._ensure_view_container()
         if not force_rebuild and getattr(self, "_main_built", False):
+            is_batch = self.config.get('allow_batch_downloads', False)
+            self._apply_window_constraints(min_extra=self._batch_min_extra if is_batch else 0)
             if switch_view:
                 self._show_view("main")
-                self.root.after(0, self._fade_in)
+                self._after(0, self._fade_in)
             return
 
         saved_url_entry = None
@@ -1417,8 +1617,10 @@ class MediaDownloader:
             url_text_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
             url_text_frame.configure(height=360)
             url_text_frame.pack_propagate(False)
+            url_text_frame.grid_columnconfigure(0, weight=1)
+            url_text_frame.grid_rowconfigure(0, weight=1)
             text_row = tk.Frame(url_text_frame, bg=theme["surface_alt"])
-            text_row.pack(fill=tk.BOTH, expand=True, padx=3, pady=6)
+            text_row.grid(row=0, column=0, sticky="nsew", padx=3, pady=(6, 0))
             self.url_text_frame = url_text_frame
             self.batch_line_numbers = tk.Text(
                 text_row,
@@ -1436,12 +1638,6 @@ class MediaDownloader:
             self.batch_line_numbers.pack(side=tk.LEFT, fill=tk.Y)
             self.batch_line_numbers.bind("<Button-1>", lambda e: "break")
             self.batch_line_numbers.bind("<Key>", lambda e: "break")
-            self.batch_url_scrollbar = ttk.Scrollbar(
-                text_row,
-                orient="vertical",
-                style="Modern.Vertical.TScrollbar"
-            )
-            self.batch_url_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             self.url_text = tk.Text(
                 text_row,
                 font=fonts["body"],
@@ -1453,7 +1649,7 @@ class MediaDownloader:
                 relief="flat",
                 bd=0,
                 height=4,
-                wrap="word",
+                wrap="none",
                 highlightthickness=0,
                 undo=True,
                 autoseparators=True,
@@ -1465,6 +1661,7 @@ class MediaDownloader:
                 text_seed = self._batch_saved_links or ""
             if text_seed:
                 self.url_text.insert("1.0", text_seed)
+            self._apply_batch_text_limits()
             def update_line_numbers():
                 if not self.url_text.winfo_exists():
                     return
@@ -1481,18 +1678,44 @@ class MediaDownloader:
                     self.batch_line_numbers.yview_moveto(first)
                 except Exception:
                     pass
-                if getattr(self, "batch_url_scrollbar", None):
-                    try:
-                        self.batch_url_scrollbar.set(first, last)
-                    except Exception:
-                        pass
             self.url_text.config(yscrollcommand=sync_line_numbers)
-            self.batch_url_scrollbar.config(command=self.url_text.yview)
+            def on_shift_mousewheel(event):
+                if event.delta:
+                    self.url_text.xview_scroll(int(-1*(event.delta/120)), "units")
+                elif event.num == 5:
+                    self.url_text.xview_scroll(1, "units")
+                elif event.num == 4:
+                    self.url_text.xview_scroll(-1, "units")
+                return "break"
+            def on_mousewheel(event):
+                if event.state & 0x1:
+                    return "break"
+                if event.delta:
+                    self.url_text.yview_scroll(int(-1*(event.delta/120)), "units")
+                elif event.num == 5:
+                    self.url_text.yview_scroll(1, "units")
+                elif event.num == 4:
+                    self.url_text.yview_scroll(-1, "units")
+                return "break"
+            self.url_text.bind("<MouseWheel>", on_mousewheel)
+            self.url_text.bind("<Button-4>", on_mousewheel)
+            self.url_text.bind("<Button-5>", on_mousewheel)
+            self.batch_line_numbers.bind("<MouseWheel>", on_mousewheel)
+            self.batch_line_numbers.bind("<Button-4>", on_mousewheel)
+            self.batch_line_numbers.bind("<Button-5>", on_mousewheel)
+            self.url_text.bind("<Shift-MouseWheel>", on_shift_mousewheel)
+            self.url_text.bind("<Shift-Button-4>", on_shift_mousewheel)
+            self.url_text.bind("<Shift-Button-5>", on_shift_mousewheel)
+            self.batch_line_numbers.bind("<Shift-MouseWheel>", on_shift_mousewheel)
+            self.batch_line_numbers.bind("<Shift-Button-4>", on_shift_mousewheel)
+            self.batch_line_numbers.bind("<Shift-Button-5>", on_shift_mousewheel)
             def on_text_modified(event):
+                self.url_text.edit_modified(False)
+                self._apply_batch_text_limits()
                 self.url_text.edit_modified(False)
                 update_line_numbers()
             self.url_text.bind("<<Modified>>", on_text_modified)
-            self.root.after(0, update_line_numbers)
+            self._after(0, update_line_numbers)
             self.paste_button = None
             self.batch_progress_frame = None
 
@@ -1505,15 +1728,27 @@ class MediaDownloader:
                     self.url_text.edit_separator()
                 except Exception:
                     pass
-                lines = clipboard.splitlines()
-                for line in lines:
+                max_lines = self._normalize_batch_line_limit(self.config.get('max_batch_lines'))
+                disable_limits = self.config.get('disable_char_limits', False)
+                existing = [line for line in self.url_text.get("1.0", "end-1c").splitlines() if line.strip()]
+                for line in clipboard.splitlines():
                     line = line.strip()
-                    if line:
-                        self.url_text.insert(tk.END, ("" if self.url_text.get("end-2c", "end-1c").strip() == "" else "\n") + line)
+                    if not line:
+                        continue
+                    if not disable_limits:
+                        line = line[:256]
+                    if len(existing) >= max_lines:
+                        break
+                    existing.append(line)
+                self.url_text.delete("1.0", tk.END)
+                if existing:
+                    self.url_text.insert("1.0", "\n".join(existing))
                 try:
                     self.url_text.edit_separator()
                 except Exception:
                     pass
+                self._apply_batch_text_limits()
+                update_line_numbers()
                 return "break"
             self.url_text.bind("<Control-v>", batch_paste_handler)
             self.url_text.bind("<Control-V>", batch_paste_handler)
@@ -1547,6 +1782,9 @@ class MediaDownloader:
                 first_line = next((line.strip() for line in saved_url_text.splitlines() if line.strip()), "")
                 if first_line:
                     self.url_entry.insert(0, first_line)
+            self.url_entry.bind("<KeyRelease>", lambda e: self._apply_single_url_limit())
+            self.url_entry.bind("<<Paste>>", lambda e: self._after(0, self._apply_single_url_limit))
+            self._apply_single_url_limit()
             self.paste_button = tk.Button(
                 url_input_row,
                 text="Paste",
@@ -1658,7 +1896,7 @@ class MediaDownloader:
         self.quality_combo.bind("<B1-Motion>", self._clear_combo_selection)
         self.quality_combo.bind("<FocusOut>", self._clear_combo_selection)
         self.update_quality_buttons()
-        self.root.after(0, lambda: self._sync_card_heights(format_card, quality_card))
+        self._after(0, lambda: self._sync_card_heights(format_card, quality_card))
         btn_row = tk.Frame(self.main_frame, bg=theme["bg"])
         btn_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         btn_row.grid_columnconfigure(0, weight=1, uniform="action")
@@ -1703,11 +1941,35 @@ class MediaDownloader:
             self.abort_button.config(state=tk.DISABLED, cursor="", bg=theme["disabled_bg"], fg=theme["disabled_fg"])
 
         if not is_batch:
-            self.progress = ttk.Progressbar(self.main_frame, mode="determinate", length=380, style="Modern.Horizontal.TProgressbar")
-            self.progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12), ipady=8)
-            self.progress["value"] = 0
+            self.progress = tk.Canvas(
+                self.main_frame,
+                height=36,
+                bg=theme["surface_alt"],
+                highlightthickness=1,
+                highlightbackground=theme["border"],
+                highlightcolor=theme["border"],
+                bd=0,
+                relief="flat"
+            )
+            self.progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12), ipady=4)
+            self._progress_value = 0.0
+            self._progress_fill_color = theme["accent"]
+            self.progress_fill_id = self.progress.create_rectangle(0, 0, 0, 0, fill=self._progress_fill_color, width=0)
+            self.progress_text_id = self.progress.create_text(
+                0,
+                0,
+                text="0%",
+                font=(fonts["caption"][0], fonts["caption"][1], "bold"),
+                fill=theme["text"]
+            )
+            self.progress.bind("<Configure>", lambda _e: self._update_progress_canvas())
+            self._last_progress_text = "0%"
+            self._update_progress_canvas()
         else:
             self.progress = None
+            self._last_progress_text = None
+            self.progress_fill_id = None
+            self.progress_text_id = None
 
         console_frame = tk.Frame(
             self.main_frame,
@@ -1716,13 +1978,8 @@ class MediaDownloader:
             highlightbackground=theme["border"],
             highlightcolor=theme["border"],
         )
+        self.console_frame = console_frame
         console_frame.grid(row=4, column=0, columnspan=2, sticky="nsew")
-        self.console_scrollbar = ttk.Scrollbar(
-            console_frame,
-            orient="vertical",
-            style="Modern.Vertical.TScrollbar",
-        )
-        self.console_scrollbar.pack(side="right", fill="y")
         self.console = tk.Text(
             console_frame,
             height=5,
@@ -1736,10 +1993,8 @@ class MediaDownloader:
             state="normal",
             wrap="word",
             font=fonts["mono"],
-            yscrollcommand=self.console_scrollbar.set,
         )
         self.console.pack(side="left", fill="both", expand=True)
-        self.console_scrollbar.config(command=self.console.yview)
         def _on_console_mousewheel(event):
             if event.delta:
                 self.console.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -1807,12 +2062,13 @@ class MediaDownloader:
         version_label.pack(side="right", anchor="e", padx=(0, 8))
         self._configure_footer(bottom_bar, bottom_left, bottom_right, min_width=540)
         self.enforce_min_size()
+        self._apply_window_constraints(min_extra=self._batch_min_extra if is_batch else 0)
         self.root.update_idletasks()
         if switch_view:
             self._show_view("main")
         self._main_built = True
         if switch_view:
-            self.root.after(0, self._fade_in)
+            self._after(0, self._fade_in)
 
     def update_format_buttons(self):
         theme = self.theme
@@ -1823,7 +2079,11 @@ class MediaDownloader:
                 btn.config(bg=theme["surface_alt"], fg=theme["text"])
 
     def show_main_view(self):
-        self.create_widgets(force_rebuild=False, switch_view=True)
+        force_rebuild = getattr(self, "_pending_batch_refresh", False)
+        self._pending_batch_refresh = False
+        self.create_widgets(force_rebuild=force_rebuild, switch_view=True)
+        is_batch = self.config.get('allow_batch_downloads', False)
+        self._apply_window_constraints(min_extra=self._batch_min_extra if is_batch else 0)
 
     def update_quality_buttons(self):
         is_audio = self.selected_format.get() in ("mp3", "wav")
@@ -1873,6 +2133,7 @@ class MediaDownloader:
         try:
             self.url_entry.delete(0, tk.END)
             self.url_entry.insert(0, self.root.clipboard_get())
+            self._apply_single_url_limit()
             theme = self.theme
             self._fade_entry_fg(self.url_entry, start_color=theme["accent"], end_color=theme["text"], steps=10, delay=40)
         except tk.TclError:
@@ -1894,7 +2155,7 @@ class MediaDownloader:
             )
             entry.config(fg=rgb_to_hex(curr_rgb))
             if i < steps:
-                entry.after(delay, lambda: step(i+1))
+                self._after(delay, lambda: step(i+1), widget=entry)
         step(0)
 
     def sanitize_filename(self, name):
@@ -1934,6 +2195,44 @@ class MediaDownloader:
         if not sanitized and show_error:
             messagebox.showerror("Invalid URL", "The link is invalid.")
         return sanitized
+
+    def _apply_single_url_limit(self):
+        if self.config.get('disable_char_limits', False):
+            return
+        entry = getattr(self, "url_entry", None)
+        if not entry or not entry.winfo_exists():
+            return
+        value = entry.get()
+        if len(value) > 512:
+            entry.delete(0, tk.END)
+            entry.insert(0, value[:512])
+
+    def _apply_batch_text_limits(self):
+        if getattr(self, "_batch_enforcing", False):
+            return
+        text = getattr(self, "url_text", None)
+        if not text or not text.winfo_exists():
+            return
+        self._batch_enforcing = True
+        try:
+            content = text.get("1.0", "end-1c")
+            lines = content.splitlines()
+            max_lines = self._normalize_batch_line_limit(self.config.get('max_batch_lines'))
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+            if not self.config.get('disable_char_limits', False):
+                lines = [line[:256] for line in lines]
+            new_content = "\n".join(lines)
+            if new_content != content:
+                insert_index = text.index(tk.INSERT)
+                text.delete("1.0", tk.END)
+                text.insert("1.0", new_content)
+                try:
+                    text.mark_set(tk.INSERT, insert_index)
+                except Exception:
+                    pass
+        finally:
+            self._batch_enforcing = False
 
     def _url_key(self, url):
         try:
@@ -1978,18 +2277,10 @@ class MediaDownloader:
     def start_download(self):
         theme = self.theme
         fonts = self.fonts
-        if self.progress:
-            self.progress["value"] = 0
-            style = ttk.Style(self.root)
-            style.configure(
-                "Modern.Horizontal.TProgressbar",
-                background=theme["accent"],
-                lightcolor=theme["accent"],
-                darkcolor=theme["accent"],
-                thickness=72,
-            )
-            self.progress.configure(style="Modern.Horizontal.TProgressbar")
-            self.progress.update_idletasks()
+        if self.progress and isinstance(self.progress, tk.Canvas):
+            self._set_progress_style("normal")
+            self._set_progress_value(0)
+            self._set_progress_text("0%")
         if self.console:
             self.console.delete(1.0, tk.END)
         self._drain_queue(self.progress_queue)
@@ -2003,6 +2294,9 @@ class MediaDownloader:
             urls = []
             if hasattr(self, 'url_text') and self.url_text.winfo_exists():
                 urls = [u.strip() for u in self.url_text.get("1.0", tk.END).splitlines() if u.strip()]
+            max_lines = self._normalize_batch_line_limit(self.config.get('max_batch_lines'))
+            if len(urls) > max_lines:
+                urls = urls[:max_lines]
             if not urls:
                 messagebox.showerror("Error", "Please enter one or more media URLs")
                 self.downloading = False
@@ -2047,8 +2341,6 @@ class MediaDownloader:
             window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.pack(side="left", fill="both", expand=True)
 
-            scrollbar = ttk.Scrollbar(self.batch_progress_frame, orient="vertical", style="Modern.Vertical.TScrollbar", command=canvas.yview)
-            canvas.configure(yscrollcommand=scrollbar.set)
             def _resize_canvas_window():
                 canvas.itemconfigure(window_id, width=canvas.winfo_width())
             def _apply_scrollregion():
@@ -2064,9 +2356,13 @@ class MediaDownloader:
             def _schedule_scrollregion(_event=None):
                 if getattr(canvas, "_scrollregion_job", None):
                     canvas.after_cancel(canvas._scrollregion_job)
-                canvas._scrollregion_job = canvas.after(60, _apply_scrollregion)
+                canvas._scrollregion_job = self._after(120, _apply_scrollregion, widget=canvas)
+            def _schedule_canvas_resize(_event=None):
+                if getattr(canvas, "_resize_job", None):
+                    canvas.after_cancel(canvas._resize_job)
+                canvas._resize_job = self._after(80, lambda: (_resize_canvas_window(), _schedule_scrollregion()), widget=canvas)
             scrollable_frame.bind("<Configure>", _schedule_scrollregion)
-            canvas.bind("<Configure>", lambda e: (_resize_canvas_window(), _schedule_scrollregion()))
+            canvas.bind("<Configure>", _schedule_canvas_resize)
             _resize_canvas_window()
             def _on_mousewheel(event):
                 if event.delta:
@@ -2132,10 +2428,8 @@ class MediaDownloader:
             self.root.update_idletasks()
             if len(urls) > 10:
                 canvas.config(height=target_height)
-                scrollbar.pack(side="right", fill="y")
             else:
                 canvas.config(height=min(32 * len(urls) + 10, target_height))
-                scrollbar.pack_forget()
 
             def check_links():
                 def fast_check():
@@ -2312,9 +2606,30 @@ class MediaDownloader:
                         self._batch_download_dir = media_dl_dir
                         self._batch_all_done = False
                         self._batch_done_set = set()
+                        batch_jobs_lock = threading.Lock()
+                        batch_jobs_remaining = 0
+
+                        def finalize_batch():
+                            if self._batch_all_done:
+                                return
+                            self.downloading = False
+                            self.set_controls_state(True)
+                            self._show_reset_button()
+                            self._batch_all_done = True
+                            self.append_console("Batch download finished.\n")
+
+                        def mark_batch_done():
+                            nonlocal batch_jobs_remaining
+                            with batch_jobs_lock:
+                                if batch_jobs_remaining <= 0:
+                                    return
+                                batch_jobs_remaining -= 1
+                                if batch_jobs_remaining == 0:
+                                    self.run_on_ui_thread(finalize_batch)
 
                         def batch_download_worker(idx, url, format_choice, quality_choice, safe_base):
                             if not url or not safe_base:
+                                mark_batch_done()
                                 return
                             max_attempts = self._normalize_batch_retries(self.config.get('batch_retry_attempts'))
                             def progress_hook(d):
@@ -2446,6 +2761,7 @@ class MediaDownloader:
                                 self._cleanup_temp_files(media_dl_dir, temp_base, max_attempts=60, delay=0.25)
                             finally:
                                 self._unregister_active_temp(media_dl_dir, temp_base)
+                                mark_batch_done()
 
                         def enqueue_jobs():
                             for idx, url in enumerate(valid_links):
@@ -2469,29 +2785,14 @@ class MediaDownloader:
 
                         jobs = queue.Queue()
                         enqueue_jobs()
-                        worker_count = min(self._normalize_batch_concurrency(self.config.get('batch_concurrency')), jobs.qsize())
+                        batch_jobs_remaining = jobs.qsize()
+                        if batch_jobs_remaining == 0:
+                            finalize_batch()
+                            return
+                        worker_count = min(self._normalize_batch_concurrency(self.config.get('batch_concurrency')), batch_jobs_remaining)
                         for _ in range(max(1, worker_count)):
                             t = threading.Thread(target=worker, daemon=True)
                             t.start()
-
-                        def check_all_done():
-                            if self.abort_event.is_set():
-                                return
-                            all_done = True
-                            for idx, lbl in enumerate(self.batch_status_labels):
-                                if (valid_links[idx] or idx in redownload_links):
-                                    if lbl.cget("text") not in ("Done", "Error", "Aborted"):
-                                        all_done = False
-                                        break
-                            if all_done:
-                                self.downloading = False
-                                self.set_controls_state(True)
-                                self._show_reset_button()
-                                self._batch_all_done = True
-                                self.append_console(f"Batch download finished.\n")
-                            else:
-                                self.root.after(1, check_all_done)
-                        check_all_done()
 
                     self.run_on_ui_thread(prompt_redownloads, redownload_indices, start_batch_downloads)
                 threading.Thread(target=fast_check, daemon=True).start()
@@ -2521,7 +2822,7 @@ class MediaDownloader:
             self.append_console("Stages: 2 (download + post-processing)\n")
             self.downloading = True
             self.set_controls_state(False)
-            self.poll_progress_queue()
+            self._schedule_progress_poll()
             def check_and_download():
                 if self.abort_event.is_set():
                     return
@@ -2634,6 +2935,23 @@ class MediaDownloader:
                 self.run_on_ui_thread(self._show_reset_button)
         threading.Thread(target=finish_abort, daemon=True).start()
 
+    def _on_window_close(self):
+        self._closing = True
+        if self.downloading:
+            self.abort()
+            self._after(50, lambda: self._check_close_after_abort(0))
+        else:
+            self.terminate_program()
+
+    def _check_close_after_abort(self, attempts):
+        if not self.downloading:
+            self.terminate_program()
+            return
+        if attempts >= 200:
+            self.terminate_program()
+            return
+        self._after(50, lambda: self._check_close_after_abort(attempts + 1))
+
     def terminate_program(self):
         self.status_polling = False
         try:
@@ -2646,9 +2964,13 @@ class MediaDownloader:
         try:
             if getattr(sys, 'frozen', False):
                 args = [sys.executable] + sys.argv[1:]
+                env = os.environ.copy()
+                env.pop("_PYI_TEMP_PATH", None)
+                env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                subprocess.Popen(args, cwd=os.getcwd(), env=env)
             else:
                 args = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
-            subprocess.Popen(args, cwd=os.getcwd())
+                subprocess.Popen(args, cwd=os.getcwd())
         except Exception as e:
             logging.error(f"Failed to restart application: {e}")
         self.terminate_program()
@@ -2745,11 +3067,7 @@ class MediaDownloader:
                             pass
                     os.rename(temp_path, final_path)
                 if self.progress:
-                    def mark_complete():
-                        self.progress.configure(style="Modern.Complete.Horizontal.TProgressbar")
-                        self.progress["value"] = 100
-                        self.progress.update_idletasks()
-                    self.run_on_ui_thread(mark_complete)
+                    self.run_on_ui_thread(self._mark_progress_complete)
                 elapsed = time.time() - start_time
                 file_size = os.path.getsize(output_path_final) if os.path.exists(output_path_final) else 0
                 size_mb = file_size / (1024 * 1024)
@@ -2791,13 +3109,16 @@ class MediaDownloader:
                 except Exception:
                     val = 0
                 self.progress_queue.put(val)
+                self.run_on_ui_thread(self._schedule_progress_poll)
             except Exception:
                 self.progress_queue.put(0)
+                self.run_on_ui_thread(self._schedule_progress_poll)
         elif d['status'] == 'finished':
             self.progress_queue.put(100)
+            self.run_on_ui_thread(self._schedule_progress_poll)
 
 
-    def check_for_updates(self):#UPDATE CHECK
+    def check_for_updates(self, manual=False):#UPDATE CHECK
         def update_check():
             try:
                 current_version = "v1.0.0"
@@ -2828,11 +3149,16 @@ class MediaDownloader:
                             f"Would you like to download it now?"
                         )
                         self.run_on_ui_thread(self._prompt_update, prompt_message, download_url)
+                    elif manual:
+                        self.run_on_ui_thread(messagebox.showinfo, "Up to Date", "You are already on the latest version.")
                 else:
                     logging.error(f"Failed to fetch SourceForge RSS feed: HTTP {response.status_code}")
+                    if manual:
+                        self.run_on_ui_thread(messagebox.showerror, "Update Check Failed", "Unable to check for updates. Please try again later.")
             except Exception as e:
                 logging.error(f"Error during SourceForge update check: {e}")
-                self.run_on_ui_thread(messagebox.showerror, "Update Check Failed", "Unable to check for updates. Please try again later.")
+                if manual:
+                    self.run_on_ui_thread(messagebox.showerror, "Update Check Failed", "Unable to check for updates. Please try again later.")
 
         threading.Thread(target=update_check, daemon=True).start()
 
@@ -2917,32 +3243,66 @@ class MediaDownloader:
 
     def poll_status_queue(self):
         if not self.status_polling:
+            self._status_poll_scheduled = False
             return
         try:
-            while True:
+            processed = 0
+            max_tasks = self._max_status_tasks_per_tick
+            while processed < max_tasks:
                 msg = self.status_queue.get_nowait()
                 self._append_console(msg + "\n")
+                processed += 1
         except queue.Empty:
             pass
-        self.root.after(100, self.poll_status_queue)
+        if not self.status_queue.empty():
+            self._after(60, self.poll_status_queue)
+        else:
+            self._status_poll_scheduled = False
+
+    def _schedule_status_poll(self):
+        if not self.status_polling:
+            return
+        if self._status_poll_scheduled:
+            return
+        self._status_poll_scheduled = True
+        self._after(16, self.poll_status_queue)
 
     def poll_progress_queue(self):
         if not self.downloading:
+            self._progress_poll_scheduled = False
             return
         if self.abort_event.is_set():
             self._drain_queue(self.progress_queue)
+            self._progress_poll_scheduled = False
             return
         try:
-            while True:
+            processed = 0
+            max_tasks = self._max_progress_updates_per_tick
+            last_val = None
+            while processed < max_tasks:
                 val = self.progress_queue.get_nowait()
-                self.display_percent_in_console(val)
+                last_val = val
+                processed += 1
         except queue.Empty:
             pass
-        if self.downloading:
-            self.root.after(100, self.poll_progress_queue)
+        if last_val is not None:
+            self.display_percent_in_console(last_val)
+        if self.downloading and not self.progress_queue.empty():
+            self._after(60, self.poll_progress_queue)
+        else:
+            self._progress_poll_scheduled = False
+
+    def _schedule_progress_poll(self):
+        if not self.downloading:
+            return
+        if self._progress_poll_scheduled:
+            return
+        self._progress_poll_scheduled = True
+        self._after(16, self.poll_progress_queue)
 
     def set_status(self, msg):
         self.status_queue.put(msg)
+        self._schedule_status_poll()
 
     def append_console(self, msg):
         self.run_on_ui_thread(self._append_console, msg)
@@ -2991,45 +3351,25 @@ class MediaDownloader:
             return
         if percent <= 0:
             if not getattr(self, "_percent_started", False):
-                if self.progress:
-                    try:
-                        self.progress["value"] = 0
-                        self.progress.update_idletasks()
-                    except Exception:
-                        self.progress["value"] = 0
+                if self.progress and isinstance(self.progress, tk.Canvas):
+                    self._set_progress_value(0)
+                    self._set_progress_text("0%")
             return
         if percent > 0:
             self._percent_started = True
-        if self.console:
-            content = self.console.get("1.0", tk.END)
-            lines = content.rstrip("\n").split("\n")
-            timestamp = time.strftime("%H:%M:%S")
-            if percent == 100:
-                if not getattr(self, "_download_finished", False):
-                    if lines and lines[-1].strip().endswith("% Done"):
-                        lines = lines[:-1]
-                    self._download_finished = True
-                    total = getattr(self, "_process_total", 1)
-                    done = min(getattr(self, "_process_done", 0) + 1, total)
-                    self._process_done = done
-                    if total > 1:
-                        lines.append(f"{timestamp}: Download finished ({done}/{total}). Post-processing...")
-                    else:
-                        lines.append(f"{timestamp}: Process finished ({done}/{total}).")
+        if percent == 100 and not getattr(self, "_download_finished", False):
+            self._download_finished = True
+            total = getattr(self, "_process_total", 1)
+            done = min(getattr(self, "_process_done", 0) + 1, total)
+            self._process_done = done
+            if total > 1:
+                self.append_console(f"Download finished ({done}/{total}). Post-processing...\n")
             else:
-                percent_line = f"{timestamp}: {percent}% Done"
-                if lines and lines[-1].strip().endswith("% Done"):
-                    lines = lines[:-1]
-                lines.append(percent_line)
-            self.console.delete("1.0", tk.END)
-            self.console.insert(tk.END, "\n".join(lines) + ("\n" if lines else ""))
-            self.console.see(tk.END)
-        if self.progress:
-            try:
-                self.progress["value"] = float(percent)
-                self.progress.update_idletasks()
-            except Exception:
-                self.progress["value"] = 0
+                self.append_console(f"Process finished ({done}/{total}).\n")
+        if self.progress and isinstance(self.progress, tk.Canvas):
+            self._set_progress_value(percent)
+        if percent > 0:
+            self._set_progress_text(f"{int(percent)}%")
 
     def show_settings(self):
         if self.downloading:
@@ -3061,7 +3401,7 @@ class MediaDownloader:
             activeforeground=theme["text"],
             highlightthickness=0
         )
-        disable_warnings_cb.pack(anchor="w", padx=32, pady=(0, 10))
+        disable_warnings_cb.pack(anchor="w", padx=32, pady=(0, 20))
         def on_toggle_disable_already_downloaded_prompts():
             self.config['disable_already_downloaded_prompts'] = not self.config.get('disable_already_downloaded_prompts', False)
             self.save_config()
@@ -3085,9 +3425,7 @@ class MediaDownloader:
             self.config['allow_batch_downloads'] = not self.config.get('allow_batch_downloads', False)
             self.save_config()
             batch_var.set(self.config['allow_batch_downloads'])
-            self._begin_transition()
-            self.create_widgets(force_rebuild=True, switch_view=False)
-            self.root.after(0, self._fade_in)
+            self._pending_batch_refresh = True
         batch_var = tk.BooleanVar(value=self.config.get('allow_batch_downloads', False))
         batch_downloads_cb = tk.Checkbutton(
             self.settings_frame,
@@ -3124,6 +3462,113 @@ class MediaDownloader:
             highlightthickness=0
         )
         preserve_links_cb.pack(anchor="w", padx=32, pady=(0, 20))
+        def on_toggle_disable_char_limits():
+            self.config['disable_char_limits'] = not self.config.get('disable_char_limits', False)
+            self.save_config()
+            char_limit_var.set(self.config['disable_char_limits'])
+            self._apply_single_url_limit()
+            self._apply_batch_text_limits()
+        char_limit_var = tk.BooleanVar(value=self.config.get('disable_char_limits', False))
+        disable_char_limits_cb = tk.Checkbutton(
+            self.settings_frame,
+            text="Disable URL length limits",
+            variable=char_limit_var,
+            command=on_toggle_disable_char_limits,
+            font=fonts["body"],
+            bg=theme["bg"],
+            fg=theme["text"],
+            selectcolor=theme["surface_alt"],
+            activebackground=theme["surface_alt"],
+            activeforeground=theme["text"],
+            highlightthickness=0
+        )
+        disable_char_limits_cb.pack(anchor="w", padx=32, pady=(0, 20))
+        def on_toggle_auto_updates():
+            self.config['auto_check_updates'] = bool(auto_update_var.get())
+            self.save_config()
+        auto_update_var = tk.BooleanVar(value=self.config.get('auto_check_updates', True))
+        updates_row = tk.Frame(self.settings_frame, bg=theme["bg"])
+        updates_row.pack(anchor="w", padx=32, pady=(0, 20), fill="x")
+        auto_updates_cb = tk.Checkbutton(
+            updates_row,
+            text="Automatically check for updates",
+            variable=auto_update_var,
+            command=on_toggle_auto_updates,
+            font=fonts["body"],
+            bg=theme["bg"],
+            fg=theme["text"],
+            selectcolor=theme["surface_alt"],
+            activebackground=theme["surface_alt"],
+            activeforeground=theme["text"],
+            highlightthickness=0
+        )
+        auto_updates_cb.pack(side="left")
+        check_updates_btn = tk.Button(
+            updates_row,
+            text="Check now",
+            font=fonts["label"],
+            bg=theme["surface_alt"],
+            fg=theme["text"],
+            activebackground=theme["surface_alt_hover"],
+            activeforeground=theme["text"],
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=2,
+            command=lambda: self.check_for_updates(manual=True)
+        )
+        check_updates_btn.pack(side="left", padx=(12, 0))
+        self.add_hover_effect(
+            check_updates_btn,
+            bg_normal=theme["surface_alt"],
+            fg_normal=theme["text"],
+            bg_hover=theme["surface_alt_hover"],
+            fg_hover=theme["accent"]
+        )
+        def on_max_lines_change():
+            value = self._normalize_batch_line_limit(max_lines_var.get())
+            self.config['max_batch_lines'] = value
+            self.save_config()
+            max_lines_var.set(str(value))
+            self._apply_batch_text_limits()
+        max_lines_default = self._default_batch_line_limit()
+        max_lines_var = tk.StringVar(value=str(self._normalize_batch_line_limit(self.config.get('max_batch_lines'))))
+        tk.Label(self.settings_frame, text="Max batch links:", font=fonts["label"], bg=theme["bg"], fg=theme["text"]).pack(anchor="w", padx=32, pady=(0, 4))
+        max_lines_row = tk.Frame(self.settings_frame, bg=theme["bg"])
+        max_lines_row.pack(anchor="w", padx=32, pady=(0, 6), fill="x")
+        max_lines_spin = tk.Spinbox(
+            max_lines_row,
+            from_=1,
+            to=1024,
+            textvariable=max_lines_var,
+            font=fonts["body"],
+            bg=theme["surface_alt"],
+            fg=theme["text"],
+            relief="flat",
+            bd=0,
+            width=6,
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["border"]
+        )
+        max_lines_spin.pack(side="left")
+        try:
+            max_lines_spin.config(
+                buttonbackground="black",
+                buttonforeground="white"
+            )
+        except tk.TclError:
+            pass
+        max_lines_spin.config(command=on_max_lines_change)
+        max_lines_spin.bind("<FocusOut>", lambda e: on_max_lines_change())
+        max_lines_spin.bind("<Return>", lambda e: on_max_lines_change())
+        tk.Label(
+            self.settings_frame,
+            text=f"Limits batch input lines. Default: {max_lines_default} (max 1024).",
+            font=fonts["caption"],
+            bg=theme["bg"],
+            fg=theme["muted"]
+        ).pack(anchor="w", padx=32, pady=(0, 20))
         def on_concurrency_change():
             value = self._normalize_batch_concurrency(concurrency_var.get())
             self.config['batch_concurrency'] = value
@@ -3281,10 +3726,13 @@ class MediaDownloader:
                     'disable_warnings': False,
                     'allow_batch_downloads': False,
                     'disable_already_downloaded_prompts': False,
+                    'auto_check_updates': True,
                     'download_location': self._default_download_dir(),
                     'batch_concurrency': self._default_batch_concurrency(),
                     'batch_retry_attempts': 1,
-                    'preserve_batch_links': False
+                    'preserve_batch_links': False,
+                    'max_batch_lines': self._default_batch_line_limit(),
+                    'disable_char_limits': False
                 }
                 self.config = default_config
                 self.save_config()
@@ -3318,9 +3766,10 @@ class MediaDownloader:
         version_label.pack(side="right", anchor="e", padx=(0, 2))
         self._configure_footer(bottom_bar, bottom_left, bottom_right, min_width=540)
         self.enforce_min_size()
+        self._apply_window_constraints(min_extra=260)
         self.root.update_idletasks()
         self._show_view("settings")
-        self.root.after(0, self._fade_in)
+        self._after(0, self._fade_in)
 
 if __name__ == "__main__":
     enable_high_dpi()
