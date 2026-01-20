@@ -36,7 +36,7 @@ Just paste a link and click to download.
 
 ---
 
-## Features
+## 📋 Features
 
 * One-click downloads with real-time status
 * Single or batch downloads
@@ -49,7 +49,7 @@ Just paste a link and click to download.
 
 ---
 
-## Quick Start
+## Easy to operate
 
 1. Paste a URL (or multiple URLs for batch mode)
 2. Choose format and quality
@@ -78,7 +78,7 @@ See `MediaCrate/supportedsites.md` for the full list.
 
 ---
 
-## Preview
+## 🎥 Preview
 
 <details> <summary><strong>Watch MediaCrate in action</strong></summary> <!-- video --> </details>
 
@@ -126,7 +126,7 @@ The executable will be generated in the `dist/` directory.
 
 ---
 
-## Security & Warnings
+## ⚠️ Security & Warnings
 
 Operating systems may show warnings when downloading MediaCrate simply because it is not yet widely recognized.
 
@@ -160,7 +160,7 @@ If reporting bugs, please include clear reproduction steps.
 
 ---
 
-## License
+## 📜 License
 
 Apache-2.0
 
@@ -168,7 +168,7 @@ See `LICENSE` for details.
 
 ---
 
-## Contact
+## 📬 Contact
 
 [email@justagwas.com](mailto:email@justagwas.com)
 
