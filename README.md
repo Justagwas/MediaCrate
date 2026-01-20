@@ -1,6 +1,7 @@
 <p align="center">
-  <img width="256" height="200" alt="MediaCrate" src="https://github.com/user-attachments/assets/d5c62732-4cda-4004-8847-6f730755ec2c" />
+  <img width="256" height="200" alt="MediaCrate Logo" src="https://github.com/user-attachments/assets/3bf8495d-40ef-4ca5-863e-a20fb017a738" />
 </p>
+
 
 <p align="center">
   <b>The Universal Multimedia Downloader.</b><br>
