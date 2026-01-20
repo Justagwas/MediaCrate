@@ -365,3 +365,4 @@ MediaCrate/version.txt
 /MediaCrate/dist
 /MediaCrate/build
 MediaCrate/MediaCrate_config.json
+MediaCrate/MediaCrate.spec
