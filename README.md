@@ -1,48 +1,35 @@
 <p align="center">
-  placeholder
+  <img width="256" height="200" alt="MediaCrate" src="https://github.com/user-attachments/assets/d5c62732-4cda-4004-8847-6f730755ec2c" />
 </p>
-
-<h1 align="center">MediaCrate</h1>
 
 <p align="center">
   <b>Fast. Simple. Reliable.</b><br>
-  Download video and audio from supported sites with MediaCrate desktop app.
+  Download video and audio from over <b>1,000+ websites</b> with one click.
 </p>
 
 <p align="center">
-  <a href="https://github.com/Justagwas/MediaCrate/releases/latest">
-    <img src="https://img.shields.io/github/v/release/Justagwas/MediaCrate?style=for-the-badge" alt="Latest Release">
-  </a>
-  <a href="https://github.com/Justagwas/MediaCrate/releases">
-    <img src="https://img.shields.io/github/downloads/Justagwas/MediaCrate/total?style=for-the-badge" alt="Total Downloads">
-  </a>
-  <a href="https://github.com/Justagwas/MediaCrate/issues">
-    <img src="https://img.shields.io/github/issues/Justagwas/MediaCrate?style=for-the-badge" alt="Open Issues">
-  </a>
-  <a href="https://github.com/Justagwas/MediaCrate/commits">
-    <img src="https://img.shields.io/github/last-commit/Justagwas/MediaCrate?style=for-the-badge" alt="Last Commit">
+  <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrate%20Setup.exe">
+    <img
+      src="https://img.shields.io/badge/▼%20Download%20MediaCrate%20for%20Windows%20▼-2563eb?style=for-the-badge&logo=windows&logoColor=white"
+      alt="Download MediaCrate for Windows"
+    >
   </a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Justagwas/MediaCrate/releases/latest">
-    <img src="https://img.shields.io/badge/Download-Windows-blue?style=for-the-badge&logo=windows" alt="Download for Windows">
-  </a>
-</p>
-
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#preview">Preview</a> •
-  <a href="#security--warnings">Security</a> •
-  <a href="#license">License</a>
+  <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a> &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/issues">Issues</a> &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/wiki">Documentation</a> &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/blob/main/LICENSE.txt">License</a>
 </p>
 
 ---
 
-## Built for people who just want it to work
+## Built to be simple
 
-MediaCrate is a lightweight desktop application for downloading video and audio from supported websites. It's designed to feel effortless for casual users, while remaining transparent and configurable for developers and enthusiasts.
+MediaCrate is a lightweight desktop application for downloading video and audio from supported websites.
+
+It's designed to feel effortless for casual users, while remaining transparent and configurable for everyone else.
 
 Just paste a link and click to download.
 
@@ -92,16 +79,7 @@ See `MediaCrate/supportedsites.md` for the full list.
 
 ## Preview
 
-<details>
-<summary><strong>Watch MediaCrate in action</strong></summary>
-
-placeholder
-
-</details>
-
-<p align="center">
-  <img src="placeholder" alt="MediaCrate" />
-</p>
+<details> <summary><strong>Watch MediaCrate in action</strong></summary> <!-- video --> </details>
 
 ---
 
@@ -159,7 +137,7 @@ MediaCrate is:
 
 You are encouraged to review the source code or scan the executable with any security tool of your choice.
 
-If you downloaded MediaCrate from the official repository or release page, it is safe to use.
+If downloaded from the official repository or release page, it is safe to use.
 
 ---
 
@@ -185,7 +163,7 @@ If reporting bugs, please include clear reproduction steps.
 
 Apache-2.0
 
-See `LICENSE.txt` for details.
+See `LICENSE` for details.
 
 ---
 
