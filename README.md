@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>Fast. Simple. Reliable.</b><br>
+  <b>The Universal Multimedia Downloader.</b><br>
   Download video and audio from over <b>1,000+ websites</b> with one click.
 </p>
 
