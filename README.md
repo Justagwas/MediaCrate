@@ -4,8 +4,8 @@
 
 
 <p align="center">
-  <b>The Universal Multimedia Downloader.</b><br>
-  Download video and audio from over <b>1,000+ websites</b> with one click.
+  <b>The Universal Multimedia Downloader</b><br>
+  Download video and audio from over <b>1,000+ websites</b> with one click
 </p>
 
 <p align="center">
