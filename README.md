@@ -20,7 +20,7 @@
   <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a> &nbsp;•&nbsp;
   <a href="https://github.com/Justagwas/MediaCrate/issues">Issues</a> &nbsp;•&nbsp;
   <a href="https://github.com/Justagwas/MediaCrate/wiki">Documentation</a> &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/blob/main/LICENSE.txt">License</a>
+  <a href="https://github.com/Justagwas/MediaCrate/blob/main/LICENSE">License</a>
 </p>
 
 ---
