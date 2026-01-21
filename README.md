@@ -28,11 +28,17 @@
 
 ## Built to be simple
 
-MediaCrate is a lightweight desktop application for downloading video and audio from supported websites.
+MediaCrate is a fast, lightweight desktop application for downloading video and audio from supported websites.
 
-It's designed to feel effortless for casual users, while remaining transparent and configurable for everyone else.
+Paste a link, choose your options, and download.
 
-Just paste a link and click to download.
+MediaCrate is built to be efficient:
+
+- ~0% CPU usage while idle
+
+- ~1% CPU usage during light downloads
+
+- ~40 MB memory footprint
 
 ---
 
@@ -72,7 +78,7 @@ Batch downloads are handled like so:
 
 ## Supported Sites
 
-MediaCrate is powered by yt-dlp, so site support matches upstream.
+Site support follows yt-dlp upstream updates.
 
 See `MediaCrate/supportedsites.md` for the full list.
 
@@ -80,7 +86,10 @@ See `MediaCrate/supportedsites.md` for the full list.
 
 ## 🎥 Preview
 
-<details> <summary><strong>Watch MediaCrate in action</strong></summary> <!-- video --> </details>
+<details>
+  <summary><strong>CLICK HERE TO EXPAND AND VIEW PREVIEW VIDEO</strong></summary>
+  <video src="https://github.com/user-attachments/assets/ef20c013-5a79-41c1-9dc0-d40ba03d27ef" controls muted style="max-width: auto; height: auto;" ></video>
+</details>
 
 ---
 
@@ -138,7 +147,7 @@ MediaCrate is:
 
 You are encouraged to review the source code or scan the executable with any security tool of your choice.
 
-If downloaded from the official repository or release page, it is safe to use.
+If downloaded from the official repository or release page, it can be independently verified and safely used.
 
 ---
 
