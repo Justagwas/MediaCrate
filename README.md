@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup_v1.0.0.exe">
+  <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe">
     <img
       src="https://img.shields.io/badge/▼%20Download%20MediaCrate%20for%20Windows%20▼-2563eb?style=for-the-badge&logo=windows&logoColor=white"
       alt="Download MediaCrate for Windows"
