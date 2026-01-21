@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://justagwas.com/projects/mediacrate">Website</a>
+  <a href="https://Justagwas.com/projects/mediacrate">Website</a>
   &nbsp;•&nbsp;
   <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a>
   &nbsp;•&nbsp;
