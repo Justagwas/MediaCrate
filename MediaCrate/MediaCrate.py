@@ -676,7 +676,7 @@ class MediaDownloader:
     def center_window(self, width, height):
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        offset = int(min(120, sh * 0.08))
+        offset = int(min(200, sh * 0.12))
         x = int((sw / 2) - (width / 2))
         y = int((sh / 2) - (height / 2)) - offset
         x = max(0, x)
