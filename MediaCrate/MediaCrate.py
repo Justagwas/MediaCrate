@@ -72,6 +72,8 @@ class MediaDownloader:
             'allow_batch_downloads': False,
             'disable_already_downloaded_prompts': False,
             'auto_check_updates': True,
+            'enable_window_resizing': False,
+            'ui_queue_cap': self._default_ui_queue_cap(),
             'download_location': self._default_download_dir(),
             'batch_concurrency': self._default_batch_concurrency(),
             'batch_retry_attempts': 1,
@@ -88,6 +90,7 @@ class MediaDownloader:
                         config[k] = v
                 config['batch_concurrency'] = self._normalize_batch_concurrency(config.get('batch_concurrency'))
                 config['max_batch_lines'] = self._normalize_batch_line_limit(config.get('max_batch_lines'))
+                config['ui_queue_cap'] = self._normalize_ui_queue_cap(config.get('ui_queue_cap'))
                 self.config = config
             except Exception:
                 self.config = default_config
@@ -114,6 +117,9 @@ class MediaDownloader:
     def _default_batch_line_limit(self):
         return 64
 
+    def _default_ui_queue_cap(self):
+        return 50
+
     def _default_download_dir(self):
         return os.path.join(os.path.expanduser("~"), "Downloads", "MediaCrate")
 
@@ -139,7 +145,7 @@ class MediaDownloader:
             value = int(value)
         except (TypeError, ValueError):
             return self._default_batch_concurrency()
-        return max(1, min(16, value))
+        return max(1, min(64, value))
 
     def _normalize_batch_line_limit(self, value):
         try:
@@ -154,6 +160,13 @@ class MediaDownloader:
         except (TypeError, ValueError):
             return 1
         return max(1, min(5, value))
+
+    def _normalize_ui_queue_cap(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return self._default_ui_queue_cap()
+        return max(1, min(500, value))
 
     def _display_path(self, path):
         try:
@@ -313,6 +326,38 @@ class MediaDownloader:
         text_color = self.theme["bg"] if value >= 50 else self.theme["text"]
         canvas.itemconfig(self.progress_text_id, fill=text_color)
 
+    def _set_text_var(self, var, text):
+        if var is None:
+            return
+        try:
+            key = var._name
+        except Exception:
+            key = str(var)
+        self._pending_text_vars[key] = (var, text)
+        if self._pending_text_vars_scheduled:
+            return
+        self._pending_text_vars_scheduled = True
+        self.run_on_ui_thread(self._flush_text_vars)
+
+    def _flush_text_vars(self):
+        pending = self._pending_text_vars
+        self._pending_text_vars = {}
+        self._pending_text_vars_scheduled = False
+        for key, payload in pending.items():
+            if isinstance(payload, tuple) and len(payload) == 2:
+                var, text = payload
+            elif hasattr(key, "set"):
+                var, text = key, payload
+            else:
+                continue
+            try:
+                var.set(text)
+            except Exception:
+                pass
+        if self._pending_text_vars and not self._pending_text_vars_scheduled:
+            self._pending_text_vars_scheduled = True
+            self.run_on_ui_thread(self._flush_text_vars)
+
     def _is_descendant(self, widget, ancestor):
         try:
             while widget:
@@ -394,6 +439,7 @@ class MediaDownloader:
         self.settings_view.grid(row=0, column=0, sticky="nsew")
 
     def _show_view(self, view):
+        self._current_view = view
         if view == "settings":
             self.settings_view.tkraise()
         else:
@@ -527,7 +573,7 @@ class MediaDownloader:
 
     def _after(self, delay_ms, callback, *, widget=None):
         target = widget or self.root
-        safe_delay = max(8, int(delay_ms))
+        safe_delay = max(0, int(delay_ms))
         return target.after(safe_delay, callback)
 
     def process_gui_queue(self):
@@ -547,7 +593,7 @@ class MediaDownloader:
         except queue.Empty:
             pass
         if not self.gui_queue.empty():
-            self._after(20, self.process_gui_queue)
+            self._after(16, self.process_gui_queue)
         else:
             self._gui_poll_scheduled = False
 
@@ -588,9 +634,21 @@ class MediaDownloader:
         self._progress_value = 0.0
         self._progress_fill_color = self.theme["accent"]
         self._closing = False
+        self._pending_text_vars = {}
+        self._pending_text_vars_scheduled = False
+        self._current_view = None
+        self._settings_enter_size = None
+        self._settings_forced_size = None
+        self._settings_user_resized = False
+        self._batch_active = None
+        self._batch_enter_size = None
+        self._batch_forced_size = None
+        self._batch_user_resized = False
+        self._batch_resize_pending = False
+        self._window_resizing_enabled = bool(self.config.get('enable_window_resizing', True))
         self.root.title("MediaCrate") #Version 1.0.0
         self.root.configure(bg=self.theme["bg"])
-        self.root.resizable(True, True)
+        self.root.resizable(self._window_resizing_enabled, self._window_resizing_enabled)
         self.configure_styles()
         self.configure_geometry(prefer_tall=self.config.get('allow_batch_downloads', False))
         self._last_user_size = None
@@ -598,10 +656,12 @@ class MediaDownloader:
         self._gui_poll_scheduled = False
         self._status_poll_scheduled = False
         self._progress_poll_scheduled = False
-        self._max_gui_tasks_per_tick = 50
-        self._max_status_tasks_per_tick = 50
-        self._max_progress_updates_per_tick = 50
-        self.root.bind("<Configure>", self._on_root_configure)
+        queue_cap = self._normalize_ui_queue_cap(self.config.get('ui_queue_cap'))
+        self._max_gui_tasks_per_tick = queue_cap
+        self._max_status_tasks_per_tick = queue_cap
+        self._max_progress_updates_per_tick = queue_cap
+        if self._window_resizing_enabled:
+            self.root.bind("<Configure>", self._on_root_configure)
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self.status_queue = queue.Queue()
         self.progress_queue = queue.Queue()
@@ -616,7 +676,11 @@ class MediaDownloader:
     def center_window(self, width, height):
         self.root.update_idletasks()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x, y = int((sw / 2) - (width / 2)), int((sh / 2) - (height / 2))
+        offset = int(min(120, sh * 0.08))
+        x = int((sw / 2) - (width / 2))
+        y = int((sh / 2) - (height / 2)) - offset
+        x = max(0, x)
+        y = max(0, y)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def configure_geometry(self, prefer_tall=False):
@@ -645,9 +709,13 @@ class MediaDownloader:
             self._after(120, lambda: setattr(self, "_ignore_resize", False))
 
     def _on_root_configure(self, event):
+        if not getattr(self, "_window_resizing_enabled", True):
+            return
         if event.widget is not self.root:
             return
         if self._ignore_resize:
+            return
+        if getattr(self, "_transitioning", False):
             return
         if self.root.state() != "normal":
             return
@@ -656,6 +724,24 @@ class MediaDownloader:
         new_size = (event.width, event.height)
         if self._last_user_size == new_size:
             return
+        if getattr(self, "_current_view", None) == "settings":
+            forced_size = getattr(self, "_settings_forced_size", None)
+            if not getattr(self, "_settings_user_resized", False) and forced_size:
+                if abs(new_size[0] - forced_size[0]) <= 2 and abs(new_size[1] - forced_size[1]) <= 2:
+                    self._settings_forced_size = new_size
+                    return
+                self._settings_user_resized = True
+                if getattr(self, "_batch_active", False):
+                    self._batch_user_resized = True
+        if getattr(self, "_current_view", None) == "main" and getattr(self, "_batch_active", False):
+            if getattr(self, "_batch_resize_pending", False):
+                return
+            forced_size = getattr(self, "_batch_forced_size", None)
+            if not getattr(self, "_batch_user_resized", False) and forced_size:
+                if abs(new_size[0] - forced_size[0]) <= 2 and abs(new_size[1] - forced_size[1]) <= 2:
+                    self._batch_forced_size = new_size
+                    return
+                self._batch_user_resized = True
         self._last_user_size = new_size
         self._begin_resize_wrap()
 
@@ -921,11 +1007,14 @@ class MediaDownloader:
 
     def deferred_startup(self):
         self.set_icon()
+        def after_updates():
+            self.show_main_ui()
+        def after_nodejs():
+            if self.config.get('auto_check_updates', True):
+                self.check_for_updates(on_complete=after_updates)
+            else:
+                after_updates()
         def after_ffmpeg():
-            def after_nodejs():
-                if self.config.get('auto_check_updates', True):
-                    self.check_for_updates()
-                self.show_main_ui()
             self._nodejs_callback = after_nodejs
             self.check_nodejs()
         self._ffmpeg_callback = after_ffmpeg
@@ -936,6 +1025,7 @@ class MediaDownloader:
             self.splash_frame.destroy()
         self.create_widgets()
         is_batch = self.config.get('allow_batch_downloads', False)
+        self._batch_active = is_batch
         self._after(0, lambda: self._apply_window_constraints(
             min_extra=self._batch_min_extra if is_batch else 0
         ))
@@ -1062,7 +1152,7 @@ class MediaDownloader:
                 button_frame, text="Continue", command=lambda: self.clear_ffmpeg_prompt(callback),
                 font=fonts["button"], bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             continue_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(continue_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1070,7 +1160,7 @@ class MediaDownloader:
                 button_frame, text="Exit", command=self.abort,
                 font=fonts["button"], bg=theme["danger"], fg=theme["bg"],
                 activebackground=theme["danger_hover"], activeforeground=theme["bg"],
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             exit_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(exit_button, bg_normal=theme["danger"], fg_normal=theme["bg"], bg_hover=theme["danger_hover"], fg_hover=theme["bg"])
@@ -1118,7 +1208,7 @@ class MediaDownloader:
                 font=fonts["button"],
                 bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             auto_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(auto_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1127,7 +1217,7 @@ class MediaDownloader:
                 font=fonts["button"],
                 bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             manual_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(manual_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1179,7 +1269,7 @@ class MediaDownloader:
                 font=fonts["button"],
                 bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             self.proceed_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(self.proceed_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1188,7 +1278,7 @@ class MediaDownloader:
                 font=fonts["button"],
                 bg=theme["danger"], fg=theme["bg"],
                 activebackground=theme["danger_hover"], activeforeground=theme["bg"],
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             cancel_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(cancel_button, bg_normal=theme["danger"], fg_normal=theme["bg"], bg_hover=theme["danger_hover"], fg_hover=theme["bg"])
@@ -1260,7 +1350,7 @@ class MediaDownloader:
                 font=fonts["button"],
                 bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             ok_button.pack(pady=10)
             self.add_hover_effect(ok_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1288,13 +1378,13 @@ class MediaDownloader:
                                     percent = int(downloaded * 100 / total)
                                     mb_done = downloaded / (1024 * 1024)
                                     mb_total = total / (1024 * 1024)
-                                    self.run_on_ui_thread(status_var.set, f"Downloading FFmpeg... {percent}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+                                    self._set_text_var(status_var, f"Downloading FFmpeg... {percent}% ({mb_done:.1f}/{mb_total:.1f} MB)")
                                 else:
                                     mb_done = downloaded / (1024 * 1024)
-                                    self.run_on_ui_thread(status_var.set, f"Downloading FFmpeg... {mb_done:.1f} MB")
+                                    self._set_text_var(status_var, f"Downloading FFmpeg... {mb_done:.1f} MB")
 
                     self.set_status("Extracting FFmpeg...")
-                    self.run_on_ui_thread(status_var.set, "Extracting FFmpeg...")
+                    self._set_text_var(status_var, "Extracting FFmpeg...")
                     logging.info(f"Extracting FFmpeg to {extract_path}")
                     os.makedirs(extract_path, exist_ok=True)
                     with zipfile.ZipFile(download_path, 'r') as zip_ref:
@@ -1314,22 +1404,22 @@ class MediaDownloader:
                     shutil.rmtree(extract_path)
 
                     self.set_status("FFmpeg installed successfully!")
-                    self.run_on_ui_thread(status_var.set, "FFmpeg installed successfully.")
+                    self._set_text_var(status_var, "FFmpeg installed successfully.")
                     def finish_install():
                         messagebox.showinfo("Success", "FFmpeg has been installed successfully. The app will now restart.")
                         self.restart_program()
                     self.run_on_ui_thread(finish_install)
                 except requests.exceptions.Timeout:
                     self.set_status("FFmpeg download timed out.")
-                    self.run_on_ui_thread(status_var.set, "FFmpeg download timed out.")
+                    self._set_text_var(status_var, "FFmpeg download timed out.")
                     self.run_on_ui_thread(messagebox.showerror, "Error", "FFmpeg download timed out. Please check your connection or download it manually.")
                 except requests.exceptions.RequestException as e:
                     self.set_status("FFmpeg download failed.")
-                    self.run_on_ui_thread(status_var.set, "FFmpeg download failed.")
+                    self._set_text_var(status_var, "FFmpeg download failed.")
                     self.run_on_ui_thread(messagebox.showerror, "Error", f"FFmpeg download failed: {e}")
                 except Exception as e:
                     self.set_status("FFmpeg installation failed.")
-                    self.run_on_ui_thread(status_var.set, "FFmpeg installation failed.")
+                    self._set_text_var(status_var, "FFmpeg installation failed.")
                     self.run_on_ui_thread(messagebox.showerror, "Error", f"Failed to download and install FFmpeg: {e}")
             threading.Thread(target=download_ffmpeg, daemon=True).start()
 
@@ -1345,17 +1435,17 @@ class MediaDownloader:
         button_frame = tk.Frame(self.root, bg=bg_main)
         button_frame.pack(pady=10)
 
-        proceed_button = tk.Button(button_frame, text="Yes", command=on_download_choice, font=fonts["button"], bg=bg_button, fg=fg_button, activebackground=active_bg_button, activeforeground=active_fg_button, relief="flat", bd=0, padx=12, pady=2, width=12)
+        proceed_button = tk.Button(button_frame, text="Yes", command=on_download_choice, font=fonts["button"], bg=bg_button, fg=fg_button, activebackground=active_bg_button, activeforeground=active_fg_button, relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2")
         proceed_button.pack(side=tk.LEFT, padx=5)
         self.add_hover_effect(proceed_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
-        confirm_button = tk.Button(button_frame, text="Cancel", command=on_confirm, font=fonts["button"], bg=theme["danger"], fg=theme["bg"], activebackground=theme["danger_hover"], activeforeground=theme["bg"], relief="flat", bd=0, padx=12, pady=2, width=12)
+        confirm_button = tk.Button(button_frame, text="Cancel", command=on_confirm, font=fonts["button"], bg=theme["danger"], fg=theme["bg"], activebackground=theme["danger_hover"], activeforeground=theme["bg"], relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2")
         confirm_button.pack(side=tk.LEFT, padx=5)
         self.add_hover_effect(confirm_button, bg_normal=theme["danger"], fg_normal=theme["bg"], bg_hover=theme["danger_hover"], fg_hover=theme["bg"])
 
     def clear_ffmpeg_prompt(self, callback=None):
         for widget in self.root.winfo_children():
             widget.destroy()
-        self.create_widgets()
+        self.show_splash()
         if callback:
             callback()
 
@@ -1401,7 +1491,7 @@ class MediaDownloader:
                 button_frame, text="Continue", command=lambda: self.clear_nodejs_prompt(callback),
                 font=fonts["button"], bg=bg_button, fg=fg_button,
                 activebackground=active_bg_button, activeforeground=active_fg_button,
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             continue_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(continue_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
@@ -1409,7 +1499,7 @@ class MediaDownloader:
                 button_frame, text="Exit", command=self.abort,
                 font=fonts["button"], bg=theme["danger"], fg=theme["bg"],
                 activebackground=theme["danger_hover"], activeforeground=theme["bg"],
-                relief="flat", bd=0, padx=12, pady=2, width=12
+                relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2"
             )
             exit_button.pack(side=tk.LEFT, padx=5)
             self.add_hover_effect(exit_button, bg_normal=theme["danger"], fg_normal=theme["bg"], bg_hover=theme["danger_hover"], fg_hover=theme["bg"])
@@ -1451,13 +1541,13 @@ class MediaDownloader:
                                     percent = int(downloaded * 100 / total)
                                     mb_done = downloaded / (1024 * 1024)
                                     mb_total = total / (1024 * 1024)
-                                    self.run_on_ui_thread(status_var.set, f"Downloading Node.js... {percent}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+                                    self._set_text_var(status_var, f"Downloading Node.js... {percent}% ({mb_done:.1f}/{mb_total:.1f} MB)")
                                 else:
                                     mb_done = downloaded / (1024 * 1024)
-                                    self.run_on_ui_thread(status_var.set, f"Downloading Node.js... {mb_done:.1f} MB")
+                                    self._set_text_var(status_var, f"Downloading Node.js... {mb_done:.1f} MB")
 
                     self.set_status("Extracting Node.js...")
-                    self.run_on_ui_thread(status_var.set, "Extracting Node.js...")
+                    self._set_text_var(status_var, "Extracting Node.js...")
                     logging.info(f"Extracting Node.js to {extract_path}")
                     os.makedirs(extract_path, exist_ok=True)
                     with zipfile.ZipFile(download_path, 'r') as zip_ref:
@@ -1477,22 +1567,24 @@ class MediaDownloader:
                     shutil.rmtree(extract_path)
 
                     self.set_status("Node.js installed successfully!")
-                    self.run_on_ui_thread(status_var.set, "Node.js installed successfully.")
-                    self.run_on_ui_thread(messagebox.showinfo, "Success", "Node.js has been installed successfully.")
-                    self.run_on_ui_thread(self.clear_nodejs_prompt)
+                    self._set_text_var(status_var, "Node.js installed successfully.")
+                    def finish_install():
+                        messagebox.showinfo("Success", "Node.js has been installed successfully.")
+                        self.clear_nodejs_prompt(callback)
+                    self.run_on_ui_thread(finish_install)
                 except requests.exceptions.Timeout:
                     self.set_status("Node.js download timed out.")
-                    self.run_on_ui_thread(status_var.set, "Node.js download timed out.")
+                    self._set_text_var(status_var, "Node.js download timed out.")
                     self.run_on_ui_thread(set_buttons_state, tk.NORMAL)
                     self.run_on_ui_thread(messagebox.showerror, "Error", "Node.js download timed out. Please check your connection or download it manually.")
                 except requests.exceptions.RequestException as e:
                     self.set_status("Node.js download failed.")
-                    self.run_on_ui_thread(status_var.set, "Node.js download failed.")
+                    self._set_text_var(status_var, "Node.js download failed.")
                     self.run_on_ui_thread(set_buttons_state, tk.NORMAL)
                     self.run_on_ui_thread(messagebox.showerror, "Error", f"Node.js download failed: {e}")
                 except Exception as e:
                     self.set_status("Node.js installation failed.")
-                    self.run_on_ui_thread(status_var.set, "Node.js installation failed.")
+                    self._set_text_var(status_var, "Node.js installation failed.")
                     self.run_on_ui_thread(set_buttons_state, tk.NORMAL)
                     self.run_on_ui_thread(messagebox.showerror, "Error", f"Failed to download and install Node.js: {e}")
             threading.Thread(target=download_nodejs, daemon=True).start()
@@ -1509,10 +1601,10 @@ class MediaDownloader:
         button_frame = tk.Frame(self.root, bg=bg_main)
         button_frame.pack(pady=10)
 
-        proceed_button = tk.Button(button_frame, text="Yes", command=on_download, font=fonts["button"], bg=bg_button, fg=fg_button, activebackground=active_bg_button, activeforeground=active_fg_button, relief="flat", bd=0, padx=12, pady=2, width=12)
+        proceed_button = tk.Button(button_frame, text="Yes", command=on_download, font=fonts["button"], bg=bg_button, fg=fg_button, activebackground=active_bg_button, activeforeground=active_fg_button, relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2")
         proceed_button.pack(side=tk.LEFT, padx=5)
         self.add_hover_effect(proceed_button, bg_normal=bg_button, fg_normal=fg_button, bg_hover=active_bg_button, fg_hover=active_fg_button)
-        confirm_button = tk.Button(button_frame, text="Cancel", command=on_confirm, font=fonts["button"], bg=theme["danger"], fg=theme["bg"], activebackground=theme["danger_hover"], activeforeground=theme["bg"], relief="flat", bd=0, padx=12, pady=2, width=12)
+        confirm_button = tk.Button(button_frame, text="Cancel", command=on_confirm, font=fonts["button"], bg=theme["danger"], fg=theme["bg"], activebackground=theme["danger_hover"], activeforeground=theme["bg"], relief="flat", bd=0, padx=12, pady=2, width=12, cursor="hand2")
         confirm_button.pack(side=tk.LEFT, padx=5)
         self.add_hover_effect(confirm_button, bg_normal=theme["danger"], fg_normal=theme["bg"], bg_hover=theme["danger_hover"], fg_hover=theme["bg"])
         status_label = tk.Label(self.root, textvariable=status_var, bg=bg_main, fg=theme["muted"], wraplength=420, justify="left", font=fonts["caption"])
@@ -1521,7 +1613,7 @@ class MediaDownloader:
     def clear_nodejs_prompt(self, callback=None):
         for widget in self.root.winfo_children():
             widget.destroy()
-        self.create_widgets()
+        self.show_splash()
         if callback:
             callback()
 
@@ -2078,12 +2170,51 @@ class MediaDownloader:
             else:
                 btn.config(bg=theme["surface_alt"], fg=theme["text"])
 
+    def _restore_main_size_after_settings(self):
+        restored = False
+        if self._settings_enter_size and not self._settings_user_resized:
+            target_w, target_h = self._settings_enter_size
+            self._set_geometry_safe(target_w, target_h)
+            self._last_user_size = (target_w, target_h)
+            restored = True
+        self._settings_enter_size = None
+        self._settings_forced_size = None
+        self._settings_user_resized = False
+        return restored
+
     def show_main_view(self):
         force_rebuild = getattr(self, "_pending_batch_refresh", False)
         self._pending_batch_refresh = False
         self.create_widgets(force_rebuild=force_rebuild, switch_view=True)
+        self._restore_main_size_after_settings()
         is_batch = self.config.get('allow_batch_downloads', False)
+        prev_batch = self._batch_active if self._batch_active is not None else is_batch
+        if prev_batch != is_batch:
+            if is_batch:
+                if self._last_user_size:
+                    self._batch_enter_size = self._last_user_size
+                else:
+                    self._batch_enter_size = (self.root.winfo_width(), self.root.winfo_height())
+                self._batch_user_resized = False
+                self._batch_forced_size = None
+                self._batch_resize_pending = True
+            else:
+                if self._batch_enter_size and not self._batch_user_resized:
+                    target_w, target_h = self._batch_enter_size
+                    self._set_geometry_safe(target_w, target_h)
+                    self._last_user_size = (target_w, target_h)
+                self._batch_enter_size = None
+                self._batch_forced_size = None
+                self._batch_user_resized = False
+                self._batch_resize_pending = False
+        self._batch_active = is_batch
         self._apply_window_constraints(min_extra=self._batch_min_extra if is_batch else 0)
+        if is_batch and self._batch_resize_pending:
+            self.root.update_idletasks()
+            self._batch_forced_size = (self.root.winfo_width(), self.root.winfo_height())
+            if self._batch_enter_size:
+                self._last_user_size = self._batch_enter_size
+            self._batch_resize_pending = False
 
     def update_quality_buttons(self):
         is_audio = self.selected_format.get() in ("mp3", "wav")
@@ -3118,7 +3249,10 @@ class MediaDownloader:
             self.run_on_ui_thread(self._schedule_progress_poll)
 
 
-    def check_for_updates(self, manual=False):#UPDATE CHECK
+    def check_for_updates(self, manual=False, on_complete=None):#UPDATE CHECK
+        def finish():
+            if on_complete:
+                self.run_on_ui_thread(on_complete)
         def update_check():
             try:
                 current_version = "v1.0.0"
@@ -3148,21 +3282,37 @@ class MediaDownloader:
                             f"A newer version - {latest_version} is available!\n"
                             f"Would you like to download it now?"
                         )
-                        self.run_on_ui_thread(self._prompt_update, prompt_message, download_url)
+                        self.run_on_ui_thread(self._prompt_update, prompt_message, download_url, finish)
+                        return
                     elif manual:
-                        self.run_on_ui_thread(messagebox.showinfo, "Up to Date", "You are already on the latest version.")
+                        def show_up_to_date():
+                            messagebox.showinfo("Up to Date", "You are already on the latest version.")
+                            finish()
+                        self.run_on_ui_thread(show_up_to_date)
+                        return
+                    finish()
                 else:
                     logging.error(f"Failed to fetch SourceForge RSS feed: HTTP {response.status_code}")
                     if manual:
-                        self.run_on_ui_thread(messagebox.showerror, "Update Check Failed", "Unable to check for updates. Please try again later.")
+                        def show_failed():
+                            messagebox.showerror("Update Check Failed", "Unable to check for updates. Please try again later.")
+                            finish()
+                        self.run_on_ui_thread(show_failed)
+                        return
+                    finish()
             except Exception as e:
                 logging.error(f"Error during SourceForge update check: {e}")
                 if manual:
-                    self.run_on_ui_thread(messagebox.showerror, "Update Check Failed", "Unable to check for updates. Please try again later.")
+                    def show_failed():
+                        messagebox.showerror("Update Check Failed", "Unable to check for updates. Please try again later.")
+                        finish()
+                    self.run_on_ui_thread(show_failed)
+                    return
+                finish()
 
         threading.Thread(target=update_check, daemon=True).start()
 
-    def _prompt_update(self, prompt_message, download_url):
+    def _prompt_update(self, prompt_message, download_url, on_complete=None):
         theme = self.theme
         fonts = self.fonts
         bg_main = theme["bg"]
@@ -3194,6 +3344,8 @@ class MediaDownloader:
             self.update_overlay.destroy()
         def no_action():
             self.update_overlay.destroy()
+            if on_complete:
+                on_complete()
         yes_button = tk.Button(
             button_frame,
             text="Yes",
@@ -3207,7 +3359,8 @@ class MediaDownloader:
             bd=0,
             padx=20,
             pady=5,
-            width=10
+            width=10,
+            cursor="hand2"
         )
         yes_button.pack(side="left", padx=10)
         self.add_hover_effect(
@@ -3230,7 +3383,8 @@ class MediaDownloader:
             bd=0,
             padx=20,
             pady=5,
-            width=10
+            width=10,
+            cursor="hand2"
         )
         no_button.pack(side="right", padx=10)
         self.add_hover_effect(
@@ -3255,7 +3409,7 @@ class MediaDownloader:
         except queue.Empty:
             pass
         if not self.status_queue.empty():
-            self._after(60, self.poll_status_queue)
+            self._after(16, self.poll_status_queue)
         else:
             self._status_poll_scheduled = False
 
@@ -3275,20 +3429,16 @@ class MediaDownloader:
             self._drain_queue(self.progress_queue)
             self._progress_poll_scheduled = False
             return
+        last_val = None
         try:
-            processed = 0
-            max_tasks = self._max_progress_updates_per_tick
-            last_val = None
-            while processed < max_tasks:
-                val = self.progress_queue.get_nowait()
-                last_val = val
-                processed += 1
+            while True:
+                last_val = self.progress_queue.get_nowait()
         except queue.Empty:
             pass
         if last_val is not None:
             self.display_percent_in_console(last_val)
         if self.downloading and not self.progress_queue.empty():
-            self._after(60, self.poll_progress_queue)
+            self._after(32, self.poll_progress_queue)
         else:
             self._progress_poll_scheduled = False
 
@@ -3374,6 +3524,10 @@ class MediaDownloader:
     def show_settings(self):
         if self.downloading:
             return
+        if getattr(self, "_current_view", None) != "settings":
+            self._settings_enter_size = (self.root.winfo_width(), self.root.winfo_height())
+            self._settings_forced_size = None
+            self._settings_user_resized = False
         self._begin_transition()
         self._ensure_view_container()
         for widget in self.settings_view.winfo_children():
@@ -3383,6 +3537,27 @@ class MediaDownloader:
         self.settings_frame = self.settings_view
         self.settings_frame.configure(bg=theme["bg"])
         tk.Label(self.settings_frame, text="Settings", font=fonts["title"], fg=theme["text"], bg=theme["bg"]).pack(pady=(18, 30))
+        def on_toggle_disable_char_limits():
+            self.config['disable_char_limits'] = not self.config.get('disable_char_limits', False)
+            self.save_config()
+            char_limit_var.set(self.config['disable_char_limits'])
+            self._apply_single_url_limit()
+            self._apply_batch_text_limits()
+        char_limit_var = tk.BooleanVar(value=self.config.get('disable_char_limits', False))
+        disable_char_limits_cb = tk.Checkbutton(
+            self.settings_frame,
+            text="Disable URL length limits",
+            variable=char_limit_var,
+            command=on_toggle_disable_char_limits,
+            font=fonts["body"],
+            bg=theme["bg"],
+            fg=theme["text"],
+            selectcolor=theme["surface_alt"],
+            activebackground=theme["surface_alt"],
+            activeforeground=theme["text"],
+            highlightthickness=0
+        )
+        disable_char_limits_cb.pack(anchor="w", padx=32, pady=(0, 20))
         def on_toggle_disable_warnings():
             self.config['disable_warnings'] = not self.config.get('disable_warnings', False)
             self.save_config()
@@ -3421,17 +3596,24 @@ class MediaDownloader:
             highlightthickness=0
         )
         disable_already_downloaded_cb.pack(anchor="w", padx=32, pady=(0, 20))
-        def on_toggle_batch_downloads():
-            self.config['allow_batch_downloads'] = not self.config.get('allow_batch_downloads', False)
-            self.save_config()
-            batch_var.set(self.config['allow_batch_downloads'])
-            self._pending_batch_refresh = True
-        batch_var = tk.BooleanVar(value=self.config.get('allow_batch_downloads', False))
-        batch_downloads_cb = tk.Checkbutton(
+        def on_toggle_window_resizing():
+            new_value = bool(window_resize_var.get())
+            current_value = bool(self.config.get('enable_window_resizing', True))
+            if new_value == current_value:
+                return
+            if messagebox.askyesno("Restart Required", "Changing window resizing requires restarting the app. Restart now?"):
+                self.config['enable_window_resizing'] = new_value
+                self.save_config()
+                messagebox.showinfo("Restarting", "The app will now restart to apply the change.")
+                self.restart_program()
+            else:
+                window_resize_var.set(current_value)
+        window_resize_var = tk.BooleanVar(value=self.config.get('enable_window_resizing', True))
+        window_resize_cb = tk.Checkbutton(
             self.settings_frame,
-            text="Allow Batch Downloads (multi-link notepad input)",
-            variable=batch_var,
-            command=on_toggle_batch_downloads,
+            text="Enable window resizing",
+            variable=window_resize_var,
+            command=on_toggle_window_resizing,
             font=fonts["body"],
             bg=theme["bg"],
             fg=theme["text"],
@@ -3440,7 +3622,7 @@ class MediaDownloader:
             activeforeground=theme["text"],
             highlightthickness=0
         )
-        batch_downloads_cb.pack(anchor="w", padx=32, pady=(0, 20))
+        window_resize_cb.pack(anchor="w", padx=32, pady=(0, 20))
         def on_toggle_preserve_batch_links():
             self.config['preserve_batch_links'] = not self.config.get('preserve_batch_links', False)
             self.save_config()
@@ -3462,18 +3644,17 @@ class MediaDownloader:
             highlightthickness=0
         )
         preserve_links_cb.pack(anchor="w", padx=32, pady=(0, 20))
-        def on_toggle_disable_char_limits():
-            self.config['disable_char_limits'] = not self.config.get('disable_char_limits', False)
+        def on_toggle_batch_downloads():
+            self.config['allow_batch_downloads'] = not self.config.get('allow_batch_downloads', False)
             self.save_config()
-            char_limit_var.set(self.config['disable_char_limits'])
-            self._apply_single_url_limit()
-            self._apply_batch_text_limits()
-        char_limit_var = tk.BooleanVar(value=self.config.get('disable_char_limits', False))
-        disable_char_limits_cb = tk.Checkbutton(
+            batch_var.set(self.config['allow_batch_downloads'])
+            self._pending_batch_refresh = True
+        batch_var = tk.BooleanVar(value=self.config.get('allow_batch_downloads', False))
+        batch_downloads_cb = tk.Checkbutton(
             self.settings_frame,
-            text="Disable URL length limits",
-            variable=char_limit_var,
-            command=on_toggle_disable_char_limits,
+            text="Allow Batch Downloads (multi-link notepad input)",
+            variable=batch_var,
+            command=on_toggle_batch_downloads,
             font=fonts["body"],
             bg=theme["bg"],
             fg=theme["text"],
@@ -3482,7 +3663,7 @@ class MediaDownloader:
             activeforeground=theme["text"],
             highlightthickness=0
         )
-        disable_char_limits_cb.pack(anchor="w", padx=32, pady=(0, 20))
+        batch_downloads_cb.pack(anchor="w", padx=32, pady=(0, 20))
         def on_toggle_auto_updates():
             self.config['auto_check_updates'] = bool(auto_update_var.get())
             self.save_config()
@@ -3525,6 +3706,52 @@ class MediaDownloader:
             bg_hover=theme["surface_alt_hover"],
             fg_hover=theme["accent"]
         )
+        def on_queue_cap_change():
+            value = self._normalize_ui_queue_cap(queue_cap_var.get())
+            self.config['ui_queue_cap'] = value
+            self.save_config()
+            queue_cap_var.set(str(value))
+            self._max_gui_tasks_per_tick = value
+            self._max_status_tasks_per_tick = value
+            self._max_progress_updates_per_tick = value
+        queue_cap_default = self._default_ui_queue_cap()
+        queue_cap_var = tk.StringVar(value=str(self._normalize_ui_queue_cap(self.config.get('ui_queue_cap'))))
+        tk.Label(self.settings_frame, text="UI queue cap (tasks per tick):", font=fonts["label"], bg=theme["bg"], fg=theme["text"]).pack(anchor="w", padx=32, pady=(0, 4))
+        queue_cap_row = tk.Frame(self.settings_frame, bg=theme["bg"])
+        queue_cap_row.pack(anchor="w", padx=32, pady=(0, 6), fill="x")
+        queue_cap_spin = tk.Spinbox(
+            queue_cap_row,
+            from_=1,
+            to=500,
+            textvariable=queue_cap_var,
+            font=fonts["body"],
+            bg=theme["surface_alt"],
+            fg=theme["text"],
+            relief="flat",
+            bd=0,
+            width=6,
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["border"]
+        )
+        queue_cap_spin.pack(side="left")
+        try:
+            queue_cap_spin.config(
+                buttonbackground="black",
+                buttonforeground="white"
+            )
+        except tk.TclError:
+            pass
+        queue_cap_spin.config(command=on_queue_cap_change)
+        queue_cap_spin.bind("<FocusOut>", lambda e: on_queue_cap_change())
+        queue_cap_spin.bind("<Return>", lambda e: on_queue_cap_change())
+        tk.Label(
+            self.settings_frame,
+            text=f"Drains UI/status queues per tick. Default: {queue_cap_default} (max 500).",
+            font=fonts["caption"],
+            bg=theme["bg"],
+            fg=theme["muted"]
+        ).pack(anchor="w", padx=32, pady=(0, 20))
         def on_max_lines_change():
             value = self._normalize_batch_line_limit(max_lines_var.get())
             self.config['max_batch_lines'] = value
@@ -3582,7 +3809,7 @@ class MediaDownloader:
         concurrency_spin = tk.Spinbox(
             concurrency_row,
             from_=1,
-            to=16,
+            to=64,
             textvariable=concurrency_var,
             font=fonts["body"],
             bg=theme["surface_alt"],
@@ -3727,6 +3954,8 @@ class MediaDownloader:
                     'allow_batch_downloads': False,
                     'disable_already_downloaded_prompts': False,
                     'auto_check_updates': True,
+                    'enable_window_resizing': False,
+                    'ui_queue_cap': self._default_ui_queue_cap(),
                     'download_location': self._default_download_dir(),
                     'batch_concurrency': self._default_batch_concurrency(),
                     'batch_retry_attempts': 1,
@@ -3766,8 +3995,9 @@ class MediaDownloader:
         version_label.pack(side="right", anchor="e", padx=(0, 2))
         self._configure_footer(bottom_bar, bottom_left, bottom_right, min_width=540)
         self.enforce_min_size()
-        self._apply_window_constraints(min_extra=260)
+        self._apply_window_constraints(min_extra=440)
         self.root.update_idletasks()
+        self._settings_forced_size = (self.root.winfo_width(), self.root.winfo_height())
         self._show_view("settings")
         self._after(0, self._fade_in)
 
