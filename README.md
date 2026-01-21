@@ -136,7 +136,7 @@ python MediaCrate.py
 ### Build (PyInstaller)
 
 ```bash
-pyinstaller -F -w -i "icon.ico" --version-file=version.txt --clean MediaCrate.py
+pyinstaller -F -w -i "icon.ico" --clean MediaCrate.py
 ```
 
 The executable will be generated in the `dist/` directory.
