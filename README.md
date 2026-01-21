@@ -1,12 +1,17 @@
 <p align="center">
-  <img width="256" height="200" alt="MediaCrate Logo" src="https://github.com/user-attachments/assets/3bf8495d-40ef-4ca5-863e-a20fb017a738" />
+  <img width="256" height="200"
+       alt="MediaCrate Logo"
+       src="https://github.com/user-attachments/assets/3bf8495d-40ef-4ca5-863e-a20fb017a738" />
 </p>
 
+<h2 align="center">The Universal Multimedia Downloader</h2>
 
 <p align="center">
-  <b>The Universal Multimedia Downloader</b><br>
-  Download video and audio from over <b>1,000+ websites</b> with one click
+  Download video and audio from over <b>1,000+ websites</b><br/>
+  with one click
 </p>
+
+<br/>
 
 <p align="center">
   <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe">
@@ -18,9 +23,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a> &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/issues">Issues</a> &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/wiki">Documentation</a> &nbsp;•&nbsp;
+  <a href="https://justagwas.com/projects/mediacrate">Website</a>
+  &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a>
+  &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/issues">Issues</a>
+  &nbsp;•&nbsp;
+  <a href="https://github.com/Justagwas/MediaCrate/wiki">Documentation</a>
+  &nbsp;•&nbsp;
   <a href="https://github.com/Justagwas/MediaCrate/blob/main/LICENSE">License</a>
 </p>
 
