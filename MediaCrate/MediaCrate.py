@@ -3340,8 +3340,8 @@ class MediaDownloader:
         button_frame.pack(pady=15)
         def yes_action():
             self.open_url(download_url)
-            self.abort()
             self.update_overlay.destroy()
+            self.terminate_program()
         def no_action():
             self.update_overlay.destroy()
             if on_complete:
