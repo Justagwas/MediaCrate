@@ -2199,8 +2199,11 @@ class MediaDownloader:
                 self._batch_forced_size = None
                 self._batch_resize_pending = True
             else:
-                if self._batch_enter_size and not self._batch_user_resized:
-                    target_w, target_h = self._batch_enter_size
+                if not self._batch_user_resized:
+                    if self._batch_enter_size:
+                        target_w, target_h = self._batch_enter_size
+                    else:
+                        target_w, target_h = self._base_minsize()
                     self._set_geometry_safe(target_w, target_h)
                     self._last_user_size = (target_w, target_h)
                 self._batch_enter_size = None
