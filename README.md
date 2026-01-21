@@ -173,7 +173,7 @@ If reporting bugs, please include clear reproduction steps.
 
 Apache-2.0
 
-See `LICENSE` for details.
+See [`LICENSE`](https://github.com/Justagwas/MediaCrate?tab=Apache-2.0-1-ov-file) for details.
 
 ---
 
