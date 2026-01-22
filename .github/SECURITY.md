@@ -8,7 +8,7 @@ This project is currently maintained on a best-effort basis. Security updates wi
 
 | Version | Supported |
 |---------|-----------|
-| Latest  | ✅         |
+| Latest  | ✅ Yes ✅      |
 
 Older versions are not guaranteed to receive patches.
 
