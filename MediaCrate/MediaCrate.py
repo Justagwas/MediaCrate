@@ -1,6 +1,6 @@
-#Checkout my other projects! https://www.justagwas.com
-#You can find the OFFICIAL CODE of this program here - https://sourceforge.net/p/mediacrate/code/ci/master/tree/
-#You can also find the REPO in GitHub - https://github.com/Justagwas/MediaCrate
+#Checkout my other projects! https://justagwas.com
+#You can find the OFFICIAL CODE of this program here - https://sourceforge.net/p/mediacrate/code/ci/main/tree/
+#You can also find the REPO in GitHub - https://github.com/Justagwas/mediacrate
 import tkinter as tk
 from tkinter import messagebox, ttk
 from yt_dlp import YoutubeDL
@@ -1068,7 +1068,7 @@ class MediaDownloader:
                     return
             def download_icon():
                 try:
-                    icon_url = "https://sourceforge.net/p/mediacrate/code/ci/master/tree/icon.ico?format=raw"
+                    icon_url = "https://sourceforge.net/p/mediacrate/code/ci/main/tree/MediaCrate/icon.ico?format=raw"
                     logging.info(f"Downloading icon from {icon_url} to {icon_path}")
                     response = requests.get(icon_url, stream=True, timeout=10)
                     response.raise_for_status()
@@ -1816,12 +1816,24 @@ class MediaDownloader:
                     clipboard = self.root.clipboard_get()
                 except tk.TclError:
                     return "break"
+
+                try:
+                    yview = self.url_text.yview()
+                    xview = self.url_text.xview()
+                    insert_pos = self.url_text.index("insert")
+                except Exception:
+                    yview = None
+                    xview = None
+                    insert_pos = None
+
                 try:
                     self.url_text.edit_separator()
                 except Exception:
                     pass
+
                 max_lines = self._normalize_batch_line_limit(self.config.get('max_batch_lines'))
                 disable_limits = self.config.get('disable_char_limits', False)
+
                 existing = [line for line in self.url_text.get("1.0", "end-1c").splitlines() if line.strip()]
                 for line in clipboard.splitlines():
                     line = line.strip()
@@ -1832,16 +1844,30 @@ class MediaDownloader:
                     if len(existing) >= max_lines:
                         break
                     existing.append(line)
+
                 self.url_text.delete("1.0", tk.END)
                 if existing:
                     self.url_text.insert("1.0", "\n".join(existing))
+
+                try:
+                    if yview is not None:
+                        self.url_text.yview_moveto(yview[0])
+                    if xview is not None:
+                        self.url_text.xview_moveto(xview[0])
+                    if insert_pos is not None:
+                        self.url_text.mark_set("insert", insert_pos)
+                except Exception:
+                    pass
+
                 try:
                     self.url_text.edit_separator()
                 except Exception:
                     pass
+
                 self._apply_batch_text_limits()
                 update_line_numbers()
                 return "break"
+
             self.url_text.bind("<Control-v>", batch_paste_handler)
             self.url_text.bind("<Control-V>", batch_paste_handler)
         else:
@@ -2144,7 +2170,7 @@ class MediaDownloader:
         )
         official_link = tk.Label(bottom_right, text="Official page", font=fonts["caption"], fg=theme["accent"], bg=theme["bg"], cursor="hand2")
         official_link.pack(side="right", anchor="e", padx=(0, 8))
-        official_link.bind("<Button-1>", lambda e: self.open_url("https://justagwas.com/projects/MediaCrate"))
+        official_link.bind("<Button-1>", lambda e: self.open_url("https://justagwas.com/projects/mediacrate"))
         self.add_hover_effect(
             official_link,
             bg_normal=theme["bg"], fg_normal=theme["accent"],
@@ -3290,8 +3316,8 @@ class MediaDownloader:
                 return None, None
 
         def fetch_from_github_latest():
-            download_url = "https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe"
-            latest_page = "https://github.com/Justagwas/MediaCrate/releases/latest"
+            download_url = "https://github.com/Justagwas/mediacrate/releases/latest/download/MediaCrateSetup.exe"
+            latest_page = "https://github.com/Justagwas/mediacrate/releases/latest"
 
             try:
                 r = requests.get(latest_page, timeout=10, allow_redirects=True)
@@ -4121,7 +4147,7 @@ class MediaDownloader:
         )
         official_link = tk.Label(bottom_right, text="Official page", font=fonts["caption"], fg=theme["accent"], bg=theme["bg"], cursor="hand2")
         official_link.pack(side="right", anchor="e", padx=(0, 12))
-        official_link.bind("<Button-1>", lambda e: self.open_url("https://justagwas.com/projects/MediaCrate"))
+        official_link.bind("<Button-1>", lambda e: self.open_url("https://justagwas.com/projects/mediacrate"))
         self.add_hover_effect(
             official_link,
             bg_normal=theme["bg"], fg_normal=theme["accent"],
