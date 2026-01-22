@@ -3252,64 +3252,197 @@ class MediaDownloader:
             self.run_on_ui_thread(self._schedule_progress_poll)
 
 
-    def check_for_updates(self, manual=False, on_complete=None):#UPDATE CHECK
+    def check_for_updates(self, manual=False, on_complete=None):  # UPDATE CHECK
         def finish():
             if on_complete:
                 self.run_on_ui_thread(on_complete)
+
+        def normalize_version(v: str) -> str:
+            if not v:
+                return ""
+            v = str(v).strip()
+            return v[1:] if v.lower().startswith("v") else v
+
+        def parse_version_from_text(text: str) -> str:
+            if not text:
+                return ""
+            m = re.search(r"(\d+\.\d+\.\d+)", text)
+            return m.group(1) if m else ""
+
+        def fetch_from_website_manifest():
+            manifest_url = "https://www.justagwas.com/projects/mediacrate/latest.json"
+            try:
+                r = requests.get(manifest_url, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+
+                raw_version = str(data.get("version", "")).strip()
+                download_url = str(data.get("url", "")).strip()
+
+                v_norm = normalize_version(raw_version)
+                if not v_norm or not download_url:
+                    logging.error("Manifest missing/invalid 'version' or 'url'.")
+                    return None, None
+
+                return f"v{v_norm}", download_url
+            except Exception as e:
+                logging.error(f"Website manifest check failed: {e}")
+                return None, None
+
+        def fetch_from_github_latest():
+            download_url = "https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe"
+            latest_page = "https://github.com/Justagwas/MediaCrate/releases/latest"
+
+            try:
+                r = requests.get(latest_page, timeout=10, allow_redirects=True)
+                r.raise_for_status()
+
+                final_url = r.url or ""
+                v_norm = parse_version_from_text(final_url)
+                if not v_norm:
+                    v_norm = parse_version_from_text(r.text)
+
+                if not v_norm:
+                    logging.error("GitHub latest release reachable but version not detected.")
+                    return None, None
+
+                return f"v{v_norm}", download_url
+            except Exception as e:
+                logging.error(f"GitHub latest release check failed: {e}")
+                return None, None
+
+        def fetch_from_sourceforge_rss(current_version_display: str):
+            rss_url = "https://sourceforge.net/projects/mediacrate/rss?path=/"
+            had_any_version_candidates = False
+
+            try:
+                response = requests.get(rss_url, timeout=10)
+                if response.status_code != 200:
+                    logging.error(f"Failed to fetch SourceForge RSS feed: HTTP {response.status_code}")
+                    return None, None, had_any_version_candidates
+
+                root = ET.fromstring(response.text)
+                current_norm = normalize_version(current_version_display)
+
+                best_version = None
+                best_link = None
+
+                for item in root.findall(".//item"):
+                    title_el = item.find("title")
+                    link_el = item.find("link")
+                    if title_el is None or link_el is None:
+                        continue
+
+                    title = title_el.text or ""
+                    link = link_el.text or ""
+
+                    match = re.search(r"_v(\d+\.\d+\.\d+)", title)
+                    if not match:
+                        continue
+
+                    had_any_version_candidates = True
+                    candidate_norm = match.group(1)
+
+                    try:
+                        if Version(candidate_norm) > Version(current_norm):
+                            best_version = f"v{candidate_norm}"
+                            best_link = link
+                            break
+                    except InvalidVersion:
+                        logging.error(f"Invalid version format in RSS: {candidate_norm}")
+                        continue
+
+                return best_version, best_link, had_any_version_candidates
+
+            except Exception as e:
+                logging.error(f"Error during SourceForge update check: {e}")
+                return None, None, had_any_version_candidates
+
+        def show_failed_ui():
+            messagebox.showerror(
+                "Update Check Failed",
+                "Unable to check for updates. Please try again later."
+            )
+            finish()
+
         def update_check():
             try:
                 current_version = "v1.0.0"
-                rss_url = "https://sourceforge.net/projects/mediacrate/rss?path=/"
-                response = requests.get(rss_url, timeout=10)
-                if response.status_code == 200:
-                    root = ET.fromstring(response.text)
-                    latest_version = None
-                    download_url = None
 
-                    for item in root.findall(".//item"):
-                        title = item.find("title").text
-                        link = item.find("link").text
-                        match = re.search(r"_v(\d+\.\d+\.\d+)", title)
-                        if match:
-                            version_str = f"v{match.group(1)}"
-                            try:
-                                if Version(version_str) > Version(current_version):
-                                    latest_version = version_str
-                                    download_url = link
-                                    break
-                            except InvalidVersion:
-                                logging.error(f"Invalid version format: {version_str}")
-                    
-                    if latest_version and download_url:
-                        prompt_message = (
-                            f"A newer version - {latest_version} is available!\n"
-                            f"Would you like to download it now?"
-                        )
-                        self.run_on_ui_thread(self._prompt_update, prompt_message, download_url, finish)
-                        return
-                    elif manual:
+                latest_version, download_url = fetch_from_website_manifest()
+                if latest_version and download_url:
+                    try:
+                        if Version(normalize_version(latest_version)) > Version(normalize_version(current_version)):
+                            prompt_message = (
+                                f"A newer version - {latest_version} is available!\n"
+                                f"Would you like to download it now?"
+                            )
+                            self.run_on_ui_thread(self._prompt_update, prompt_message, download_url, finish)
+                            return
+                    except InvalidVersion as e:
+                        logging.error(f"Invalid version comparison (manifest): {e}")
+
+                    if manual:
                         def show_up_to_date():
                             messagebox.showinfo("Up to Date", "You are already on the latest version.")
                             finish()
                         self.run_on_ui_thread(show_up_to_date)
                         return
                     finish()
-                else:
-                    logging.error(f"Failed to fetch SourceForge RSS feed: HTTP {response.status_code}")
+                    return
+
+                latest_version, download_url = fetch_from_github_latest()
+                if latest_version and download_url:
+                    try:
+                        if Version(normalize_version(latest_version)) > Version(normalize_version(current_version)):
+                            prompt_message = (
+                                f"A newer version - {latest_version} is available!\n"
+                                f"Would you like to download it now?"
+                            )
+                            self.run_on_ui_thread(self._prompt_update, prompt_message, download_url, finish)
+                            return
+                    except InvalidVersion as e:
+                        logging.error(f"Invalid version comparison (github): {e}")
+
                     if manual:
-                        def show_failed():
-                            messagebox.showerror("Update Check Failed", "Unable to check for updates. Please try again later.")
+                        def show_up_to_date():
+                            messagebox.showinfo("Up to Date", "You are already on the latest version.")
                             finish()
-                        self.run_on_ui_thread(show_failed)
+                        self.run_on_ui_thread(show_up_to_date)
                         return
                     finish()
-            except Exception as e:
-                logging.error(f"Error during SourceForge update check: {e}")
+                    return
+
+                latest_version, download_url, had_candidates = fetch_from_sourceforge_rss(current_version)
+                if latest_version and download_url:
+                    prompt_message = (
+                        f"A newer version - {latest_version} is available!\n"
+                        f"Would you like to download it now?"
+                    )
+                    self.run_on_ui_thread(self._prompt_update, prompt_message, download_url, finish)
+                    return
+
+                if not had_candidates:
+                    logging.error("SourceForge RSS did not contain any parsable version entries.")
+                    if manual:
+                        self.run_on_ui_thread(show_failed_ui)
+                        return
+                    finish()
+                    return
+
                 if manual:
-                    def show_failed():
-                        messagebox.showerror("Update Check Failed", "Unable to check for updates. Please try again later.")
+                    def show_up_to_date():
+                        messagebox.showinfo("Up to Date", "You are already on the latest version.")
                         finish()
-                    self.run_on_ui_thread(show_failed)
+                    self.run_on_ui_thread(show_up_to_date)
+                    return
+
+                finish()
+
+            except Exception as e:
+                logging.error(f"Error during update check: {e}")
+                if manual:
+                    self.run_on_ui_thread(show_failed_ui)
                     return
                 finish()
 
