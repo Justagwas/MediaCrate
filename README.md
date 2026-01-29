@@ -119,11 +119,11 @@ Located next to `MediaCrate.py`.
 ### Requirements
 
 ```
-packaging==25.0
+packaging==26.0
 pathvalidate==3.3.1
 pywin32==311
 Requests==2.32.5
-yt_dlp==2025.12.8
+yt_dlp==2026.01.29
 ```
 
 ### Run From Source
