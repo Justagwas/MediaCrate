@@ -1,6 +1,5 @@
-#Checkout my other projects! https://justagwas.com
-#You can find the OFFICIAL CODE of this program here - https://sourceforge.net/p/mediacrate/code/ci/main/tree/
-#You can also find the REPO in GitHub - https://github.com/Justagwas/mediacrate
+#Check out my other projects! https://justagwas.com/projects
+#You can find the OFFICIAL CODE of this program here - https://github.com/Justagwas/mediacrate
 import tkinter as tk
 from tkinter import messagebox, ttk
 from yt_dlp import YoutubeDL
@@ -646,7 +645,7 @@ class MediaDownloader:
         self._batch_user_resized = False
         self._batch_resize_pending = False
         self._window_resizing_enabled = bool(self.config.get('enable_window_resizing', True))
-        self.root.title("MediaCrate") #Version 1.0.0
+        self.root.title("MediaCrate") #Version 1.0.1
         self.root.configure(bg=self.theme["bg"])
         self.root.resizable(self._window_resizing_enabled, self._window_resizing_enabled)
         self.configure_styles()
@@ -2176,7 +2175,7 @@ class MediaDownloader:
             bg_normal=theme["bg"], fg_normal=theme["accent"],
             bg_hover=theme["bg"], fg_hover=theme["text"]
         )
-        version_label = tk.Label(bottom_right, text="v1.0.0", font=fonts["caption"], fg=theme["muted"], bg=theme["bg"])
+        version_label = tk.Label(bottom_right, text="v1.0.1", font=fonts["caption"], fg=theme["muted"], bg=theme["bg"])
         version_label.pack(side="right", anchor="e", padx=(0, 8))
         self._configure_footer(bottom_bar, bottom_left, bottom_right, min_width=540)
         self.enforce_min_size()
@@ -3393,7 +3392,7 @@ class MediaDownloader:
 
         def update_check():
             try:
-                current_version = "v1.0.0"
+                current_version = "v1.0.1"
 
                 latest_version, download_url = fetch_from_website_manifest()
                 if latest_version and download_url:
@@ -4153,7 +4152,7 @@ class MediaDownloader:
             bg_normal=theme["bg"], fg_normal=theme["accent"],
             bg_hover=theme["bg"], fg_hover=theme["text"]
         )
-        version_label = tk.Label(bottom_right, text="v1.0.0 ", font=fonts["caption"], fg=theme["muted"], bg=theme["bg"])
+        version_label = tk.Label(bottom_right, text="v1.0.1 ", font=fonts["caption"], fg=theme["muted"], bg=theme["bg"])
         version_label.pack(side="right", anchor="e", padx=(0, 2))
         self._configure_footer(bottom_bar, bottom_left, bottom_right, min_width=540)
         self.enforce_min_size()
