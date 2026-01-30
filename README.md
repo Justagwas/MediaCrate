@@ -1,24 +1,27 @@
 <p align="center">
-  <img width="256" height="256"
-       alt="MediaCrate Logo"
-       src="https://github.com/user-attachments/assets/298427b1-d609-4e22-84c4-2c28bd980951" />
+  <img
+    width="256"
+    height="256"
+    alt="MediaCrate Logo"
+    src="https://github.com/user-attachments/assets/298427b1-d609-4e22-84c4-2c28bd980951"
+  />
 </p>
 
-<h2 align="center">The Universal Multimedia Downloader</h2>
+<h1 align="center">MediaCrate</h1>
+
+<h3 align="center">The universal multimedia downloader</h3>
 
 <p align="center">
-  Download video and audio from over <b>1,000+ websites</b><br/>
-  with one click
+  Download video and audio from over <strong>1,000+ supported websites</strong><br/>
+  with a simple, local desktop app.
 </p>
-
-<br/>
 
 <p align="center">
   <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe">
     <img
-      src="https://img.shields.io/badge/▼%20Download%20MediaCrate%20for%20Windows%20▼-2563eb?style=for-the-badge&logo=windows&logoColor=white"
+      src="https://img.shields.io/badge/Download%20for%20Windows-2563eb?style=for-the-badge&logo=windows&logoColor=white"
       alt="Download MediaCrate for Windows"
-    >
+    />
   </a>
 </p>
 
@@ -36,32 +39,18 @@
 
 ---
 
-## Built to be simple
+## Overview
 
-MediaCrate is a fast, lightweight desktop application for downloading video and audio from supported websites.
+MediaCrate is a fast, lightweight desktop application for downloading video and
+audio from supported websites.
 
-Paste a link, choose your options, and download.
+Paste a link, choose your format and quality, and download.
 
 MediaCrate is built to be efficient:
 
 - ~0% CPU usage while idle
-
 - ~1% CPU usage during light downloads
-
 - ~40 MB memory footprint
-
----
-
-## 📋 Features
-
-* One-click downloads with real-time status
-* Single or batch downloads
-* Output formats: MP4, MP3, MOV, WAV
-* Video quality selection up to 4K (when available)
-* Duplicate and invalid link detection in batch mode
-* Safe cancel - active downloads stop instantly
-* Custom download location
-* Built-in console with timestamps and selectable text
 
 ---
 
@@ -69,9 +58,22 @@ MediaCrate is built to be efficient:
 
 1. Paste a URL (or multiple URLs for batch mode)
 2. Choose format and quality
-3. Click Download
+3. Click **Download**
 
 That's it.
+
+---
+
+## Features
+
+- One-click downloads with real-time status
+- Single and batch downloads
+- Output formats: MP4, MP3, MOV, WAV and other
+- Video quality selection up to 4K (when available)
+- Duplicate and invalid link detection in batch mode
+- Safe cancel (active downloads stop immediately)
+- Custom download location
+- Built-in console with timestamps and warnings
 
 ---
 
@@ -79,26 +81,37 @@ That's it.
 
 Batch downloads are handled like so:
 
-* Duplicate URLs are skipped and marked
-* Invalid entries are clearly labeled
-* Existing files can be skipped or re-downloaded based on your preferences
-* Adjustable concurrency and retry limits
+- Duplicate URLs are skipped and clearly marked
+- Invalid entries are labeled
+- Existing files can be skipped or re-downloaded based on preferences
+- Adjustable concurrency and retry limits
 
 ---
 
 ## Supported Sites
 
-Site support follows yt-dlp upstream updates.
+Site support follows upstream `yt-dlp` updates.
 
-See `MediaCrate/supportedsites.md` for the full list.
+For the full list of supported websites, see:
+
+```
+MediaCrate/supportedsites.md
+```
 
 ---
 
-## 🎥 Preview
+## Preview
 
 <details>
-  <summary><strong>CLICK HERE TO EXPAND AND VIEW PREVIEW VIDEO</strong></summary>
-  <video src="https://github.com/user-attachments/assets/ef20c013-5a79-41c1-9dc0-d40ba03d27ef" controls muted style="max-width: auto; height: auto;" ></video>
+<summary><strong>Click to expand preview video</strong></summary>
+
+<video
+  src="https://github.com/user-attachments/assets/ef20c013-5a79-41c1-9dc0-d40ba03d27ef"
+  controls
+  muted
+  style="max-width: 100%; height: auto;">
+</video>
+
 </details>
 
 ---
@@ -116,22 +129,28 @@ MediaCrate_config.json
 
 Located next to `MediaCrate.py`.
 
+---
+
 ### Requirements
 
 ```
 packaging==26.0
 pathvalidate==3.3.1
 pywin32==311
-Requests==2.32.5
-yt_dlp==2026.01.29
-```
+requests==2.32.5
+yt-dlp==2026.01.29
+````
+
+---
 
 ### Run From Source
 
 ```bash
 pip install -r requirements.txt
 python MediaCrate.py
-```
+````
+
+---
 
 ### Build (PyInstaller)
 
@@ -145,9 +164,10 @@ The executable will be generated in the `dist/` directory.
 
 ---
 
-## ⚠️ Security & Warnings
+## Security and OS Warnings
 
-Operating systems may show warnings when downloading MediaCrate simply because it is not yet widely recognized.
+Your operating system may show warnings when downloading or running MediaCrate
+because it is not yet widely recognized.
 
 MediaCrate is:
 
@@ -155,9 +175,11 @@ MediaCrate is:
 * Local-only (no accounts, no telemetry)
 * Limited strictly to the URLs you provide
 
-You are encouraged to review the source code or scan the executable with any security tool of your choice.
+You are encouraged to review the source code or scan the executable with any
+security tool of your choice.
 
-If downloaded from the official repository or release page, it can be independently verified and safely used.
+If downloaded from the official repository or release page, it can be
+independently verified and safely used.
 
 ---
 
@@ -167,7 +189,7 @@ If downloaded from the official repository or release page, it can be independen
 * Not DRM-circumvention software
 * Not a cloud-based downloader
 
-MediaCrate downloads only what you explicitly request.
+MediaCrate only downloads content you explicitly request.
 
 ---
 
@@ -175,22 +197,18 @@ MediaCrate downloads only what you explicitly request.
 
 Issues, suggestions, and pull requests are welcome.
 
-If reporting bugs, please include clear reproduction steps.
+If reporting a bug, please include clear reproduction steps.
 
 ---
 
-## 📜 License
+## License
 
-Apache-2.0
+Apache License 2.0
 
-See [`LICENSE`](https://github.com/Justagwas/MediaCrate?tab=Apache-2.0-1-ov-file) for details.
+See `LICENSE` for details.
 
 ---
 
-## 📬 Contact
+## Contact
 
 [email@justagwas.com](mailto:email@justagwas.com)
-
----
-
-MediaCrate is designed to be intuitive, fast, and simple.
