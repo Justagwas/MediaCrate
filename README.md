@@ -1,7 +1,7 @@
 <p align="center">
   <img
-    width="256"
-    height="256"
+    width="192"
+    height="192"
     alt="MediaCrate Logo"
     src="https://github.com/user-attachments/assets/298427b1-d609-4e22-84c4-2c28bd980951"
   />
