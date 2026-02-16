@@ -120,7 +120,7 @@ Default output folder: `%USERPROFILE%\Downloads\MediaCrate`.
 
 ```powershell
 cd MediaCrate
-py -m pip install -r MediaCrate/requirements.txt
+py -m pip install -r requirements.txt
 py MediaCrate.py
 ```
 
