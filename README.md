@@ -23,9 +23,9 @@
 
 </div>
 
-<p align="center"><b>The universal multimedia downloader application</b></p>
+<p align="center"><b>The all-in-one multimedia downloader application</b></p>
 
-<p align="center">Paste a link, select your preferred format and quality, queue batch downloads with pause/resume/retry support, and manage everything in one place</p>
+<p align="center">Paste a link, select your preferred format and quality, queue 100+ downloads with pause/resume/retry support, and manage it all in one place</p>
 
 <div align="center">
 
