@@ -361,8 +361,15 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-MediaCrate/version.txt
 /MediaCrate/dist
 /MediaCrate/build
+/release
 MediaCrate/MediaCrate_config.json
-MediaCrate/MediaCrate.spec
+MediaCrate/batch_queue_state.json
+MediaCrate/download_archive.txt
+MediaCrate/download_history.json
+MediaCrate/ffmpeg.exe
+MediaCrate/ffprobe.exe
+/MediaCrate/tests
+*.spec
+MediaCrate/version.txt

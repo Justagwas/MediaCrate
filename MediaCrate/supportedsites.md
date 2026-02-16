@@ -1,5 +1,5 @@
-Below is a list of all extractors that are currently supported in MediaCrate.
-The only reliable way to check if a site is supported is to try it.
+This list mirrors upstream `yt-dlp` extractor support and can change between releases.
+The only reliable way to verify a specific URL is to test it in the current MediaCrate build.
 
 - 10play
 - 17live

@@ -1,178 +1,159 @@
+# MediaCrate
+
+<div align="center">
+
+[![Code: GitHub](https://img.shields.io/badge/Code-GitHub-111827.svg?style=flat&logo=github&logoColor=white)](https://github.com/Justagwas/MediaCrate)
+[![Website](https://img.shields.io/badge/Website-MediaCrate-0ea5e9.svg?style=flat&logo=google-chrome&logoColor=white)](https://Justagwas.com/projects/mediacrate)
+[![Mirror: SourceForge](https://img.shields.io/badge/Mirror-SourceForge-ff6600.svg?style=flat&logo=sourceforge&logoColor=white)](https://sourceforge.net/projects/mediacrate/)
+
+</div>
+
 <p align="center">
   <img
-    width="192"
-    height="192"
+    width="128"
+    height="128"
     alt="MediaCrate Logo"
     src="https://github.com/user-attachments/assets/6293a8af-3d7e-4856-a939-ca063cd6185c"
   />
 </p>
 
-<h1 align="center">MediaCrate</h1>
+<div align="center">
 
-<h3 align="center">The universal multimedia downloader</h3>
+[![Download (Windows)](https://img.shields.io/badge/Download-Windows%20(MediaCrateSetup.exe)-2563eb.svg?style=flat&logo=windows&logoColor=white)](https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe)
 
-<p align="center">
-  Save media from supported sources with format, quality, and fallback controls<br/>
-  with a lightweight desktop app.
-</p>
+</div>
 
-<p align="center">
-  <a href="https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe">
-    <img
-      src="https://img.shields.io/badge/Download%20for%20Windows-2563eb?style=for-the-badge&logo=windows&logoColor=white"
-      alt="Download MediaCrate for Windows"
-    />
-  </a>
-</p>
+<p align="center"><b>The universal multimedia downloader application</b></p>
 
-<p align="center">
-  <a href="https://www.justagwas.com/projects/mediacrate">Website</a>
-  &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/releases">Releases</a>
-  &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/issues">Issues</a>
-  &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/wiki">Documentation</a>
-  &nbsp;•&nbsp;
-  <a href="https://github.com/Justagwas/MediaCrate/blob/main/LICENSE">License</a>
-</p>
+<p align="center">Paste a link, select your preferred format and quality, queue batch downloads with pause/resume/retry support, and manage everything in one place</p>
 
----
+<div align="center">
+
+[![Version](https://img.shields.io/github/v/tag/Justagwas/MediaCrate.svg?label=Version)](
+https://github.com/Justagwas/MediaCrate/tags)
+[![Last Commit](https://img.shields.io/github/last-commit/Justagwas/MediaCrate/main.svg?style=flat&cacheSeconds=3600)](
+https://github.com/Justagwas/MediaCrate/commits/main)
+[![Stars](https://img.shields.io/github/stars/Justagwas/MediaCrate.svg?style=flat&cacheSeconds=3600)](
+https://github.com/Justagwas/MediaCrate/stargazers)
+[![Open Issues](https://img.shields.io/github/issues/Justagwas/MediaCrate.svg)](
+https://github.com/Justagwas/MediaCrate/issues)
+[![License](https://img.shields.io/github/license/Justagwas/MediaCrate.svg)](
+https://github.com/Justagwas/MediaCrate/blob/main/LICENSE)
+
+</div>
 
 ## Overview
 
-MediaCrate is a desktop app for downloading video or audio from supported sources using `yt-dlp` with a simple UI.
+MediaCrate is a Windows desktop downloader built with Python and `yt-dlp`. It supports both single-URL and multi-URL workflows, with in-app queue controls, dependency setup, and persistent user settings.
 
-It includes URL validation, format/quality selection, batch downloads, fallback download strategies, and settings for advanced source handling (cookies and proxy).
+MediaCrate's performance:
+- ~0% CPU usage while idle
+- ~1% CPU usage during active use
+- ~60 MB memory usage
+- Download performance depends solely on your internet connection.
 
-For source support details, see [`MediaCrate/supportedsites.md`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md).  
-
-MediaCrate is built to be efficient:  
-- ~0% CPU usage while idle  
-- ~1% CPU usage during light downloads  
-- ~40 MB memory footprint  
+- Supported sites: https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md
 
 ## Basic usage
 
-1. Launch MediaCrate.
-2. Paste one media URL (or enable batch mode in **Settings** for multiple links).
-3. Choose format and quality.
-4. Click **Download**.
-5. Use **STOP** to abort active work, or **Open downloads folder** to jump to saved files.
+1. Download and install from the [latest release](https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe).
+2. Launch MediaCrate.
+3. Paste a URL in the input field.
+4. Choose format and quality.
+5. Click `DOWNLOAD` for single-link mode, or switch to `Multi-URL` for queue mode.
+6. Track progress in the progress bar and console.
+7. Open files/folders from the History section.
 
-Default output location is `~/Downloads/MediaCrate` (configurable in Settings).
+Default output folder: `%USERPROFILE%\Downloads\MediaCrate`.
 
 ## Features
 
-- Single-link and optional batch-link download workflows.
-- Format presets (`VIDEO`, `AUDIO`, `MP4`, `MP3`) plus dynamic format loading via `Load others`.
-- Dynamic quality probing (up to available source resolutions, including `2160p` when available).
-- Download retries and fallback attempts for difficult sources.
-- Optional browser cookies and proxy support.
-- First-launch setup wizard and UI scale setup flow.
-- Theme support (`dark` / `light`), update checks, and runtime settings persistence.
+- Single-URL and Multi-URL download modes.
+- Queue operations: add, bulk paste, import, export, start, pause, resume, stop, retry, remove.
+- Format and quality selection with metadata probing and fallback behavior.
+- Download controls for conflict policy, retry profile, speed limit, and adaptive concurrency.
+- Built-in dependency install actions for FFmpeg and Node.js.
+- History tools for open file/folder, retry URL, and clear history.
+- Guided in-app tutorial.
+- Runtime storage under `%LOCALAPPDATA%\MediaCrate`.
 
-## Batch downloads
+## Feature sections
 
-- Batch mode can be enabled in Settings (`Allow Batch Downloads`).
-- Detects invalid URLs and duplicate URLs before starting downloads.
-- Handles already-existing files with optional re-download prompts.
-- Supports configurable batch concurrency, retries, and maximum batch lines.
-- Optional `Enable fallback attempts for batch downloads` for harder cases.
+### Download modes
 
-## Format, quality, and source handling
+- `Single-URL`: direct one-link workflow.
+- `Multi-URL`: queue-based workflow with row-level status and actions.
+- Both modes share the same output, format/quality, and policy controls.
 
-- Quality options are probed from source metadata for the selected URL/format.
-- Audio formats always use best available audio stream for extraction.
-- `Load others` pulls additional container/codec extensions available for the current URL.
-- Proxy format is validated (for example `http://host:port` or `socks5://user:pass@host:port`).
-- Browser cookies can be enabled and sourced from `chrome`, `edge`, `firefox`, `brave`, `opera`, `vivaldi`, or `safari`.
+### Queue and batch controls
 
-## First-launch and dependency prompts
+- Bulk operations include paste/import/export and start-all behavior.
+- Pause/resume and retry states are surfaced per-row and in aggregate progress.
+- Queue state can be restored between sessions.
 
-- First run includes a setup wizard (download location, warnings behavior, default format, etc.).
-- App checks for FFmpeg and Node.js; on Windows, guided install prompts are available.
-- Built-in update checks use the official manifest, GitHub latest release, and SourceForge RSS as fallback.
+### Dependencies
+
+- FFmpeg is required for key merge/conversion paths and is checked on startup.
+- Node.js is installable from Settings for compatible workflows.
+- Install progress and status are shown in-app.
+
+### Updates and release metadata
+
+- Update checks are driven by the official manifest (`latest.json`) and trusted fallback providers.
+- Release details are available from GitHub releases and the project site.
 
 ## Preview
 
-- Project page with full preview gallery: [justagwas.com/projects/mediacrate](https://www.justagwas.com/projects/mediacrate)
-- OpenPiano Installer Download link: [justagwas.com/projects/mediacrate/download](https://www.justagwas.com/projects/mediacrate/download)
+- Website project page (overview + gallery): <https://www.justagwas.com/projects/mediacrate>
+- Download page: <https://www.justagwas.com/projects/mediacrate/download>
+- Releases: <https://github.com/Justagwas/mediacrate/releases>
 
-<details>
-<summary>For Developers</summary>
+<details><summary>For Developers</summary>
 
 ### Requirements
 
-- Python 3 with Tkinter available.
-- Dependencies from [`MediaCrate/requirements.txt`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/requirements.txt):
-  - `packaging==26.0`
-  - `pathvalidate==3.3.1`
-  - `pywin32==311`
-  - `Requests==2.32.5`
-  - `yt_dlp==2026.1.29`
+- Windows (primary runtime target).
+- Python 3.11+.
+- Dependencies in [`MediaCrate/requirements.txt`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/requirements.txt)
 
 ### Running From Source
 
-```bash
+```powershell
 cd MediaCrate
-py -m pip install -r requirements.txt
+py -m pip install -r MediaCrate/requirements.txt
 py MediaCrate.py
 ```
 
-### Testing (optional)
+### Configuration Files
 
-From `MediaCrate/`:
-
-```bash
-py -m unittest discover -s tests -p "test_*.py" -v
-```
-
-### Build (optional)
-
-There is no committed automated build script in this repo. For a manual one-file build:
-
-```bash
-cd MediaCrate
-py -m pip install pyinstaller
-py -m PyInstaller -F -w -i "icon.ico" --clean MediaCrate.py
-```
-
-### Configuration Files (developer-relevant)
-
-- Runtime config: `MediaCrate_config.json` (auto-generated in app directory or `%LOCALAPPDATA%\MediaCrate` when needed).
-- Project dependencies: [`MediaCrate/requirements.txt`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/requirements.txt).
-- Supported extractor snapshot: [`MediaCrate/supportedsites.md`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md).
-- Static analysis workflow: [`.github/workflows/codeql.yml`](https://github.com/Justagwas/MediaCrate/blob/main/.github/workflows/codeql.yml).
+- App settings schema and persistence logic: [`MediaCrate/mediacrate/core/config_service.py`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/mediacrate/core/config_service.py)
+- Runtime path resolution and storage directories: [`MediaCrate/mediacrate/core/paths.py`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/mediacrate/core/paths.py)
 
 </details>
 
 ## Security and OS Warnings
 
-Windows may show SmartScreen or unsigned-app warnings for new builds. If you downloaded from official project sources, verify and proceed based on your trust policy:
-
-- Website: <https://www.justagwas.com/projects/mediacrate>
-- GitHub repo: <https://github.com/Justagwas/MediaCrate>
-- Releases: <https://github.com/Justagwas/MediaCrate/releases>
-
-Always review source and scan binaries yourself if required by your environment.
-
-Use MediaCrate only for content you are authorized to download and in line with local law/platform terms.
+- Windows SmartScreen can show warnings for newer or unsigned binaries.
+- Download from official links only:
+  - <https://github.com/Justagwas/mediacrate/releases>
+  - <https://www.justagwas.com/projects/mediacrate/download>
+  - <https://sourceforge.net/projects/mediacrate/>
+- Security policy and private vulnerability reporting: [`.github/SECURITY.md`](https://github.com/Justagwas/MediaCrate/blob/main/.github/SECURITY.md)
 
 ## Contributing
 
-Contributions are welcome:
+Contributions are welcome.
 
-- Start with [contribution guidelines](https://github.com/Justagwas/MediaCrate/blob/main/.github/CONTRIBUTING.md).
-- Open issues at <https://github.com/Justagwas/MediaCrate/issues>.
-- Submit pull requests at <https://github.com/Justagwas/MediaCrate/pulls>.
-- Follow the [Code of Conduct](https://github.com/Justagwas/MediaCrate/blob/main/.github/CODE_OF_CONDUCT.md).
-
-Security reports should follow [`.github/SECURITY.md`](https://github.com/Justagwas/MediaCrate/blob/main/.github/SECURITY.md).
+- Start with [`.github/CONTRIBUTING.md`](https://github.com/Justagwas/MediaCrate/blob/main/.github/CONTRIBUTING.md)
+- Follow [`.github/CODE_OF_CONDUCT.md`](https://github.com/Justagwas/MediaCrate/blob/main/.github/CODE_OF_CONDUCT.md)
+- Use [Issues](https://github.com/Justagwas/MediaCrate/issues) for bugs, requests, and questions
+- Wiki: <https://github.com/Justagwas/mediacrate/wiki>
 
 ## License
 
-Licensed under the Apache License 2.0. See [`LICENSE`](https://github.com/Justagwas/MediaCrate/blob/main/LICENSE).
+Licensed under the Apache License 2.0.
+
+See [`LICENSE`](https://github.com/Justagwas/MediaCrate/blob/main/LICENSE).
 
 ## Contact
 
