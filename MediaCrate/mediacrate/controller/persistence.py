@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Callable
 
 from ..core.download_service import normalize_batch_url, validate_url
-from ..core.models import BatchEntry, BatchEntryStatus, DownloadHistoryEntry, is_audio_format_choice
+from ..core.models import (
+    BatchEntry,
+    BatchEntryStatus,
+    DownloadHistoryEntry,
+    DEFAULT_FORMAT_CHOICES,
+    DEFAULT_QUALITY_CHOICES,
+    is_audio_format_choice,
+)
 from ..core.paths import batch_queue_state_path, download_history_path
 
 
@@ -114,10 +121,12 @@ def deserialize_batch_entry(
         [str(item or "").strip().upper() for item in payload.get("available_formats", []) if str(item or "").strip()]
     )
     if not available_formats:
-        available_formats = ["VIDEO", "AUDIO", "MP4", "MP3"]
+        available_formats = list(DEFAULT_FORMAT_CHOICES)
     available_qualities = dedupe_preserve(
         [str(item or "").strip().upper() for item in payload.get("available_qualities", []) if str(item or "").strip()]
     )
+    if not available_qualities:
+        available_qualities = list(DEFAULT_QUALITY_CHOICES)
     if "BEST QUALITY" not in available_qualities:
         available_qualities.insert(0, "BEST QUALITY")
 

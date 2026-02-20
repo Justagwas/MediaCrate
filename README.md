@@ -29,16 +29,12 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/github/v/tag/Justagwas/MediaCrate.svg?label=Version)](
-https://github.com/Justagwas/MediaCrate/tags)
-[![Last Commit](https://img.shields.io/github/last-commit/Justagwas/MediaCrate/main.svg?style=flat&cacheSeconds=3600)](
-https://github.com/Justagwas/MediaCrate/commits/main)
-[![Stars](https://img.shields.io/github/stars/Justagwas/MediaCrate.svg?style=flat&cacheSeconds=3600)](
-https://github.com/Justagwas/MediaCrate/stargazers)
-[![Open Issues](https://img.shields.io/github/issues/Justagwas/MediaCrate.svg)](
-https://github.com/Justagwas/MediaCrate/issues)
-[![License](https://img.shields.io/github/license/Justagwas/MediaCrate.svg)](
-https://github.com/Justagwas/MediaCrate/blob/main/LICENSE)
+[![Version](https://img.shields.io/github/v/tag/Justagwas/mediacrate.svg?label=Version)](https://github.com/Justagwas/mediacrate/tags)
+[![License](https://img.shields.io/github/license/Justagwas/mediacrate.svg)](https://github.com/Justagwas/mediacrate/blob/main/LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/Justagwas/mediacrate/main.svg?style=flat&cacheSeconds=3600)](https://github.com/Justagwas/mediacrate/commits/main)
+[![Open Issues](https://img.shields.io/github/issues/Justagwas/mediacrate.svg)](https://github.com/Justagwas/mediacrate/issues)
+[![Stars](https://img.shields.io/github/stars/Justagwas/mediacrate.svg?style=flat&cacheSeconds=3600)](https://github.com/Justagwas/mediacrate/stargazers)
+![Installs (7d)](https://img.shields.io/badge/dynamic/json?style=flat&url=https%3A%2F%2Fdownload-stats-worker.justagwas.workers.dev%2Fdownloads%2Fmediacrate%3Frange%3Dweek&query=%24.data.weekly.all&label=Installs%20(7d))
 
 </div>
 
@@ -97,11 +93,6 @@ Default output folder: `%USERPROFILE%\Downloads\MediaCrate`.
 - Node.js is installable from Settings for compatible workflows.
 - Install progress and status are shown in-app.
 
-### Updates and release metadata
-
-- Update checks are driven by the official manifest (`latest.json`) and trusted fallback providers.
-- Release details are available from GitHub releases and the project site.
-
 ## Preview
 
 - Website project page (overview + gallery): <https://www.justagwas.com/projects/mediacrate>
@@ -126,7 +117,7 @@ py MediaCrate.py
 
 ### Configuration Files
 
-- App settings schema and persistence logic: [`MediaCrate/mediacrate/core/config_service.py`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/mediacrate/core/config_service.py)
+- App settings schema and persistence logic: [`MediaCrate/mediacrate/core/config.py`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/mediacrate/core/config.py)
 - Runtime path resolution and storage directories: [`MediaCrate/mediacrate/core/paths.py`](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/mediacrate/core/paths.py)
 
 </details>

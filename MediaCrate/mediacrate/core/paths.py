@@ -6,7 +6,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from .app_metadata import APP_NAME
+from .config import APP_NAME
 
 @lru_cache(maxsize=1)
 def app_dir() -> Path:

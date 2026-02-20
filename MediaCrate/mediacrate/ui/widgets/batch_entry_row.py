@@ -4,7 +4,6 @@ from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -36,6 +35,9 @@ class BatchEntryRowWidget(QFrame):
         self._url_elide_extra_px_default = 0
         self._url_elide_extra_px_compact = 0
         self._url_elide_extra_px = self._url_elide_extra_px_default
+        self._detail_elide_extra_px_default = 0
+        self._detail_elide_extra_px_compact = 0
+        self._detail_elide_extra_px = self._detail_elide_extra_px_default
         self._entry_id = str(entry_id or "").strip()
         self._full_url_text = ""
         self._thumbnail_source_url = ""
@@ -50,12 +52,15 @@ class BatchEntryRowWidget(QFrame):
         self._settings_compact_mode = False
         self._primary_action = "download"
         self._is_duplicate_visual = False
+        self._selection_locked_for_active_job = False
+        self._layout_refresh_pending = False
         self._ui_scale = 1.0
         self._last_entry_signature: tuple[object, ...] | None = None
         self._last_status_state = ""
         self._last_url_state = ""
         self._last_formats: tuple[str, ...] = ()
         self._last_qualities: tuple[str, ...] = ()
+        self._primary_is_retry = False
         self._deferred_elide_timer = QTimer(self)
         self._deferred_elide_timer.setSingleShot(True)
         self._deferred_elide_timer.setInterval(40)
@@ -69,7 +74,7 @@ class BatchEntryRowWidget(QFrame):
         root_layout.setSpacing(8)
         self._root_layout = root_layout
 
-        self.thumbnail_label = QLabel("THUMB\nNAIL", self)
+        self.thumbnail_label = QLabel('THUMB\nNAIL', self)
         self.thumbnail_label.setObjectName("batchEntryThumbnail")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
         self.thumbnail_label.setFixedSize(74, 74)
@@ -91,26 +96,22 @@ class BatchEntryRowWidget(QFrame):
         self.url_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.url_label.setContentsMargins(0, 0, 0, 0)
         self.url_label.setMinimumWidth(0)
-        self.url_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.status_label = QLabel("Queued", right_container)
+        self.url_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_label = QLabel('Queued', right_container)
         self.status_label.setObjectName("batchEntryStatus")
         self.status_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.download_button = QPushButton("Download", right_container)
+        self.download_button = QPushButton('Download', right_container)
         self.download_button.setObjectName("batchEntryAction")
         self.download_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.remove_button = QPushButton("Remove", right_container)
+        self.remove_button = QPushButton('Remove', right_container)
         self.remove_button.setObjectName("batchEntryAction")
         self.remove_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.format_combo = ChevronComboBox(right_container)
         self.format_combo.setObjectName("batchEntryFormat")
-        self.format_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.format_combo.setMinimumContentsLength(0)
         self.format_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.quality_combo = ChevronComboBox(right_container)
         self.quality_combo.setObjectName("batchEntryQuality")
-        self.quality_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.quality_combo.setMinimumContentsLength(0)
         self.quality_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         top_row.addWidget(self.url_label, 1, Qt.AlignVCenter)
@@ -126,7 +127,8 @@ class BatchEntryRowWidget(QFrame):
         self.detail_label.setObjectName("muted")
         self.detail_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.detail_label.setContentsMargins(0, 0, 0, 0)
-        self.detail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.detail_label.setMinimumWidth(0)
+        self.detail_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         detail_row.addWidget(self.detail_label, 1)
         detail_row.addWidget(self.format_combo, 0, Qt.AlignRight)
         detail_row.addWidget(self.quality_combo, 0, Qt.AlignRight)
@@ -138,13 +140,8 @@ class BatchEntryRowWidget(QFrame):
         self.quality_combo.currentTextChanged.connect(self._on_quality_changed)
         self.quality_combo.disabledClicked.connect(self._on_quality_disabled_clicked)
         self.url_label.installEventFilter(self)
-        self.format_combo.installEventFilter(self)
-        self.quality_combo.installEventFilter(self)
-        self.download_button.installEventFilter(self)
-        self.remove_button.installEventFilter(self)
 
         self._update_compact_layout()
-        self._apply_control_cursors()
 
     @staticmethod
     def _scaled(value: int, scale: float, minimum: int = 1) -> int:
@@ -163,7 +160,7 @@ class BatchEntryRowWidget(QFrame):
 
     def _set_thumbnail_placeholder(self) -> None:
         self.thumbnail_label.clear()
-        self.thumbnail_label.setText("THUMB\nNAIL")
+        self.thumbnail_label.setText('THUMB\nNAIL')
         self.thumbnail_label.setToolTip(self._thumbnail_source_url)
         self._thumbnail_original = None
 
@@ -197,15 +194,18 @@ class BatchEntryRowWidget(QFrame):
         if not pixmap.loadFromData(bytes(image_data)):
             self._set_thumbnail_placeholder()
             return
+        target_size = self.thumbnail_label.size()
+        safe_width = max(1, int(target_size.width()))
+        safe_height = max(1, int(target_size.height()))
+        if pixmap.width() > safe_width or pixmap.height() > safe_height:
+            pixmap = pixmap.scaled(
+                safe_width,
+                safe_height,
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation,
+            )
         self._thumbnail_original = pixmap
         self._apply_thumbnail_pixmap()
-
-    @staticmethod
-    def _truncate(text: str, max_len: int = 86) -> str:
-        raw = str(text or "").strip()
-        if len(raw) <= max_len:
-            return raw
-        return f"{raw[: max_len - 1]}..."
 
     def set_busy(self, busy: bool) -> None:
         normalized = bool(busy)
@@ -215,11 +215,10 @@ class BatchEntryRowWidget(QFrame):
         self._apply_enabled_state()
 
     def _apply_enabled_state(self) -> None:
-        locked = bool(self._busy)
-        combos_enabled = (not locked) and self._show_format_quality
+        combos_enabled = self._show_format_quality and (not self._selection_locked_for_active_job)
         self.format_combo.setEnabled(combos_enabled)
         self.quality_combo.setEnabled(combos_enabled)
-        self.quality_combo.setProperty("_mc_block_popup", not self._quality_allowed)
+        self.quality_combo.setProperty("_mc_block_popup", (not self._quality_allowed) or (not combos_enabled))
         primary_enabled = self._can_download
         secondary_enabled = self._can_remove
         self.download_button.setEnabled(primary_enabled)
@@ -258,21 +257,9 @@ class BatchEntryRowWidget(QFrame):
                     text = str(self._full_url_text or "").strip()
                     if text:
                         QApplication.clipboard().setText(text)
-                        QToolTip.showText(QCursor.pos(), "Link copied to clipboard.", self.url_label)
+                        QToolTip.showText(QCursor.pos(), 'Link copied to clipboard.', self.url_label)
                         event.accept()
                         return True
-            if watched in {self.format_combo, self.quality_combo, self.download_button, self.remove_button}:
-                if event.type() in {
-                    QEvent.EnabledChange,
-                    QEvent.Show,
-                    QEvent.Hide,
-                    QEvent.Enter,
-                    QEvent.HoverEnter,
-                    QEvent.HoverMove,
-                    QEvent.StyleChange,
-                    QEvent.Polish,
-                }:
-                    self._set_cursor_for_control(watched)
             return super().eventFilter(watched, event)
         except RuntimeError:
             return False
@@ -317,6 +304,8 @@ class BatchEntryRowWidget(QFrame):
         else:
             available = max(self.url_label.width(), self.url_label.sizeHint().width())
         available -= max(0, int(self._url_elide_extra_px))
+        if self._settings_compact_mode:
+            available = int(available * 0.55)
         return max(40, available)
 
     def _update_detail_elide(self) -> None:
@@ -347,11 +336,23 @@ class BatchEntryRowWidget(QFrame):
             available = detail_row_width - right_controls - 2
         else:
             available = max(self.detail_label.width(), self.detail_label.sizeHint().width())
+        available -= max(0, int(self._detail_elide_extra_px))
+        if self._settings_compact_mode:
+            available = int(available * 0.50)
         return max(48, available)
 
     def _update_text_elide(self) -> None:
         self._update_url_elide()
         self._update_detail_elide()
+
+    def refresh_layout_for_available_width(self) -> None:
+        if self._layout_refresh_pending:
+            self._layout_refresh_pending = False
+            self._update_compact_layout()
+            return
+        self._update_text_elide()
+        if self.isVisible():
+            self._schedule_deferred_elide_refresh()
 
     def _apply_compact_control_metrics(self) -> None:
         scale = self._ui_scale
@@ -375,7 +376,7 @@ class BatchEntryRowWidget(QFrame):
 
     def _update_compact_layout(self) -> None:
         scale = self._ui_scale
-        self.setMinimumWidth(self._scaled(760, scale, 420))
+        self.setMinimumWidth(self._scaled(460, scale, 300))
         self._root_base_margins = (
             self._scaled(8, scale, 4),
             self._scaled(7, scale, 3),
@@ -397,6 +398,11 @@ class BatchEntryRowWidget(QFrame):
         self._url_elide_extra_px_default = self._scaled(0, scale, 0)
         self._url_elide_extra_px_compact = self._scaled(0, scale, 0)
         self._url_elide_extra_px = self._url_elide_extra_px_compact if self._settings_compact_mode else self._url_elide_extra_px_default
+        self._detail_elide_extra_px_default = self._scaled(0, scale, 0)
+        self._detail_elide_extra_px_compact = self._scaled(0, scale, 0)
+        self._detail_elide_extra_px = (
+            self._detail_elide_extra_px_compact if self._settings_compact_mode else self._detail_elide_extra_px_default
+        )
         self._root_layout.setContentsMargins(*self._root_base_margins)
         self._apply_duplicate_margin()
         self._apply_compact_control_metrics()
@@ -404,32 +410,48 @@ class BatchEntryRowWidget(QFrame):
         self._update_text_elide()
         self._apply_thumbnail_pixmap()
         self._apply_enabled_state()
-        self._schedule_deferred_elide_refresh()
+        if self.isVisible():
+            self._schedule_deferred_elide_refresh()
 
-    def set_format_quality_visible(self, visible: bool) -> None:
+    def set_format_quality_visible(self, visible: bool, *, refresh_layout: bool = True) -> None:
         normalized = bool(visible)
         if normalized == self._show_format_quality:
             return
         self._show_format_quality = normalized
         self.format_combo.setVisible(self._show_format_quality)
         self.quality_combo.setVisible(self._show_format_quality)
-        self._update_compact_layout()
+        if refresh_layout:
+            self._layout_refresh_pending = False
+            self._update_compact_layout()
+        else:
+            self._layout_refresh_pending = True
 
-    def set_detail_visible(self, visible: bool) -> None:
+    def set_detail_visible(self, visible: bool, *, refresh_layout: bool = True) -> None:
         normalized = bool(visible)
         if normalized == self._show_detail:
             return
         self._show_detail = normalized
         self.detail_label.setVisible(self._show_detail)
-        self._update_compact_layout()
+        if refresh_layout:
+            self._layout_refresh_pending = False
+            self._update_compact_layout()
+        else:
+            self._layout_refresh_pending = True
 
-    def set_settings_compact_mode(self, compact: bool) -> None:
+    def set_settings_compact_mode(self, compact: bool, *, refresh_layout: bool = True) -> None:
         normalized = bool(compact)
         if normalized == self._settings_compact_mode:
             return
         self._settings_compact_mode = normalized
         self._url_elide_extra_px = self._url_elide_extra_px_compact if normalized else self._url_elide_extra_px_default
-        self._update_compact_layout()
+        self._detail_elide_extra_px = (
+            self._detail_elide_extra_px_compact if normalized else self._detail_elide_extra_px_default
+        )
+        if refresh_layout:
+            self._layout_refresh_pending = False
+            self._update_compact_layout()
+        else:
+            self._layout_refresh_pending = True
 
     def entry_id(self) -> str:
         return str(self._entry_id)
@@ -458,17 +480,14 @@ class BatchEntryRowWidget(QFrame):
     def _refresh_action_button_texts(self) -> None:
         action = str(self._primary_action or "download").strip().lower()
         if action == "pause":
-            self.download_button.setText("Pause")
+            self.download_button.setText('Pause')
         elif action == "resume":
-            self.download_button.setText("Resume")
+            self.download_button.setText('Resume')
         else:
-            download_retry = self.download_button.text().strip().lower() == "retry"
-            self.download_button.setText("Retry" if download_retry else "Download")
-        self.remove_button.setText("Remove")
-
-    @staticmethod
-    def _entry_signature(entry: BatchEntry) -> tuple[object, ...]:
-        return build_batch_entry_view_state(entry).signature
+            self.download_button.setText(
+                'Retry' if self._primary_is_retry else 'Download'
+            )
+        self.remove_button.setText('Remove')
 
     def set_entry(self, entry: BatchEntry) -> None:
         view = build_batch_entry_view_state(entry)
@@ -528,8 +547,13 @@ class BatchEntryRowWidget(QFrame):
         self._can_download = bool(view.can_download)
         self._can_remove = bool(view.can_remove)
         self._primary_action = view.primary_action
+        self._selection_locked_for_active_job = self._primary_action in {"pause", "resume"}
+        self._primary_is_retry = (
+            self._primary_action == "download"
+            and view.primary_button_text == 'Retry'
+        )
         self.download_button.setText(view.primary_button_text)
-        self.remove_button.setText("Remove")
+        self.remove_button.setText('Remove')
         self._refresh_action_button_texts()
         self._update_text_elide()
         self._apply_enabled_state()
@@ -581,5 +605,9 @@ class BatchEntryRowWidget(QFrame):
 
     def showEvent(self, event) -> None:                
         super().showEvent(event)
+        if self._layout_refresh_pending:
+            self._layout_refresh_pending = False
+            self._update_compact_layout()
+            return
         self._schedule_deferred_elide_refresh()
 

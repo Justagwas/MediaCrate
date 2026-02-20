@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core.formatting import format_size_human
-from ..core.models import BatchEntry, BatchEntryStatus, is_audio_format_choice
+from ..core.models import BatchEntry, BatchEntryStatus, DEFAULT_FORMAT_CHOICES, is_audio_format_choice
 
 
 _RUNTIME_BATCH_STATUSES = frozenset(
@@ -39,7 +39,6 @@ class BatchEntryViewState:
     primary_button_text: str
     is_duplicate_visual: bool
     signature: tuple[object, ...]
-
 
 def status_label_for_state(state: str) -> str:
     mapping = {
@@ -81,7 +80,7 @@ def build_batch_entry_view_state(entry: BatchEntry) -> BatchEntryViewState:
         if str(item or "").strip()
     ]
     if not formats:
-        formats = ["VIDEO", "AUDIO", "MP4", "MP3"]
+        formats = list(DEFAULT_FORMAT_CHOICES)
     explicit_format = str(entry.format_choice or "").strip().upper()
     if explicit_format and explicit_format not in formats:
         formats.append(explicit_format)
@@ -106,7 +105,11 @@ def build_batch_entry_view_state(entry: BatchEntry) -> BatchEntryViewState:
     size_text = format_size_human(entry.expected_size_bytes)
     title_text = str(entry.title or "").strip() or "Unknown title"
     if entry.error:
-        detail_text = f"{title_text}  |  Size: {size_text}  |  {entry.error}"
+        detail_text = (
+            f"{title_text}  |  "
+            f"Size: {size_text}  |  "
+            f"{entry.error}"
+        )
     else:
         detail_text = (
             f"{title_text}"
@@ -181,9 +184,9 @@ def batch_entry_render_signature(
     controls_locked: bool,
     settings_visible: bool,
 ) -> tuple[object, ...]:
+    del settings_visible
     view = build_batch_entry_view_state(entry)
     return (
         *view.signature,
         bool(controls_locked),
-        bool(settings_visible),
     )

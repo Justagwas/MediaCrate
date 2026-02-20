@@ -373,3 +373,5 @@ MediaCrate/ffprobe.exe
 /MediaCrate/tests
 *.spec
 MediaCrate/version.txt
+*.ps1
+*.cmd

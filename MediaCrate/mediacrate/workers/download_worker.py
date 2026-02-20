@@ -17,6 +17,7 @@ class DownloadWorker(BaseWorker):
         skip_existing_files: bool = True,
         filename_template: str = "",
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> None:
         super().__init__()
@@ -28,6 +29,7 @@ class DownloadWorker(BaseWorker):
         self._skip_existing_files = bool(skip_existing_files)
         self._filename_template = str(filename_template or "").strip()
         self._conflict_policy = str(conflict_policy or "skip").strip().lower()
+        self._save_metadata_to_file = bool(save_metadata_to_file)
         self._speed_limit_kbps = max(0, int(speed_limit_kbps))
 
     def run(self) -> None:
@@ -44,6 +46,7 @@ class DownloadWorker(BaseWorker):
                 skip_existing_files=self._skip_existing_files,
                 filename_template=self._filename_template,
                 conflict_policy=self._conflict_policy,
+                save_metadata_to_file=self._save_metadata_to_file,
                 speed_limit_kbps=self._speed_limit_kbps,
             )
 

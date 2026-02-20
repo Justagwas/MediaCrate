@@ -19,6 +19,8 @@ def apply_dialog_theme(
     style = (
         f"QDialog, QMessageBox {{ background: {theme.panel_bg}; color: {theme.text_primary}; }}"
         f"QLabel {{ color: {theme.text_primary}; background: transparent; }}"
+        f"QCheckBox {{ color: {theme.text_primary}; background: transparent; }}"
+        f"QCheckBox:disabled {{ color: {theme.disabled_fg}; }}"
         f"QPushButton {{ background: {theme.panel_bg}; color: {theme.text_primary}; border: 1px solid {theme.border}; border-radius: 6px; padding: 5px 10px; font: 600 9.5pt 'Segoe UI'; min-height: 24px; }}"
         f"QPushButton:hover {{ background: {theme.accent}; color: {theme.text_primary}; }}"
         f"QPushButton:disabled {{ background: {theme.disabled_bg}; color: {theme.disabled_fg}; border-color: {theme.border}; }}"
@@ -34,6 +36,10 @@ def apply_dialog_theme(
     palette.setColor(QPalette.ButtonText, QColor(theme.text_primary))
     palette.setColor(QPalette.ToolTipBase, QColor(theme.panel_bg))
     palette.setColor(QPalette.ToolTipText, QColor(theme.text_primary))
+    palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(theme.disabled_fg))
+    palette.setColor(QPalette.Disabled, QPalette.Text, QColor(theme.disabled_fg))
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(theme.disabled_fg))
+    palette.setColor(QPalette.Disabled, QPalette.Button, QColor(theme.disabled_bg))
     widget.setPalette(palette)
     widget.setAutoFillBackground(True)
     if apply_titlebar_theme is not None:

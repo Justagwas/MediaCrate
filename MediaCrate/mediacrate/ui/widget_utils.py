@@ -7,10 +7,10 @@ from PySide6.QtWidgets import QWidget
 
 def set_widget_pointer_cursor(widget: QWidget) -> None:
     try:
-        if widget.isEnabled() and widget.isVisible():
+        if widget.isEnabled():
             widget.setCursor(Qt.PointingHandCursor)
         else:
-            widget.unsetCursor()
+            widget.setCursor(Qt.ArrowCursor)
     except RuntimeError:
         return
 

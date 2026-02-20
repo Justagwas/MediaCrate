@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .base_worker import BaseWorker
 from ..core.download_service import DownloadService
-from ..core.models import UrlAnalysisResult
+from ..core.models import UrlAnalysisResult, DEFAULT_FORMAT_CHOICES
 
 
 class SingleAnalyzeWorker(BaseWorker):
@@ -38,7 +38,7 @@ class SingleAnalyzeWorker(BaseWorker):
                         url_raw=self._url,
                         url_normalized="",
                         is_valid=False,
-                        formats=["VIDEO", "AUDIO", "MP4", "MP3"],
+                        formats=list(DEFAULT_FORMAT_CHOICES),
                         qualities=["BEST QUALITY"],
                         error=str(exc),
                     ),

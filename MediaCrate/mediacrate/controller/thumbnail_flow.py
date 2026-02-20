@@ -44,6 +44,13 @@ class ThumbnailFlowCoordinator(QObject):
         self._single_pending_url = ""
         self._single_active_url = ""
 
+    def set_max_workers(self, value: int) -> None:
+        normalized = max(1, int(value))
+        if normalized == self._max_workers:
+            return
+        self._max_workers = normalized
+        self._pump_batch_queue()
+
     def running_threads(self) -> list[QThread]:
         threads: list[QThread] = []
         if self._single_thread is not None:

@@ -79,6 +79,37 @@ def is_audio_format_choice(value: str) -> bool:
     return normalized in _AUDIO_ONLY_FORMAT_CHOICES
 
 
+CONVERSION_CONTAINER_ORDER: tuple[str, ...] = ("WEBM", "MKV", "MOV", "AVI", "FLV")
+CONVERSION_CONTAINER_CHOICES = frozenset(CONVERSION_CONTAINER_ORDER)
+DEFAULT_FORMAT_CHOICES: tuple[str, ...] = (
+    FormatChoice.VIDEO.value,
+    FormatChoice.AUDIO.value,
+    FormatChoice.MP4.value,
+    FormatChoice.MP3.value,
+    "M4A",
+    "AAC",
+    "OPUS",
+    "OGG",
+    "WAV",
+    "FLAC",
+    *CONVERSION_CONTAINER_ORDER,
+)
+DEFAULT_QUALITY_CHOICES: tuple[str, ...] = (
+    "BEST QUALITY",
+    "4320p",
+    "2880p",
+    "2160p",
+    "1440p",
+    "1080p",
+    "720p",
+    "540p",
+    "480p",
+    "360p",
+    "240p",
+    "144p",
+)
+
+
 @dataclass(slots=True)
 class AppConfig:
     schema_version: int
@@ -95,11 +126,17 @@ class AppConfig:
     download_speed_limit_kbps: int
     adaptive_batch_concurrency: bool
     auto_check_updates: bool
+    background_worker_threads: int = 4
     window_geometry: str = ""
     disable_metadata_fetch: bool = False
     disable_history: bool = False
     retry_profile: str = RetryProfile.BASIC.value
     fallback_download_on_metadata_error: bool = True
+    accurate_size_enabled: bool = False
+    save_metadata_to_file: bool = False
+    retain_format_selection_enabled: bool = True
+    saved_format_choice: str = "VIDEO"
+    saved_quality_choice: str = "BEST QUALITY"
     stale_part_cleanup_hours: int = 48
 
 
@@ -183,6 +220,15 @@ class UpdateCheckResult:
     current_version: str
     latest_version: str = ""
     download_url: str = ""
+    setup_url: str = ""
+    setup_sha256: str = ""
+    setup_size: int = 0
+    released: str = ""
+    notes: list[str] = field(default_factory=list)
+    install_supported: bool = False
+    channel: str = "stable"
+    minimum_supported_version: str = "1.0.0"
+    requires_manual_update: bool = False
     source: str = ""
     error: str = ""
 

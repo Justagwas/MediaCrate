@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 
-from mediacrate.core.app_metadata import APP_NAME, APP_VERSION
+from mediacrate.core.config import APP_NAME, APP_VERSION
 
 MUTEX_NAME = "MediaCrateMutex"
 

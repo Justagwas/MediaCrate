@@ -5,7 +5,7 @@ from typing import Protocol
 from PySide6.QtCore import QTimer
 
 from ..core.download_service import normalize_download_state
-from ..core.models import BatchEntry, BatchEntryStatus, DownloadResult, DownloadState, DownloadSummary, TERMINAL_DOWNLOAD_STATES
+from ..core.models import BatchEntry, BatchEntryStatus, DownloadResult, DownloadState, TERMINAL_DOWNLOAD_STATES
 
 
 class DownloadFlowWindow(Protocol):
@@ -180,11 +180,12 @@ class DownloadFlow:
             clamped = previous
         lowered_message = str(message or "").strip().lower()
         if (
-            (("post-processing" in lowered_message) or ("post processing" in lowered_message) or (clamped >= 99.0))
+            (("post-processing" in lowered_message) or ("post processing" in lowered_message))
             and identifier not in controller._post_processing_notice_job_ids
         ):
             controller._post_processing_notice_job_ids.add(identifier)
-            controller.window.append_log("Post-processing...")
+            if not bool(getattr(controller, "_active_download_is_multi", False)):
+                controller.window.append_log("Post-processing...")
         if abs(clamped - previous) < 0.005:
             return
         controller._download_progress_by_job[identifier] = clamped

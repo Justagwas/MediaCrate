@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
-from .config_service import DEFAULT_FILENAME_TEMPLATE
+from .config import DEFAULT_FILENAME_TEMPLATE
 from .models import (
     DownloadJob,
     DownloadResult,
@@ -24,6 +24,9 @@ from .models import (
     FormatProbeResult,
     RetryProfile,
     UrlAnalysisResult,
+    CONVERSION_CONTAINER_CHOICES,
+    CONVERSION_CONTAINER_ORDER,
+    DEFAULT_FORMAT_CHOICES,
     is_audio_format_choice,
 )
 from .formatting import format_size_human as _format_size_human
@@ -113,15 +116,16 @@ _INPROCESS_CANCELLED_SENTINEL = "__MEDIACRATE_CANCELLED__"
 _INPROCESS_PAUSED_SENTINEL = "__MEDIACRATE_PAUSED__"
 _YTDLP_MODE_ENV = "MEDIACRATE_YTDLP_MODE"
 _YTDLP_BINARY_ENV = "MEDIACRATE_YTDLP_BINARY"
-_CONVERSION_CONTAINER_CHOICES = {"WEBM", "MKV", "MOV", "AVI", "FLV"}
 _SIZE_ESTIMATE_DEFAULT_KEY = "__DEFAULT__"
+_MC_QUALITY_TOKEN_RE = re.compile(r"%\((_?mc_quality)\)[^%a-zA-Z]*[a-zA-Z]", re.IGNORECASE)
+_QUALITY_BRACKET_TOKEN_RE = re.compile(r"\[quality\]", re.IGNORECASE)
 
 
 format_size_human = _format_size_human
 
 
 def _default_format_choices() -> list[str]:
-    return [choice.value for choice in FormatChoice]
+    return list(DEFAULT_FORMAT_CHOICES)
 
 
 def _extract_expected_size_bytes(info: dict[str, object]) -> int | None:
@@ -178,8 +182,84 @@ def _size_from_format_item(fmt: dict[str, object], *, duration_seconds: int | No
                 bitrate_kbps = candidate
     if bitrate_kbps is None:
         return None
-    estimated = int((bitrate_kbps * 1000.0 / 8.0) * float(duration_seconds))
+    estimated = _estimate_size_from_bitrate(duration_seconds, bitrate_kbps)
     return estimated if estimated > 0 else None
+
+
+def _estimate_size_from_bitrate(duration_seconds: int | None, bitrate_kbps: float | None) -> int | None:
+    if not isinstance(duration_seconds, int) or duration_seconds <= 0:
+        return None
+    if not isinstance(bitrate_kbps, (int, float)) or float(bitrate_kbps) <= 0:
+        return None
+    estimated = int((float(bitrate_kbps) * 1000.0 / 8.0) * float(duration_seconds))
+    return estimated if estimated > 0 else None
+
+
+def _sum_size_from_format_items(
+    formats: list[dict[str, object]],
+    *,
+    duration_seconds: int | None,
+) -> int | None:
+    total = 0
+    found = False
+    for item in formats:
+        if not isinstance(item, dict):
+            continue
+        direct = item.get("filesize") or item.get("filesize_approx")
+        if isinstance(direct, (int, float)) and int(direct) > 0:
+            total += int(direct)
+            found = True
+            continue
+        estimate = _size_from_format_item(item, duration_seconds=duration_seconds)
+        if isinstance(estimate, int) and estimate > 0:
+            total += int(estimate)
+            found = True
+    return total if found else None
+
+
+def _requested_format_items(info_dict: dict[str, object]) -> list[dict[str, object]]:
+    if not isinstance(info_dict, dict):
+        return []
+    for key in ("requested_downloads", "requested_formats"):
+        raw = info_dict.get(key)
+        if isinstance(raw, list):
+            items = [item for item in raw if isinstance(item, dict)]
+            if items:
+                return items
+    return []
+
+
+def _enrich_format_sizes(
+    formats: list[dict[str, object]],
+    *,
+    duration_seconds: int | None,
+) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for item in formats:
+        if not isinstance(item, dict):
+            continue
+        updated = dict(item)
+        updated["_size_estimate"] = _size_from_format_item(item, duration_seconds=duration_seconds)
+        enriched.append(updated)
+    return enriched
+
+
+def _estimate_mp3_size(
+    formats: list[dict[str, object]],
+    *,
+    duration_seconds: int | None,
+) -> int | None:
+    target_bitrate_kbps = 245.0  # Approximate V0 average used by --audio-quality 0
+    target_estimate = _estimate_size_from_bitrate(duration_seconds, target_bitrate_kbps)
+    if target_estimate is None:
+        return _best_audio_size(formats)
+    source_size = _best_audio_size(formats)
+    if source_size is None:
+        return target_estimate
+    source_bitrate_kbps = (float(source_size) * 8.0) / (float(duration_seconds) * 1000.0)
+    if source_bitrate_kbps > target_bitrate_kbps:
+        return min(int(source_size), int(target_estimate))
+    return target_estimate
 
 
 def _normalize_height(value: object) -> int:
@@ -313,6 +393,8 @@ def _estimate_selection_size_bytes_from_info(
         preferred_ext = ""
         if choice not in {FormatChoice.AUDIO.value, FormatChoice.MP3.value}:
             preferred_ext = choice.lower()
+        if choice == FormatChoice.MP3.value:
+            return _estimate_mp3_size(formats, duration_seconds=duration_seconds)
         return _best_audio_size(formats, preferred_ext=preferred_ext)
 
     audio_size = _best_audio_size(formats)
@@ -329,7 +411,7 @@ def _estimate_selection_size_bytes_from_info(
             return int(video_size + audio_size)
         return _best_progressive_size(formats, max_height=height_limit)
 
-    if choice == FormatChoice.VIDEO.value or choice in _CONVERSION_CONTAINER_CHOICES:
+    if choice == FormatChoice.VIDEO.value or choice in CONVERSION_CONTAINER_CHOICES:
         video_size = _best_video_size(formats, max_height=height_limit)
         if video_size is not None and audio_size is not None:
             return int(video_size + audio_size)
@@ -405,15 +487,28 @@ def estimate_selection_size_bytes(
     quality_choice: str,
 ) -> int | None:
     estimates = result.selection_size_estimates if isinstance(result.selection_size_estimates, dict) else {}
-    key = _selection_size_key(format_choice, quality_choice)
+    normalized_format = str(format_choice or FormatChoice.VIDEO.value).strip().upper() or FormatChoice.VIDEO.value
+    if is_audio_format_choice(normalized_format):
+        normalized_quality = "BEST QUALITY"
+    else:
+        normalized_quality = str(quality_choice or "BEST QUALITY").strip().upper() or "BEST QUALITY"
+    available_formats = {
+        str(item or "").strip().upper()
+        for item in (result.formats or [])
+        if str(item or "").strip()
+    }
+    if available_formats and normalized_format not in available_formats:
+        return None
+    key = _selection_size_key(normalized_format, normalized_quality)
     value = estimates.get(key)
     if isinstance(value, int) and value > 0:
         return int(value)
-    fallback = estimates.get(_SIZE_ESTIMATE_DEFAULT_KEY)
-    if isinstance(fallback, int) and fallback > 0:
-        return int(fallback)
-    if isinstance(result.expected_size_bytes, int) and result.expected_size_bytes > 0:
-        return int(result.expected_size_bytes)
+    if normalized_format == FormatChoice.VIDEO.value and normalized_quality == "BEST QUALITY":
+        fallback = estimates.get(_SIZE_ESTIMATE_DEFAULT_KEY)
+        if isinstance(fallback, int) and fallback > 0:
+            return int(fallback)
+        if isinstance(result.expected_size_bytes, int) and result.expected_size_bytes > 0:
+            return int(result.expected_size_bytes)
     return None
 
 
@@ -539,7 +634,7 @@ def _collect_format_inventory(info_dict: dict[str, object]) -> tuple[list[str], 
         if isinstance(height, int) and height > 0 and vcodec != "none":
             heights.add(height)
 
-    for ext in sorted(_CONVERSION_CONTAINER_CHOICES):
+    for ext in CONVERSION_CONTAINER_ORDER:
         other_extensions.add(ext)
 
     qualities = ["BEST QUALITY", *[f"{height}p" for height in sorted(heights, reverse=True)]]
@@ -597,6 +692,9 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
     if choice == FormatChoice.MP3.value:
         post_args.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
         return "bestaudio", post_args
+    if is_audio_format_choice(choice):
+        post_args.extend(["--extract-audio", "--audio-format", raw_choice.lower()])
+        return "bestaudio", post_args
 
     if height is None:
         height_selector = ""
@@ -616,10 +714,9 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
         FormatChoice.AUDIO.value,
         FormatChoice.MP4.value,
         FormatChoice.MP3.value,
-        "LOAD OTHERS",
     }:
         ext = raw_choice.lower()
-        if choice in _CONVERSION_CONTAINER_CHOICES:
+        if choice in CONVERSION_CONTAINER_CHOICES:
             selector = (
                 f"bestvideo{height_selector}+bestaudio/"
                 f"best{height_selector}/best"
@@ -648,12 +745,11 @@ def _fixed_output_extension(format_choice: str) -> str | None:
         return "mp3"
     if choice == FormatChoice.MP4.value:
         return "mp4"
-    if choice in _CONVERSION_CONTAINER_CHOICES:
+    if choice in CONVERSION_CONTAINER_CHOICES:
         return choice.lower()
     if choice in {
         FormatChoice.VIDEO.value,
         FormatChoice.AUDIO.value,
-        "LOAD OTHERS",
     }:
         return None
     candidate = re.sub(r"[^a-z0-9]+", "", raw_choice.lower())
@@ -686,6 +782,57 @@ def sanitize_filename_template(value: str) -> str:
     if any(segment == ".." for segment in segments):
         return _DEFAULT_OUTPUT_TEMPLATE
     return text
+
+
+def _sanitize_template_token(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "UNKNOWN"
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text or "UNKNOWN"
+
+
+def _quality_template_value(format_choice: str, quality_choice: str) -> str:
+    normalized_format = str(format_choice or FormatChoice.VIDEO.value).strip().upper() or FormatChoice.VIDEO.value
+    normalized_quality = str(quality_choice or "").strip()
+    if is_audio_format_choice(normalized_format):
+        if normalized_format == FormatChoice.AUDIO.value:
+            return "AUDIO"
+        if normalized_format == FormatChoice.MP3.value:
+            return "MP3"
+        return _sanitize_template_token(normalized_format)
+    if not normalized_quality:
+        return "BEST QUALITY"
+    return _sanitize_template_token(normalized_quality)
+
+
+def _apply_runtime_template_tokens(
+    template: str,
+    *,
+    format_choice: str,
+    quality_choice: str,
+) -> str:
+    resolved = str(template or "").strip()
+    if not resolved:
+        return resolved
+    quality_value = _quality_template_value(format_choice, quality_choice)
+    resolved = _MC_QUALITY_TOKEN_RE.sub(quality_value, resolved)
+    resolved = _QUALITY_BRACKET_TOKEN_RE.sub(quality_value, resolved)
+    return resolved
+
+
+def _resolve_output_template(*, output_dir: Path, filename_template: str, job: DownloadJob) -> str:
+    sanitized_template = sanitize_filename_template(filename_template)
+    runtime_template = _apply_runtime_template_tokens(
+        sanitized_template,
+        format_choice=job.format_choice,
+        quality_choice=job.quality_choice,
+    )
+    return _with_forced_extension(
+        str(output_dir / runtime_template),
+        _fixed_output_extension(job.format_choice),
+    )
 
 
 def normalize_conflict_policy(value: str) -> str:
@@ -743,7 +890,7 @@ def _friendly_format_error(job: DownloadJob, error_text: str) -> str:
         quality_suffix = f" at {quality_choice}"
     return (
         f"Selected format {format_choice}{quality_suffix} is not available for this URL. "
-        "Try BEST QUALITY, VIDEO/MP4, or Load others."
+        "Try BEST QUALITY or VIDEO/MP4."
     )
 
 
@@ -801,6 +948,7 @@ class DownloadService:
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._active_lock = threading.Lock()
         self._control_condition = threading.Condition()
+        self._control_change_counter = 0
         self._active_job_processes: dict[str, subprocess.Popen[str]] = {}
         self._paused_job_ids: set[str] = set()
         self._stopped_job_ids: set[str] = set()
@@ -834,6 +982,7 @@ class DownloadService:
 
     def _notify_control_changed(self) -> None:
         with self._control_condition:
+            self._control_change_counter += 1
             self._control_condition.notify_all()
 
     def _wait_for_retry_window(
@@ -911,7 +1060,7 @@ class DownloadService:
 
     def probe_formats(self, url: str, *, timeout_seconds: float | None = None) -> FormatProbeResult:
         value = coerce_http_url(url)
-        default_formats = [choice.value for choice in FormatChoice] + ["Load others"]
+        default_formats = _default_format_choices()
         if not validate_url(value):
             return FormatProbeResult(
                 title="",
@@ -1017,6 +1166,57 @@ class DownloadService:
             error="",
         )
 
+    def resolve_selection_size_bytes(
+        self,
+        url: str,
+        format_choice: str,
+        quality_choice: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> int | None:
+        value = coerce_http_url(url)
+        if not validate_url(value):
+            return None
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception:
+            return None
+
+        selector, _post_args = _format_selector(format_choice, quality_choice)
+        opts = _metadata_extract_options(timeout_seconds)
+        opts["format"] = selector
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(value, download=False)
+        except Exception:
+            return None
+
+        info_dict = info if isinstance(info, dict) else {}
+        duration_seconds = _extract_duration_seconds(info_dict)
+        choice = str(format_choice or FormatChoice.VIDEO.value).strip().upper() or FormatChoice.VIDEO.value
+        requested_items = _requested_format_items(info_dict)
+        if requested_items:
+            selection_size = _sum_size_from_format_items(
+                requested_items,
+                duration_seconds=duration_seconds,
+            )
+        else:
+            selection_size = None
+
+        if is_audio_format_choice(choice):
+            formats_raw = info_dict.get("formats")
+            full_formats = formats_raw if isinstance(formats_raw, list) else []
+            enriched = _enrich_format_sizes(requested_items or full_formats, duration_seconds=duration_seconds)
+            if choice == FormatChoice.MP3.value:
+                return _estimate_mp3_size(enriched, duration_seconds=duration_seconds)
+            if selection_size is not None:
+                return int(selection_size)
+            return _best_audio_size(enriched)
+
+        if selection_size is not None:
+            return int(selection_size)
+        return None
+
     def _build_command(
         self,
         job: DownloadJob,
@@ -1024,15 +1224,17 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> tuple[list[str], str]:
         output_dir = Path(job.output_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
         selector, post_args = _format_selector(job.format_choice, job.quality_choice)
-        output_template = _with_forced_extension(
-            str(output_dir / sanitize_filename_template(filename_template)),
-            _fixed_output_extension(job.format_choice),
+        output_template = _resolve_output_template(
+            output_dir=output_dir,
+            filename_template=filename_template,
+            job=job,
         )
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
         command = [
@@ -1048,9 +1250,17 @@ class DownloadService:
 
         ffmpeg_path = resolve_binary("ffmpeg")
         choice = str(job.format_choice or "").strip().upper()
-        if (choice == FormatChoice.MP3.value or choice in _CONVERSION_CONTAINER_CHOICES) and not ffmpeg_path:
+        needs_conversion = (
+            (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
+            or choice in CONVERSION_CONTAINER_CHOICES
+        )
+        if needs_conversion and not ffmpeg_path:
             raise FileNotFoundError(
                 "ffmpeg is required for the selected format conversion. Install ffmpeg and retry."
+            )
+        if save_metadata_to_file and not ffmpeg_path:
+            raise FileNotFoundError(
+                "ffmpeg is required to embed metadata into the downloaded file. Install ffmpeg and retry."
             )
         if ffmpeg_path:
             command.extend(["--ffmpeg-location", ffmpeg_path])
@@ -1071,6 +1281,9 @@ class DownloadService:
         rate_limit = max(0, int(speed_limit_kbps))
         if rate_limit > 0:
             command.extend(["--limit-rate", f"{rate_limit}K"])
+
+        if save_metadata_to_file:
+            command.append("--add-metadata")
 
         command.extend(post_args)
         command.append(coerce_http_url(job.url))
@@ -1249,6 +1462,7 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
         try:
@@ -1257,6 +1471,7 @@ class DownloadService:
                 skip_existing_files=skip_existing_files,
                 filename_template=filename_template,
                 conflict_policy=conflict_policy,
+                save_metadata_to_file=save_metadata_to_file,
                 speed_limit_kbps=speed_limit_kbps,
             )
         except Exception as exc:
@@ -1345,6 +1560,7 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
         try:
@@ -1359,9 +1575,10 @@ class DownloadService:
             return self._make_result(job, state=DownloadState.ERROR.value, error=str(exc))
 
         selector, _post_args = _format_selector(job.format_choice, job.quality_choice)
-        output_template = _with_forced_extension(
-            str(output_dir / sanitize_filename_template(filename_template)),
-            _fixed_output_extension(job.format_choice),
+        output_template = _resolve_output_template(
+            output_dir=output_dir,
+            filename_template=filename_template,
+            job=job,
         )
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
         rate_limit = max(0, int(speed_limit_kbps))
@@ -1458,11 +1675,21 @@ class DownloadService:
 
         ffmpeg_path = resolve_binary("ffmpeg")
         choice = str(job.format_choice or "").strip().upper()
-        if (choice == FormatChoice.MP3.value or choice in _CONVERSION_CONTAINER_CHOICES) and not ffmpeg_path:
+        needs_conversion = (
+            (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
+            or choice in CONVERSION_CONTAINER_CHOICES
+        )
+        if needs_conversion and not ffmpeg_path:
             return self._make_result(
                 job,
                 state=DownloadState.ERROR.value,
                 error="ffmpeg is required for the selected format conversion. Install ffmpeg and retry.",
+            )
+        if save_metadata_to_file and not ffmpeg_path:
+            return self._make_result(
+                job,
+                state=DownloadState.ERROR.value,
+                error="ffmpeg is required to embed metadata into the downloaded file. Install ffmpeg and retry.",
             )
         if ffmpeg_path:
             ydl_opts["ffmpeg_location"] = ffmpeg_path
@@ -1476,17 +1703,23 @@ class DownloadService:
         if rate_limit > 0:
             ydl_opts["ratelimit"] = rate_limit * 1024
 
+        postprocessors: list[dict[str, Any]] = []
         if choice == FormatChoice.MP3.value:
-            ydl_opts["postprocessors"] = [
+            postprocessors.append(
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "0",
                 }
-            ]
-        elif choice == FormatChoice.MP4.value:
+            )
+        if save_metadata_to_file:
+            postprocessors.append({"key": "FFmpegMetadata"})
+        if postprocessors:
+            ydl_opts["postprocessors"] = postprocessors
+
+        if choice == FormatChoice.MP4.value:
             ydl_opts["merge_output_format"] = "mp4"
-        elif choice in _CONVERSION_CONTAINER_CHOICES:
+        elif choice in CONVERSION_CONTAINER_CHOICES:
             ydl_opts["merge_output_format"] = choice.lower()
 
         try:
@@ -1534,6 +1767,7 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
         interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
@@ -1550,6 +1784,7 @@ class DownloadService:
                 skip_existing_files=skip_existing_files,
                 filename_template=filename_template,
                 conflict_policy=conflict_policy,
+                save_metadata_to_file=save_metadata_to_file,
                 speed_limit_kbps=speed_limit_kbps,
             )
             if (
@@ -1565,6 +1800,7 @@ class DownloadService:
                     skip_existing_files=skip_existing_files,
                     filename_template=filename_template,
                     conflict_policy=conflict_policy,
+                    save_metadata_to_file=save_metadata_to_file,
                     speed_limit_kbps=speed_limit_kbps,
                 )
             return result
@@ -1576,6 +1812,7 @@ class DownloadService:
             skip_existing_files=skip_existing_files,
             filename_template=filename_template,
             conflict_policy=conflict_policy,
+            save_metadata_to_file=save_metadata_to_file,
             speed_limit_kbps=speed_limit_kbps,
         )
 
@@ -1636,6 +1873,7 @@ class DownloadService:
         skip_existing_files: bool,
         filename_template: str,
         conflict_policy: str,
+        save_metadata_to_file: bool,
         speed_limit_kbps: int,
     ) -> DownloadResult:
         return self.run_single(
@@ -1656,6 +1894,7 @@ class DownloadService:
             skip_existing_files=skip_existing_files,
             filename_template=filename_template,
             conflict_policy=conflict_policy,
+            save_metadata_to_file=save_metadata_to_file,
             speed_limit_kbps=speed_limit_kbps,
         )
 
@@ -1673,6 +1912,7 @@ class DownloadService:
         skip_existing_files: bool,
         filename_template: str,
         conflict_policy: str,
+        save_metadata_to_file: bool,
         speed_limit_kbps: int,
     ) -> tuple[DownloadResult, bool, int]:
         result = DownloadResult(job_id=job.job_id, url=job.url, state=DownloadState.ERROR.value)
@@ -1697,6 +1937,7 @@ class DownloadService:
                 skip_existing_files=skip_existing_files,
                 filename_template=filename_template,
                 conflict_policy=conflict_policy,
+                save_metadata_to_file=save_metadata_to_file,
                 speed_limit_kbps=speed_limit_kbps,
             )
             if result.state == DownloadState.PAUSED.value:
@@ -1792,9 +2033,16 @@ class DownloadService:
         with ordered_results_lock:
             ordered_results[job_id] = result
 
-    def _batch_wait_for_control_change(self) -> None:
+    def _batch_wait_for_control_change(self, *, cancel_token: threading.Event) -> None:
         with self._control_condition:
+            last_seen = self._control_change_counter
+            if cancel_token.is_set():
+                return
             self._control_condition.wait(timeout=0.5)
+            if cancel_token.is_set():
+                return
+            if self._control_change_counter != last_seen:
+                return
 
     def run_batch(
         self,
@@ -1810,6 +2058,7 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadSummary:
         if not jobs:
@@ -1865,6 +2114,7 @@ class DownloadService:
                         skip_existing_files=skip_existing_files,
                         filename_template=filename_template,
                         conflict_policy=conflict_policy,
+                        save_metadata_to_file=save_metadata_to_file,
                         speed_limit_kbps=speed_limit_kbps,
                     )
                     if retried_increment > 0:
@@ -1893,7 +2143,7 @@ class DownloadService:
                     )
 
                 if not count_as_complete:
-                    self._batch_wait_for_control_change()
+                    self._batch_wait_for_control_change(cancel_token=cancel_token)
                     continue
 
                 self._batch_store_result(

@@ -21,6 +21,7 @@ class TutorialOverlay(QWidget):
         self._theme = theme
         self._target_rect: QRect | None = None
         self._panel_margin = 16
+        self._progress_template = "Step {current} of {total}"
 
         self.setObjectName("tutorialOverlay")
         self.setFocusPolicy(Qt.StrongFocus)
@@ -76,6 +77,24 @@ class TutorialOverlay(QWidget):
 
         self.set_theme(theme)
 
+    def set_ui_texts(
+        self,
+        *,
+        title: str,
+        back: str,
+        next_text: str,
+        finish: str,
+        skip: str,
+        progress_template: str,
+    ) -> None:
+        if not self._title_label.text().strip():
+            self._title_label.setText(str(title or ""))
+        self._back_button.setText(str(back or ""))
+        self._next_button.setText(str(next_text or ""))
+        self._finish_button.setText(str(finish or ""))
+        self._skip_button.setText(str(skip or ""))
+        self._progress_template = str(progress_template or "Step {current} of {total}")
+
     def set_theme(self, theme: ThemePalette) -> None:
         self._theme = theme
         self._panel.setStyleSheet(
@@ -129,7 +148,11 @@ class TutorialOverlay(QWidget):
     ) -> None:
         self._title_label.setText(title)
         self._body_label.setText(body)
-        self._progress_label.setText(f"Step {index + 1} of {total}")
+        try:
+            progress_text = self._progress_template.format(current=index + 1, total=total)
+        except Exception:
+            progress_text = f"Step {index + 1} of {total}"
+        self._progress_label.setText(progress_text)
         self._back_button.setEnabled(not is_first)
         self._next_button.setVisible(not is_last)
         self._finish_button.setVisible(is_last)

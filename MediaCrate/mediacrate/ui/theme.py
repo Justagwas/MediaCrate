@@ -460,7 +460,36 @@ QPushButton#batchEntryAction {{
     font: 700 {m['subtitle_font']:.1f}pt "Segoe UI";
 }}
 QComboBox#batchEntryFormat, QComboBox#batchEntryQuality {{
+    background: {theme.app_bg};
+    color: {theme.text_primary};
+    border: 1px solid {theme.border};
+    border-radius: {m['button_radius']}px;
+    padding: {m['button_pad_y']}px {m['button_pad_x']}px;
+    padding-right: {m['combo_pad_right']}px;
     min-height: {m['entry_combo_min_h']}px;
+    font: 700 {m['subtitle_font']:.1f}pt "Segoe UI";
+}}
+QComboBox#batchEntryFormat::drop-down, QComboBox#batchEntryQuality::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: {m['combo_drop_width']}px;
+    border: none;
+    border-left: 1px solid {theme.border};
+    border-top-right-radius: {m['button_radius']}px;
+    border-bottom-right-radius: {m['button_radius']}px;
+    background: {theme.panel_bg};
+}}
+QComboBox#batchEntryFormat::down-arrow, QComboBox#batchEntryQuality::down-arrow {{
+    image: none;
+    width: 0px;
+    height: 0px;
+    border: none;
+}}
+QComboBox#batchEntryFormat QAbstractItemView, QComboBox#batchEntryQuality QAbstractItemView {{
+    background: {theme.panel_bg};
+    color: {theme.text_primary};
+    border: 1px solid {theme.border};
+    selection-background-color: {theme.accent};
     font: 700 {m['subtitle_font']:.1f}pt "Segoe UI";
 }}
 """
