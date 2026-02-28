@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import AppConfig, RetryProfile
 
 APP_NAME = "MediaCrate"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 INNO_SETUP_APP_ID = "MediaCrateJustagwas"
 PROJECT_BASE_URL = "https://www.justagwas.com/projects/mediacrate"
 OFFICIAL_PAGE_URL = PROJECT_BASE_URL
