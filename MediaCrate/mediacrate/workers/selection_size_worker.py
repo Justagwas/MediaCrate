@@ -26,11 +26,12 @@ class SelectionSizeWorker(BaseWorker):
             if self.is_cancelled():
                 return None
             self.statusChanged.emit("selection_size", "running")
-            size = self._service.resolve_selection_size_bytes(
+            size = self._service.resolve_selection_size_bytes_cancellable(
                 self._url,
                 self._format_choice,
                 self._quality_choice,
                 timeout_seconds=self._timeout_seconds,
+                cancel_token=self._stop_event,
             )
             if self.is_cancelled():
                 return None

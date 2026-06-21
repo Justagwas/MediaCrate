@@ -263,7 +263,9 @@ class MainWindow(QMainWindow):
         self._batch_thumbnail_payload_by_url: dict[str, bytes] = {}
         self._batch_row_render_signatures: dict[str, tuple[object, ...]] = {}
         self._displayed_batch_entry_ids: list[str] = []
+        self._displayed_batch_entry_id_set: set[str] = set()
         self._all_batch_entries: list[BatchEntry] = []
+        self._all_batch_entry_index_by_id: dict[str, int] = {}
         self._base_formats = list(DEFAULT_FORMAT_CHOICES)
         self._other_formats: list[str] = []
         self._base_qualities = list(DEFAULT_QUALITY_CHOICES)
@@ -304,10 +306,15 @@ class MainWindow(QMainWindow):
         self._batch_chunk_cursor = 0
         self._batch_chunk_size = 48
         self._batch_chunk_threshold = 320
+        self._batch_refresh_after_chunk = False
         self._batch_filter_refresh_timer = QTimer(self)
         self._batch_filter_refresh_timer.setSingleShot(True)
         self._batch_filter_refresh_timer.setInterval(140)
         self._batch_filter_refresh_timer.timeout.connect(self._on_batch_filter_refresh_timer)
+        self._batch_entries_refresh_timer = QTimer(self)
+        self._batch_entries_refresh_timer.setSingleShot(True)
+        self._batch_entries_refresh_timer.setInterval(24)
+        self._batch_entries_refresh_timer.timeout.connect(self._on_batch_entries_refresh_timer)
         self._last_batch_row_visibility_policy: tuple[bool, bool, bool] | None = None
         self._batch_perf_debug_enabled = (
             str(os.environ.get("MC_BATCH_PERF_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
@@ -1671,7 +1678,7 @@ class MainWindow(QMainWindow):
         speed_row = QHBoxLayout()
         speed_row.setSpacing(6)
         self._speed_row_layout = speed_row
-        self.speed_limit_label = QLabel('Speed limit', downloads_card)
+        self.speed_limit_label = QLabel('Speed limit per download', downloads_card)
         self.speed_limit_label.setObjectName("settingsSubtext")
         speed_row.addWidget(self.speed_limit_label)
         speed_row.addStretch(1)
@@ -1982,7 +1989,7 @@ class MainWindow(QMainWindow):
         self.conflict_policy_combo.clear()
         options = (
             ("skip", "Skip existing file"),
-            ("rename", "Rename output"),
+            ("rename", "Rename with number"),
             ("overwrite", "Overwrite existing file"),
         )
         for policy_value, label in options:
@@ -2128,7 +2135,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "retry_profile_combo"):
             self._populate_retry_profile_combo()
         if hasattr(self, "speed_limit_label"):
-            self.speed_limit_label.setText('Speed limit')
+            self.speed_limit_label.setText('Speed limit per download')
         if hasattr(self, "adaptive_concurrency_checkbox"):
             self.adaptive_concurrency_checkbox.setText('Adaptive concurrency guard')
         if hasattr(self, "auto_updates_checkbox"):
@@ -3179,6 +3186,12 @@ class MainWindow(QMainWindow):
     def _on_batch_filter_refresh_timer(self) -> None:
         self._refresh_batch_entries_display()
 
+    def _schedule_batch_entries_refresh(self, *, delay_ms: int = 24) -> None:
+        self._batch_entries_refresh_timer.start(max(0, int(delay_ms)))
+
+    def _on_batch_entries_refresh_timer(self) -> None:
+        self._refresh_batch_entries_display()
+
     def _log_batch_perf(self, category: str, *, sequence: int, message: str) -> None:
         if not self._batch_perf_debug_enabled:
             return
@@ -3195,6 +3208,16 @@ class MainWindow(QMainWindow):
         self._batch_chunk_entries = []
         self._batch_chunk_ordered_ids = []
         self._batch_chunk_cursor = 0
+        self._batch_refresh_after_chunk = False
+
+    def _replace_batch_chunk_entry(self, entry: BatchEntry) -> None:
+        key = str(entry.entry_id or "").strip()
+        if not key or not self._batch_chunk_entries:
+            return
+        for index, current in enumerate(self._batch_chunk_entries):
+            if str(current.entry_id or "").strip() == key:
+                self._batch_chunk_entries[index] = entry
+                return
 
     def _should_chunk_batch_refresh(self, entry_count: int, *, previous_count: int | None = None) -> bool:
         if previous_count is not None:
@@ -3215,6 +3238,7 @@ class MainWindow(QMainWindow):
         self._batch_chunk_entries = list(ordered_entries)
         self._batch_chunk_ordered_ids = list(ordered_ids)
         self._batch_chunk_cursor = 0
+        self._batch_refresh_after_chunk = False
         self._process_batch_chunk(self._batch_chunk_generation)
 
     def _on_batch_chunk_timer(self) -> None:
@@ -3223,10 +3247,14 @@ class MainWindow(QMainWindow):
     def _finish_chunked_batch_refresh(self, generation: int) -> None:
         if generation != self._batch_chunk_generation:
             return
+        refresh_after_chunk = bool(self._batch_refresh_after_chunk)
         self._batch_chunk_in_progress = False
         self._batch_chunk_entries = []
         self._batch_chunk_ordered_ids = []
         self._batch_chunk_cursor = 0
+        self._batch_refresh_after_chunk = False
+        if refresh_after_chunk:
+            self._schedule_batch_entries_refresh(delay_ms=0)
 
     def _process_batch_chunk(self, generation: int) -> None:
         if generation != self._batch_chunk_generation or not self._batch_chunk_in_progress:
@@ -3238,7 +3266,7 @@ class MainWindow(QMainWindow):
         total = len(self._batch_chunk_entries)
         if total <= 0:
             self._rebuild_batch_entries_layout([])
-            self._displayed_batch_entry_ids = []
+            self._set_displayed_batch_entry_ids([])
             self._update_batch_entry_control_visibility(update_rows=False)
             self._finish_chunked_batch_refresh(generation)
             if trace_enabled:
@@ -3282,7 +3310,7 @@ class MainWindow(QMainWindow):
             if start <= 0:
                 visible_entries = self._batch_chunk_entries[:end]
                 self._rebuild_batch_entries_layout(visible_entries)
-                self._displayed_batch_entry_ids = target_ids
+                self._set_displayed_batch_entry_ids(target_ids)
                 self._update_batch_entry_control_visibility(update_rows=False)
                 layout_action = "rebuild-initial"
             else:
@@ -3291,7 +3319,7 @@ class MainWindow(QMainWindow):
                 else:
                     visible_entries = self._batch_chunk_entries[:end]
                     self._rebuild_batch_entries_layout(visible_entries)
-                    self._displayed_batch_entry_ids = target_ids
+                    self._set_displayed_batch_entry_ids(target_ids)
                     self._update_batch_entry_control_visibility(update_rows=False)
                     layout_action = "rebuild-fallback"
         finally:
@@ -3318,10 +3346,17 @@ class MainWindow(QMainWindow):
         self._cancel_chunked_batch_refresh()
         if self._batch_filter_refresh_timer.isActive():
             self._batch_filter_refresh_timer.stop()
+        if self._batch_entries_refresh_timer.isActive():
+            self._batch_entries_refresh_timer.stop()
         self._hide_open_batch_row_popups()
         previous_displayed_count = len(self._displayed_batch_entry_ids)
-        self._all_batch_entries = [item for item in entries if isinstance(item, BatchEntry)]
-        filtered_entries = [entry for entry in self._all_batch_entries if self._entry_matches_filter(entry)]
+        self._set_all_batch_entries(entries)
+        filter_query, filter_mode = self._batch_filter_state()
+        filtered_entries = [
+            entry
+            for entry in self._all_batch_entries
+            if self._entry_matches_filter_state(entry, query=filter_query, mode=filter_mode)
+        ]
         ordered_entries = self._group_batch_entries_for_display(filtered_entries)
         entry_ids = {entry.entry_id for entry in self._all_batch_entries}
         self._remove_stale_batch_entry_widgets(entry_ids)
@@ -3346,7 +3381,7 @@ class MainWindow(QMainWindow):
                     layout_rebuilt = True
                 else:
                     self._rebuild_batch_entries_layout(ordered_entries)
-                    self._displayed_batch_entry_ids = ordered_ids
+                    self._set_displayed_batch_entry_ids(ordered_ids)
                     layout_rebuilt = True
 
     def set_batch_entry_thumbnail(self, entry_id: str, image_data: bytes | None, source_url: str = "") -> None:
@@ -3369,14 +3404,18 @@ class MainWindow(QMainWindow):
         payload = self._batch_thumbnail_payload_by_url.get(normalized_url, b"") if normalized_url else b""
         row.set_thumbnail_bytes(payload if payload else None, normalized_url)
 
-    def _entry_matches_filter(self, entry: BatchEntry) -> bool:
+    def _batch_filter_state(self) -> tuple[str, str]:
         query = self.multi_search_input.text().strip().lower()
+        mode = str(self.multi_status_filter.currentData(Qt.UserRole) or "all").strip().lower() or "all"
+        return query, mode
+
+    @staticmethod
+    def _entry_matches_filter_state(entry: BatchEntry, *, query: str, mode: str) -> bool:
         if query:
             source = f"{entry.url_raw} {entry.title}".lower()
             if query not in source:
                 return False
 
-        mode = str(self.multi_status_filter.currentData(Qt.UserRole) or "all").strip().lower() or "all"
         status = str(entry.status or "").strip().lower()
         if mode == "all":
             return True
@@ -3396,8 +3435,12 @@ class MainWindow(QMainWindow):
                 BatchEntryStatus.INVALID.value,
                 BatchEntryStatus.FAILED.value,
                 BatchEntryStatus.CANCELLED.value,
-            }
+        }
         return True
+
+    def _entry_matches_filter(self, entry: BatchEntry) -> bool:
+        query, mode = self._batch_filter_state()
+        return self._entry_matches_filter_state(entry, query=query, mode=mode)
 
     def _is_default_batch_filter(self) -> bool:
         if self.multi_search_input.text().strip():
@@ -3481,7 +3524,28 @@ class MainWindow(QMainWindow):
                 if source_url and source_url not in referenced_urls_after:
                     self._batch_thumbnail_payload_by_url.pop(source_url, None)
         if self._displayed_batch_entry_ids:
-            self._displayed_batch_entry_ids = [entry_id for entry_id in self._displayed_batch_entry_ids if entry_id in entry_ids]
+            self._set_displayed_batch_entry_ids(
+                [entry_id for entry_id in self._displayed_batch_entry_ids if entry_id in entry_ids]
+            )
+        if self._all_batch_entry_index_by_id:
+            self._all_batch_entry_index_by_id = {
+                entry_id: index
+                for index, entry_id in enumerate(str(entry.entry_id or "").strip() for entry in self._all_batch_entries)
+                if entry_id
+            }
+
+    def _set_displayed_batch_entry_ids(self, entry_ids: list[str]) -> None:
+        normalized = [str(entry_id or "").strip() for entry_id in entry_ids if str(entry_id or "").strip()]
+        self._displayed_batch_entry_ids = normalized
+        self._displayed_batch_entry_id_set = set(normalized)
+
+    def _set_all_batch_entries(self, entries: list[BatchEntry]) -> None:
+        self._all_batch_entries = [item for item in entries if isinstance(item, BatchEntry)]
+        self._all_batch_entry_index_by_id = {
+            entry_id: index
+            for index, entry_id in enumerate(str(entry.entry_id or "").strip() for entry in self._all_batch_entries)
+            if entry_id
+        }
 
     @staticmethod
     def _hide_batch_row_combo_popups(row: BatchEntryRowWidget) -> None:
@@ -3766,7 +3830,7 @@ class MainWindow(QMainWindow):
                 if row is None:
                     return False
                 self._insert_batch_row_at_order_index(position, row)
-            self._displayed_batch_entry_ids = list(ordered_ids)
+            self._set_displayed_batch_entry_ids(ordered_ids)
             self._update_batch_entry_control_visibility(update_rows=False)
             return True
 
@@ -3775,7 +3839,7 @@ class MainWindow(QMainWindow):
             return False
         if removals:
             self._detach_batch_rows_by_ids(set(removals))
-        self._displayed_batch_entry_ids = list(ordered_ids)
+        self._set_displayed_batch_entry_ids(ordered_ids)
         self._update_batch_entry_control_visibility(update_rows=False)
         return True
 
@@ -3792,7 +3856,7 @@ class MainWindow(QMainWindow):
 
         if not target_ids:
             self._show_multi_empty_label()
-            self._displayed_batch_entry_ids = []
+            self._set_displayed_batch_entry_ids([])
             self._update_batch_entry_control_visibility(update_rows=False)
             return True
 
@@ -3812,7 +3876,7 @@ class MainWindow(QMainWindow):
         if residual_removals:
             self._detach_batch_rows_by_ids(residual_removals)
 
-        self._displayed_batch_entry_ids = list(target_ids)
+        self._set_displayed_batch_entry_ids(target_ids)
         self._update_batch_entry_control_visibility(update_rows=False)
         return True
 
@@ -3823,9 +3887,16 @@ class MainWindow(QMainWindow):
         layout_action = "nochange"
         if self._batch_filter_refresh_timer.isActive():
             self._batch_filter_refresh_timer.stop()
+        if self._batch_entries_refresh_timer.isActive():
+            self._batch_entries_refresh_timer.stop()
         if self._batch_chunk_in_progress:
             self._cancel_chunked_batch_refresh()
-        filtered_entries = [entry for entry in self._all_batch_entries if self._entry_matches_filter(entry)]
+        filter_query, filter_mode = self._batch_filter_state()
+        filtered_entries = [
+            entry
+            for entry in self._all_batch_entries
+            if self._entry_matches_filter_state(entry, query=filter_query, mode=filter_mode)
+        ]
         ordered_entries = self._group_batch_entries_for_display(filtered_entries)
         entry_ids = {entry.entry_id for entry in self._all_batch_entries}
         self._remove_stale_batch_entry_widgets(entry_ids)
@@ -3854,7 +3925,7 @@ class MainWindow(QMainWindow):
         layout_ids = self._current_batch_layout_entry_ids()
         result = False
         if layout_ids != self._displayed_batch_entry_ids:
-            self._displayed_batch_entry_ids = list(layout_ids)
+            self._set_displayed_batch_entry_ids(layout_ids)
         if ordered_ids != self._displayed_batch_entry_ids:
             if self._try_incremental_batch_layout_update(ordered_ids=ordered_ids):
                 layout_action = "incremental"
@@ -3865,7 +3936,7 @@ class MainWindow(QMainWindow):
                     result = True
                 else:
                     self._rebuild_batch_entries_layout(ordered_entries)
-                    self._displayed_batch_entry_ids = ordered_ids
+                    self._set_displayed_batch_entry_ids(ordered_ids)
                     self._update_batch_entry_control_visibility(update_rows=False)
                     layout_action = "rebuild-order"
                     result = True
@@ -3963,35 +4034,48 @@ class MainWindow(QMainWindow):
             return
         self._last_batch_row_visibility_policy = policy
         show_format_quality, show_detail, compact_mode = policy
-        entries_by_id = {str(entry.entry_id): entry for entry in self._all_batch_entries}
         for row in self._batch_entry_widgets.values():
             refresh_layout = id(row) in visible_row_ids
             row.set_format_quality_visible(show_format_quality, refresh_layout=refresh_layout)
             row.set_detail_visible(show_detail, refresh_layout=refresh_layout)
             row.set_settings_compact_mode(compact_mode, refresh_layout=refresh_layout)
-            source_entry = entries_by_id.get(str(row.entry_id()))
+            source_index = self._all_batch_entry_index_by_id.get(str(row.entry_id() or "").strip())
+            source_entry = (
+                self._all_batch_entries[source_index]
+                if source_index is not None and 0 <= source_index < len(self._all_batch_entries)
+                else None
+            )
             row.set_duplicate_visual(bool(source_entry.is_duplicate) if source_entry is not None else False)
 
     def update_batch_entry(self, entry: BatchEntry) -> None:
         if not isinstance(entry, BatchEntry):
             return
-        if self._batch_chunk_in_progress:
-            self._cancel_chunked_batch_refresh()
         key = str(entry.entry_id or "").strip()
-        replaced = False
-        for idx, current in enumerate(self._all_batch_entries):
-            if str(current.entry_id or "").strip() == key:
-                self._all_batch_entries[idx] = entry
-                replaced = True
-                break
-        if not replaced:
-            self._all_batch_entries.append(entry)
-        row = self._batch_entry_widgets.get(key)
-        row_is_displayed = key in self._displayed_batch_entry_ids
-        if self._is_default_batch_filter() and row is not None and row_is_displayed:
-            self._apply_batch_entry_to_row(row, entry)
+        if not key:
             return
-        self._refresh_batch_entries_display()
+        idx = self._all_batch_entry_index_by_id.get(key)
+        if idx is not None and 0 <= idx < len(self._all_batch_entries):
+            self._all_batch_entries[idx] = entry
+        else:
+            self._all_batch_entry_index_by_id[key] = len(self._all_batch_entries)
+            self._all_batch_entries.append(entry)
+        if self._batch_chunk_in_progress:
+            self._replace_batch_chunk_entry(entry)
+        row = self._batch_entry_widgets.get(key)
+        row_is_displayed = key in self._displayed_batch_entry_id_set
+        if row is not None and row_is_displayed:
+            self._apply_batch_entry_to_row(row, entry)
+            self._batch_row_render_signatures[key] = self._batch_entry_render_signature(
+                entry,
+                controls_locked=self._controls_locked,
+                settings_visible=self._settings_visible,
+            )
+            if self._is_default_batch_filter():
+                return
+        if self._batch_chunk_in_progress:
+            self._batch_refresh_after_chunk = True
+            return
+        self._schedule_batch_entries_refresh()
 
     def _show_quality_unavailable_dialog(self) -> None:
         self._show_info_dialog(

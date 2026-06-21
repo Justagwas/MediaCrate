@@ -17,7 +17,11 @@ class ProbeWorker(BaseWorker):
             if self.is_cancelled():
                 return None
             self.statusChanged.emit("probe", "running")
-            probe_result = self._service.probe_formats(self._url, timeout_seconds=self._timeout_seconds)
+            probe_result = self._service.probe_formats_cancellable(
+                self._url,
+                timeout_seconds=self._timeout_seconds,
+                cancel_token=self._stop_event,
+            )
             if self.is_cancelled():
                 return None
             return probe_result

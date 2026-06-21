@@ -76,7 +76,6 @@ def entry_has_analysis_metadata(entry: BatchEntry | None) -> bool:
         BatchEntryStatus.PAUSED.value,
         BatchEntryStatus.DONE.value,
         BatchEntryStatus.SKIPPED.value,
-        BatchEntryStatus.FAILED.value,
         BatchEntryStatus.CANCELLED.value,
     }:
         return True

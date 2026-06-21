@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
+import contextlib
+import dataclasses
+import json
+import math
 import os
 import queue
 import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -15,6 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
 from .config import DEFAULT_FILENAME_TEMPLATE
+from .node_runtime import NODE_MIN_MAJOR_VERSION, is_supported_node_runtime
 from .models import (
     DownloadJob,
     DownloadResult,
@@ -30,6 +37,7 @@ from .models import (
     is_audio_format_choice,
 )
 from .formatting import format_size_human as _format_size_human
+from .partial_files import discard_partial_candidates, record_partial_candidates
 from .paths import resolve_binary
 
 _PROGRESS_RE = re.compile(r"(?P<percent>\d+(?:\.\d+)?)%")
@@ -116,6 +124,10 @@ _INPROCESS_CANCELLED_SENTINEL = "__MEDIACRATE_CANCELLED__"
 _INPROCESS_PAUSED_SENTINEL = "__MEDIACRATE_PAUSED__"
 _YTDLP_MODE_ENV = "MEDIACRATE_YTDLP_MODE"
 _YTDLP_BINARY_ENV = "MEDIACRATE_YTDLP_BINARY"
+_METADATA_WORKER_ENV = "MEDIACRATE_METADATA_WORKER"
+_METADATA_MODE_ENV = "MEDIACRATE_METADATA_MODE"
+_METADATA_WORKER_GRACE_SECONDS = 1.5
+_METADATA_STDERR_TAIL_BYTES = 16 * 1024
 _SIZE_ESTIMATE_DEFAULT_KEY = "__DEFAULT__"
 _MC_QUALITY_TOKEN_RE = re.compile(r"%\((_?mc_quality)\)[^%a-zA-Z]*[a-zA-Z]", re.IGNORECASE)
 _QUALITY_BRACKET_TOKEN_RE = re.compile(r"\[quality\]", re.IGNORECASE)
@@ -669,6 +681,73 @@ def _metadata_extract_options(timeout_seconds: float | None = None) -> dict[str,
     return opts
 
 
+def _dataclass_payload(value: object) -> dict[str, object]:
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _format_probe_from_payload(payload: object, *, fallback_error: str = "") -> FormatProbeResult:
+    data = payload if isinstance(payload, dict) else {}
+    formats = data.get("formats") if isinstance(data, dict) else None
+    other_formats = data.get("other_formats") if isinstance(data, dict) else None
+    qualities = data.get("qualities") if isinstance(data, dict) else None
+    return FormatProbeResult(
+        title=str(data.get("title") or "") if isinstance(data, dict) else "",
+        formats=[str(item or "") for item in formats] if isinstance(formats, list) else _default_format_choices(),
+        other_formats=[str(item or "") for item in other_formats] if isinstance(other_formats, list) else [],
+        qualities=[str(item or "") for item in qualities] if isinstance(qualities, list) else ["BEST QUALITY"],
+        error=str(data.get("error") or fallback_error) if isinstance(data, dict) else fallback_error,
+    )
+
+
+def _positive_optional_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value if value > 0 else None
+    return None
+
+
+def _url_analysis_from_payload(payload: object, *, url: str, fallback_error: str = "") -> UrlAnalysisResult:
+    data = payload if isinstance(payload, dict) else {}
+    formats = data.get("formats") if isinstance(data, dict) else None
+    qualities = data.get("qualities") if isinstance(data, dict) else None
+    estimates = data.get("selection_size_estimates") if isinstance(data, dict) else None
+    return UrlAnalysisResult(
+        url_raw=str(data.get("url_raw") or url) if isinstance(data, dict) else str(url or ""),
+        url_normalized=str(data.get("url_normalized") or normalize_batch_url(url)) if isinstance(data, dict) else normalize_batch_url(url),
+        is_valid=bool(data.get("is_valid")) if isinstance(data, dict) else False,
+        title=str(data.get("title") or "") if isinstance(data, dict) else "",
+        thumbnail_url=str(data.get("thumbnail_url") or "") if isinstance(data, dict) else "",
+        expected_size_bytes=_positive_optional_int(data.get("expected_size_bytes")) if isinstance(data, dict) else None,
+        duration_seconds=_positive_optional_int(data.get("duration_seconds")) if isinstance(data, dict) else None,
+        source_label=str(data.get("source_label") or "") if isinstance(data, dict) else "",
+        formats=[str(item or "") for item in formats] if isinstance(formats, list) else _default_format_choices(),
+        qualities=[str(item or "") for item in qualities] if isinstance(qualities, list) else ["BEST QUALITY"],
+        selection_size_estimates={
+            str(key): int(value)
+            for key, value in (estimates.items() if isinstance(estimates, dict) else [])
+            if isinstance(value, int)
+        },
+        error=str(data.get("error") or fallback_error) if isinstance(data, dict) else fallback_error,
+    )
+
+
+def _read_metadata_stderr_tail(stream: object) -> str:
+    seek = getattr(stream, "seek", None)
+    read = getattr(stream, "read", None)
+    if not callable(seek) or not callable(read):
+        return ""
+    try:
+        seek(0, os.SEEK_END)
+        end_position = int(getattr(stream, "tell")())
+        seek(max(0, end_position - _METADATA_STDERR_TAIL_BYTES), os.SEEK_SET)
+        return str(read() or "").strip()
+    except Exception:
+        return ""
+
+
 def _quality_height(value: str) -> int | None:
     cleaned = str(value or "").strip().lower()
     if not cleaned or cleaned in {"best", "best quality"}:
@@ -769,6 +848,22 @@ def _with_forced_extension(output_template: str, extension: str | None) -> str:
     return f"{template}{suffix}"
 
 
+def _with_rename_number(output_template: str, number: int) -> str:
+    template = str(output_template or "").strip()
+    index = max(0, int(number))
+    if not template or index <= 0:
+        return template
+    token = f" [{index:03d}]"
+    ext_token = ".%(ext)s"
+    if ext_token in template:
+        return template.replace(ext_token, f"{token}{ext_token}", 1)
+    path = Path(template)
+    suffix = path.suffix
+    if suffix:
+        return str(path.with_name(f"{path.stem}{token}{suffix}"))
+    return f"{template}{token}"
+
+
 def sanitize_filename_template(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -822,7 +917,13 @@ def _apply_runtime_template_tokens(
     return resolved
 
 
-def _resolve_output_template(*, output_dir: Path, filename_template: str, job: DownloadJob) -> str:
+def _resolve_output_template(
+    *,
+    output_dir: Path,
+    filename_template: str,
+    job: DownloadJob,
+    conflict_policy: str = "skip",
+) -> str:
     sanitized_template = sanitize_filename_template(filename_template)
     runtime_template = _apply_runtime_template_tokens(
         sanitized_template,
@@ -867,6 +968,80 @@ def sanitize_error_text(value: object) -> str:
     collapsed = no_ctrl.replace("\r", "\n")
     collapsed = re.sub(r"\n{3,}", "\n\n", collapsed)
     return collapsed.strip()
+
+
+def _progress_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _progress_percent_from_payload(payload: dict[str, Any]) -> float | None:
+    explicit_percent = _progress_number(payload.get("_percent"))
+    if explicit_percent is not None:
+        return explicit_percent
+
+    downloaded = _progress_number(payload.get("downloaded_bytes"))
+    for key in ("total_bytes", "total_bytes_estimate"):
+        total = _progress_number(payload.get(key))
+        if downloaded is not None and total is not None and total > 0:
+            return (downloaded / total) * 100.0
+
+    fragment_index = _progress_number(payload.get("fragment_index"))
+    fragment_count = _progress_number(payload.get("fragment_count"))
+    if fragment_index is not None and fragment_count is not None and fragment_count > 0:
+        return (fragment_index / fragment_count) * 100.0
+
+    for key in ("_percent_str", "_progress_str"):
+        text = sanitize_error_text(payload.get(key))
+        match = _PROGRESS_RE.search(text)
+        if match:
+            try:
+                return float(match.group("percent"))
+            except ValueError:
+                return None
+
+    if downloaded is not None and downloaded > 0:
+        mib = downloaded / (1024.0 * 1024.0)
+        return min(95.0, max(1.0, math.log2(mib + 1.0) * 4.0))
+    return None
+
+
+def _progress_message_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("_percent_str", "_progress_str"):
+        text = sanitize_error_text(payload.get(key))
+        if text:
+            return text
+    downloaded = _progress_number(payload.get("downloaded_bytes"))
+    if downloaded is not None and downloaded > 0:
+        return f"Downloading... {_format_size_human(int(downloaded))}"
+    return "Downloading..."
+
+
+def _resolved_node_js_runtime_path() -> str:
+    node_path = str(resolve_binary("node") or "").strip()
+    if not node_path:
+        return ""
+    if not is_supported_node_runtime(node_path, minimum_major=NODE_MIN_MAJOR_VERSION):
+        return ""
+    return node_path
+
+
+def _yt_dlp_js_runtime_cli_args() -> list[str]:
+    node_path = _resolved_node_js_runtime_path()
+    if not node_path:
+        return []
+    return ["--js-runtimes", f"node:{node_path}"]
+
+
+def _yt_dlp_js_runtime_api_options() -> dict[str, dict[str, str]]:
+    node_path = _resolved_node_js_runtime_path()
+    if not node_path:
+        return {}
+    return {"node": {"path": node_path}}
 
 
 def is_retryable_error(error_text: str) -> bool:
@@ -946,6 +1121,7 @@ class _InProcessPaused(RuntimeError):
 class DownloadService:
     def __init__(self) -> None:
         self._active_processes: set[subprocess.Popen[str]] = set()
+        self._active_metadata_processes: set[subprocess.Popen[str]] = set()
         self._active_lock = threading.Lock()
         self._control_condition = threading.Condition()
         self._control_change_counter = 0
@@ -1048,6 +1224,121 @@ class DownloadService:
             return False
 
     @staticmethod
+    def _metadata_worker_command() -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--metadata-worker"]
+        script = Path(__file__).resolve().parents[2] / "MediaCrate.py"
+        return [sys.executable, str(script), "--metadata-worker"]
+
+    @staticmethod
+    def _metadata_subprocess_timeout(timeout_seconds: float | None) -> float:
+        if isinstance(timeout_seconds, (int, float)) and float(timeout_seconds) > 0:
+            return max(1.0, float(timeout_seconds)) + _METADATA_WORKER_GRACE_SECONDS
+        return 30.0
+
+    @staticmethod
+    def _metadata_worker_enabled() -> bool:
+        if os.environ.get(_METADATA_WORKER_ENV) == "1":
+            return False
+        mode = str(os.environ.get(_METADATA_MODE_ENV, "subprocess")).strip().lower()
+        return mode != "inprocess"
+
+    def _run_metadata_subprocess(
+        self,
+        action: str,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        format_choice: str = "",
+        quality_choice: str = "",
+        cancel_token: threading.Event | None = None,
+    ) -> tuple[bool, object | None, str]:
+        command = [
+            *self._metadata_worker_command(),
+            str(action or "").strip(),
+            "--url",
+            str(url or "").strip(),
+        ]
+        if isinstance(timeout_seconds, (int, float)):
+            command.extend(["--timeout", str(float(timeout_seconds))])
+        if format_choice:
+            command.extend(["--format-choice", str(format_choice)])
+        if quality_choice:
+            command.extend(["--quality-choice", str(quality_choice)])
+
+        env = dict(os.environ)
+        env[_METADATA_WORKER_ENV] = "1"
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        stderr_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=stderr_stream,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            try:
+                stderr_stream.close()
+            except Exception:
+                pass
+            return False, None, f"Unable to start metadata worker: {exc}"
+        self._register_metadata_process(process)
+
+        try:
+            deadline = time.monotonic() + self._metadata_subprocess_timeout(timeout_seconds)
+            while process.poll() is None:
+                if cancel_token is not None and cancel_token.is_set():
+                    self._kill_process_tree(process)
+                    try:
+                        process.communicate(timeout=1.0)
+                    except Exception:
+                        pass
+                    return False, None, "Metadata worker cancelled."
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._kill_process_tree(process)
+                    try:
+                        process.communicate(timeout=1.0)
+                    except Exception:
+                        pass
+                    return False, None, "Metadata worker timed out."
+                time.sleep(min(0.1, remaining))
+
+            try:
+                stdout, _stderr = process.communicate(timeout=1.0)
+            except Exception:
+                stdout = ""
+            stderr = _read_metadata_stderr_tail(stderr_stream)
+
+            output = str(stdout or "").strip()
+            if process.returncode != 0 and not output:
+                detail = sanitize_error_text(stderr or f"Metadata worker exited with {process.returncode}")
+                return False, None, detail
+            try:
+                envelope = json.loads(output)
+            except json.JSONDecodeError:
+                detail = sanitize_error_text(stderr or output or "Metadata worker returned invalid JSON.")
+                return False, None, detail or "Metadata worker returned invalid JSON."
+            if not isinstance(envelope, dict):
+                return False, None, "Metadata worker returned an invalid response."
+            ok = bool(envelope.get("ok"))
+            result = envelope.get("result")
+            error = sanitize_error_text(envelope.get("error") or stderr or "")
+            return ok, result, error
+        finally:
+            self._unregister_metadata_process(process)
+            try:
+                stderr_stream.close()
+            except Exception:
+                pass
+
+    @staticmethod
     def _should_fallback_from_inprocess(error_text: str) -> bool:
         cleaned = sanitize_error_text(error_text).lower()
         if not cleaned:
@@ -1058,7 +1349,105 @@ class DownloadService:
             return True
         return False
 
+    def probe_formats_cancellable(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        cancel_token: threading.Event | None = None,
+    ) -> FormatProbeResult:
+        if not self._metadata_worker_enabled():
+            return self._probe_formats_inprocess(url, timeout_seconds=timeout_seconds)
+        value = coerce_http_url(url)
+        if not validate_url(value):
+            return FormatProbeResult(title="", formats=_default_format_choices(), qualities=["BEST QUALITY"], error="Invalid URL")
+        ok, payload, error = self._run_metadata_subprocess(
+            "probe",
+            value,
+            timeout_seconds=timeout_seconds,
+            cancel_token=cancel_token,
+        )
+        if not ok:
+            return FormatProbeResult(
+                title="",
+                formats=_default_format_choices(),
+                qualities=["BEST QUALITY"],
+                error=error or "Metadata probe failed.",
+            )
+        return _format_probe_from_payload(payload)
+
+    def analyze_url_cancellable(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        cancel_token: threading.Event | None = None,
+    ) -> UrlAnalysisResult:
+        value = coerce_http_url(url)
+        normalized = normalize_batch_url(value)
+        if not validate_url(value):
+            return UrlAnalysisResult(
+                url_raw=value,
+                url_normalized=normalized,
+                is_valid=False,
+                formats=_default_format_choices(),
+                qualities=["BEST QUALITY"],
+                error="Invalid URL",
+            )
+        if not self._metadata_worker_enabled():
+            return self._analyze_url_inprocess(value, timeout_seconds=timeout_seconds)
+        ok, payload, error = self._run_metadata_subprocess(
+            "analyze",
+            value,
+            timeout_seconds=timeout_seconds,
+            cancel_token=cancel_token,
+        )
+        if not ok:
+            return UrlAnalysisResult(
+                url_raw=value,
+                url_normalized=normalized,
+                is_valid=False,
+                formats=_default_format_choices(),
+                qualities=["BEST QUALITY"],
+                error=error or "Metadata analysis failed.",
+            )
+        return _url_analysis_from_payload(payload, url=value)
+
+    def resolve_selection_size_bytes_cancellable(
+        self,
+        url: str,
+        format_choice: str,
+        quality_choice: str,
+        *,
+        timeout_seconds: float | None = None,
+        cancel_token: threading.Event | None = None,
+    ) -> int | None:
+        if not self._metadata_worker_enabled():
+            return self._resolve_selection_size_bytes_inprocess(
+                url,
+                format_choice,
+                quality_choice,
+                timeout_seconds=timeout_seconds,
+            )
+        value = coerce_http_url(url)
+        if not validate_url(value):
+            return None
+        ok, payload, _error = self._run_metadata_subprocess(
+            "selection-size",
+            value,
+            timeout_seconds=timeout_seconds,
+            format_choice=format_choice,
+            quality_choice=quality_choice,
+            cancel_token=cancel_token,
+        )
+        if not ok or not isinstance(payload, int):
+            return None
+        return int(payload) if payload > 0 else None
+
     def probe_formats(self, url: str, *, timeout_seconds: float | None = None) -> FormatProbeResult:
+        return self.probe_formats_cancellable(url, timeout_seconds=timeout_seconds)
+
+    def _probe_formats_inprocess(self, url: str, *, timeout_seconds: float | None = None) -> FormatProbeResult:
         value = coerce_http_url(url)
         default_formats = _default_format_choices()
         if not validate_url(value):
@@ -1101,6 +1490,9 @@ class DownloadService:
         )
 
     def analyze_url(self, url: str, *, timeout_seconds: float | None = None) -> UrlAnalysisResult:
+        return self.analyze_url_cancellable(url, timeout_seconds=timeout_seconds)
+
+    def _analyze_url_inprocess(self, url: str, *, timeout_seconds: float | None = None) -> UrlAnalysisResult:
         value = coerce_http_url(url)
         normalized = normalize_batch_url(value)
         default_formats = _default_format_choices()
@@ -1174,6 +1566,21 @@ class DownloadService:
         *,
         timeout_seconds: float | None = None,
     ) -> int | None:
+        return self.resolve_selection_size_bytes_cancellable(
+            url,
+            format_choice,
+            quality_choice,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _resolve_selection_size_bytes_inprocess(
+        self,
+        url: str,
+        format_choice: str,
+        quality_choice: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> int | None:
         value = coerce_http_url(url)
         if not validate_url(value):
             return None
@@ -1224,6 +1631,7 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        rename_number: int = 0,
         save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> tuple[list[str], str]:
@@ -1235,17 +1643,23 @@ class DownloadService:
             output_dir=output_dir,
             filename_template=filename_template,
             job=job,
+            conflict_policy=conflict_policy,
         )
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
+        if normalized_conflict_policy == "rename" and int(rename_number) > 0:
+            output_template = _with_rename_number(output_template, int(rename_number))
         command = [
             *self._resolve_yt_dlp_subprocess_prefix(),
             "--newline",
+            "--progress",
             "--no-playlist",
             "--no-warnings",
             "-f",
             selector,
             "-o",
             output_template,
+            "--print",
+            "after_move:filepath",
         ]
 
         ffmpeg_path = resolve_binary("ffmpeg")
@@ -1264,13 +1678,14 @@ class DownloadService:
             )
         if ffmpeg_path:
             command.extend(["--ffmpeg-location", ffmpeg_path])
+        command.extend(_yt_dlp_js_runtime_cli_args())
 
-        if normalized_conflict_policy == "skip":
+        if normalized_conflict_policy in {"skip", "rename"}:
             command.append("--no-overwrites")
         elif normalized_conflict_policy == "overwrite":
             command.append("--force-overwrites")
 
-        if skip_existing_files:
+        if skip_existing_files and normalized_conflict_policy != "rename":
                                                                                     
                                                                                       
             if "--force-overwrites" in command:
@@ -1319,6 +1734,14 @@ class DownloadService:
         with self._active_lock:
             self._active_processes.discard(process)
             self._active_job_processes.pop(str(job_id or "").strip(), None)
+
+    def _register_metadata_process(self, process: subprocess.Popen[str]) -> None:
+        with self._active_lock:
+            self._active_metadata_processes.add(process)
+
+    def _unregister_metadata_process(self, process: subprocess.Popen[str]) -> None:
+        with self._active_lock:
+            self._active_metadata_processes.discard(process)
 
     def pause_job(self, job_id: str) -> None:
         key = str(job_id or "").strip()
@@ -1376,6 +1799,14 @@ class DownloadService:
             self._kill_process_tree(process)
         self._notify_control_changed()
 
+    def cancel_metadata_workers(self) -> None:
+        with self._active_lock:
+            running = list(self._active_metadata_processes)
+            self._active_metadata_processes.clear()
+        for process in running:
+            self._kill_process_tree(process)
+        self._notify_control_changed()
+
     def _resolve_interrupt_state(self, job_id: str, cancel_token: threading.Event) -> str | None:
         if cancel_token.is_set() or self._is_job_stopped(job_id):
             return DownloadState.CANCELLED.value
@@ -1405,6 +1836,24 @@ class DownloadService:
             return clean_line.split("Destination:", 1)[1].strip()
         if "Merging formats into" in clean_line:
             return clean_line.split("Merging formats into", 1)[1].strip().strip('"')
+        candidate = str(clean_line or "").strip().strip('"')
+        lowered = candidate.lower()
+        if (
+            candidate
+            and not lowered.startswith(("http://", "https://"))
+            and not lowered.startswith(("[", "error:", "warning:"))
+        ):
+            try:
+                path = Path(candidate)
+                suffix = str(path.suffix or "")
+                if (
+                    suffix
+                    and re.fullmatch(r"\.[A-Za-z0-9]{1,12}", suffix)
+                    and (path.is_absolute() or "\\" in candidate or "/" in candidate)
+                ):
+                    return candidate
+            except Exception:
+                return ""
         return ""
 
     def _consume_download_line(
@@ -1419,7 +1868,6 @@ class DownloadService:
         clean = sanitize_error_text(line)
         if not clean:
             return last_error, output_path, saw_already_downloaded, ""
-        last_error = clean
         if log_cb and _is_important_log_line(clean):
             log_cb(clean)
         if "has already been downloaded" in clean.lower():
@@ -1427,6 +1875,9 @@ class DownloadService:
         candidate_path = self._parse_output_path_from_line(clean)
         if candidate_path:
             output_path = candidate_path
+            record_partial_candidates(output_path)
+            return last_error, output_path, saw_already_downloaded, clean
+        last_error = clean
         return last_error, output_path, saw_already_downloaded, clean
 
     def _resolve_terminal_result(
@@ -1442,6 +1893,7 @@ class DownloadService:
         if return_code == 0:
             if progress_cb:
                 progress_cb(100.0, "Done")
+            discard_partial_candidates(output_path)
             if saw_already_downloaded:
                 return self._make_result(job, state=DownloadState.SKIPPED.value, output_path=output_path)
             return self._make_result(job, state=DownloadState.DONE.value, output_path=output_path)
@@ -1452,7 +1904,42 @@ class DownloadService:
             error=_friendly_format_error(job, last_error or f"yt-dlp exited with {return_code}"),
         )
 
-    def _run_single_subprocess(
+    @staticmethod
+    def _is_rename_collision_result(result: DownloadResult) -> bool:
+        if result.state == DownloadState.SKIPPED.value:
+            return True
+        error = sanitize_error_text(result.error).lower()
+        return bool(error and ("already been downloaded" in error or "already exists" in error))
+
+    def _run_with_rename_retries(
+        self,
+        *,
+        job: DownloadJob,
+        cancel_token: threading.Event,
+        log_cb: LogCallback | None,
+        run_attempt: Callable[[int], DownloadResult],
+    ) -> DownloadResult:
+        last_result: DownloadResult | None = None
+        for rename_number in range(0, 1000):
+            interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
+            if interrupt_state:
+                return self._make_result(job, state=interrupt_state)
+            result = run_attempt(rename_number)
+            last_result = result
+            if result.state in {DownloadState.CANCELLED.value, DownloadState.PAUSED.value}:
+                return result
+            if not self._is_rename_collision_result(result):
+                return result
+            if log_cb:
+                label = "original name" if rename_number == 0 else f"number {rename_number:03d}"
+                log_cb(f"Rename policy: {label} already exists; trying next number.")
+        return last_result or self._make_result(
+            job,
+            state=DownloadState.ERROR.value,
+            error="Rename policy could not find an available numbered filename.",
+        )
+
+    def _run_single_subprocess_once(
         self,
         job: DownloadJob,
         cancel_token: threading.Event,
@@ -1462,20 +1949,26 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        rename_number: int = 0,
         save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
+        output_template_for_part_tracking = ""
+        normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
+        force_no_overwrite = normalized_conflict_policy == "rename"
         try:
-            command, _ = self._build_command(
+            command, output_template_for_part_tracking = self._build_command(
                 job,
-                skip_existing_files=skip_existing_files,
+                skip_existing_files=skip_existing_files or force_no_overwrite,
                 filename_template=filename_template,
                 conflict_policy=conflict_policy,
+                rename_number=rename_number,
                 save_metadata_to_file=save_metadata_to_file,
                 speed_limit_kbps=speed_limit_kbps,
             )
         except Exception as exc:
             return self._make_result(job, state=DownloadState.ERROR.value, error=str(exc))
+        record_partial_candidates(output_template_for_part_tracking)
 
         output_path = ""
         last_error = ""
@@ -1494,6 +1987,7 @@ class DownloadService:
                 creationflags=creationflags,
             )
         except Exception as exc:
+            discard_partial_candidates(output_template_for_part_tracking)
             return self._make_result(job, state=DownloadState.ERROR.value, error=str(exc))
         self._register_process(process, job.job_id)
 
@@ -1544,13 +2038,15 @@ class DownloadService:
             )
         finally:
             self._unregister_process(process, job.job_id)
+            if output_template_for_part_tracking and process.poll() == 0:
+                discard_partial_candidates(output_template_for_part_tracking)
             try:
                 if process.stdout:
                     process.stdout.close()
             except Exception:
                 pass
 
-    def _run_single_inprocess(
+    def _run_single_subprocess(
         self,
         job: DownloadJob,
         cancel_token: threading.Event,
@@ -1560,6 +2056,51 @@ class DownloadService:
         skip_existing_files: bool = False,
         filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
         conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
+        speed_limit_kbps: int = 0,
+    ) -> DownloadResult:
+        normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
+        if normalized_conflict_policy != "rename":
+            return self._run_single_subprocess_once(
+                job,
+                cancel_token,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                skip_existing_files=skip_existing_files,
+                filename_template=filename_template,
+                conflict_policy=conflict_policy,
+                save_metadata_to_file=save_metadata_to_file,
+                speed_limit_kbps=speed_limit_kbps,
+            )
+        return self._run_with_rename_retries(
+            job=job,
+            cancel_token=cancel_token,
+            log_cb=log_cb,
+            run_attempt=lambda rename_number: self._run_single_subprocess_once(
+                job,
+                cancel_token,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                skip_existing_files=True,
+                filename_template=filename_template,
+                conflict_policy=conflict_policy,
+                rename_number=rename_number,
+                save_metadata_to_file=save_metadata_to_file,
+                speed_limit_kbps=speed_limit_kbps,
+            ),
+        )
+
+    def _run_single_inprocess_once(
+        self,
+        job: DownloadJob,
+        cancel_token: threading.Event,
+        *,
+        progress_cb: SingleProgressCallback | None = None,
+        log_cb: LogCallback | None = None,
+        skip_existing_files: bool = False,
+        filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
+        conflict_policy: str = "skip",
+        rename_number: int = 0,
         save_metadata_to_file: bool = False,
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
@@ -1579,8 +2120,12 @@ class DownloadService:
             output_dir=output_dir,
             filename_template=filename_template,
             job=job,
+            conflict_policy=conflict_policy,
         )
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
+        if normalized_conflict_policy == "rename" and int(rename_number) > 0:
+            output_template = _with_rename_number(output_template, int(rename_number))
+        record_partial_candidates(output_template)
         rate_limit = max(0, int(speed_limit_kbps))
 
         output_path = ""
@@ -1595,6 +2140,7 @@ class DownloadService:
                 value = str(payload.get(key) or "").strip()
                 if value:
                     output_path = value
+                    record_partial_candidates(output_path)
                     break
 
         def consume_message(message: object) -> str:
@@ -1644,23 +2190,9 @@ class DownloadService:
             if status != "downloading" or not progress_cb:
                 return
 
-            downloaded = payload.get("downloaded_bytes")
-            total = payload.get("total_bytes")
-            total_estimate = payload.get("total_bytes_estimate")
-            total_bytes = total if isinstance(total, (int, float)) else total_estimate
-            percent = 0.0
-            if isinstance(downloaded, (int, float)) and isinstance(total_bytes, (int, float)) and total_bytes > 0:
-                percent = (float(downloaded) / float(total_bytes)) * 100.0
-            else:
-                percent_str = str(payload.get("_percent_str") or "").strip()
-                match = _PROGRESS_RE.search(percent_str)
-                if match:
-                    try:
-                        percent = float(match.group("percent"))
-                    except ValueError:
-                        percent = 0.0
-            line = sanitize_error_text(payload.get("_percent_str") or "Downloading...")
-            progress_cb(max(0.0, min(99.0, percent)), line or "Downloading...")
+            percent = _progress_percent_from_payload(payload)
+            line = _progress_message_from_payload(payload)
+            progress_cb(max(0.0, min(99.0, percent or 0.0)), line)
 
         ydl_opts: dict[str, Any] = {
             "newline": True,
@@ -1693,10 +2225,13 @@ class DownloadService:
             )
         if ffmpeg_path:
             ydl_opts["ffmpeg_location"] = ffmpeg_path
+        js_runtimes = _yt_dlp_js_runtime_api_options()
+        if js_runtimes:
+            ydl_opts["js_runtimes"] = js_runtimes
 
         if normalized_conflict_policy == "overwrite":
             ydl_opts["overwrites"] = True
-        if normalized_conflict_policy == "skip" or skip_existing_files:
+        if normalized_conflict_policy in {"skip", "rename"} or (skip_existing_files and normalized_conflict_policy != "rename"):
             ydl_opts["nooverwrites"] = True
             ydl_opts.pop("overwrites", None)
 
@@ -1748,13 +2283,60 @@ class DownloadService:
             return self._make_result(job, state=interrupt_state, output_path=output_path)
 
         fallback_error = logger.last_error_text or last_error or f"yt-dlp exited with {result_code}"
-        return self._resolve_terminal_result(
+        result = self._resolve_terminal_result(
             job,
             return_code=result_code,
             progress_cb=progress_cb,
             saw_already_downloaded=saw_already_downloaded,
             output_path=output_path,
             last_error=fallback_error,
+        )
+        if result.state in {DownloadState.DONE.value, DownloadState.SKIPPED.value}:
+            discard_partial_candidates(output_template)
+        return result
+
+    def _run_single_inprocess(
+        self,
+        job: DownloadJob,
+        cancel_token: threading.Event,
+        *,
+        progress_cb: SingleProgressCallback | None = None,
+        log_cb: LogCallback | None = None,
+        skip_existing_files: bool = False,
+        filename_template: str = _DEFAULT_OUTPUT_TEMPLATE,
+        conflict_policy: str = "skip",
+        save_metadata_to_file: bool = False,
+        speed_limit_kbps: int = 0,
+    ) -> DownloadResult:
+        normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
+        if normalized_conflict_policy != "rename":
+            return self._run_single_inprocess_once(
+                job,
+                cancel_token,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                skip_existing_files=skip_existing_files,
+                filename_template=filename_template,
+                conflict_policy=conflict_policy,
+                save_metadata_to_file=save_metadata_to_file,
+                speed_limit_kbps=speed_limit_kbps,
+            )
+        return self._run_with_rename_retries(
+            job=job,
+            cancel_token=cancel_token,
+            log_cb=log_cb,
+            run_attempt=lambda rename_number: self._run_single_inprocess_once(
+                job,
+                cancel_token,
+                progress_cb=progress_cb,
+                log_cb=log_cb,
+                skip_existing_files=True,
+                filename_template=filename_template,
+                conflict_policy=conflict_policy,
+                rename_number=rename_number,
+                save_metadata_to_file=save_metadata_to_file,
+                speed_limit_kbps=speed_limit_kbps,
+            ),
         )
 
     def run_single(
@@ -2036,13 +2618,8 @@ class DownloadService:
     def _batch_wait_for_control_change(self, *, cancel_token: threading.Event) -> None:
         with self._control_condition:
             last_seen = self._control_change_counter
-            if cancel_token.is_set():
-                return
-            self._control_condition.wait(timeout=0.5)
-            if cancel_token.is_set():
-                return
-            if self._control_change_counter != last_seen:
-                return
+            while not cancel_token.is_set() and self._control_change_counter == last_seen:
+                self._control_condition.wait(timeout=5.0)
 
     def run_batch(
         self,
@@ -2143,7 +2720,8 @@ class DownloadService:
                     )
 
                 if not count_as_complete:
-                    self._batch_wait_for_control_change(cancel_token=cancel_token)
+                    if self._resolve_interrupt_state(current.job_id, cancel_token) == DownloadState.PAUSED.value:
+                        self._batch_wait_for_control_change(cancel_token=cancel_token)
                     continue
 
                 self._batch_store_result(
@@ -2215,3 +2793,50 @@ class DownloadService:
             retried=retried_attempts_counter[0],
             results=results,
         )
+
+
+def run_metadata_worker_cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("action", choices=["analyze", "probe", "selection-size"])
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--format-choice", default="")
+    parser.add_argument("--quality-choice", default="")
+    try:
+        args = parser.parse_args(list(argv or []))
+    except SystemExit:
+        envelope = {"ok": False, "result": None, "error": "Invalid metadata worker arguments."}
+        sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+        return 2
+
+    os.environ[_METADATA_WORKER_ENV] = "1"
+    service = DownloadService()
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            if args.action == "analyze":
+                result = service._analyze_url_inprocess(str(args.url), timeout_seconds=args.timeout)
+                payload: object = _dataclass_payload(result)
+                error = result.error or ("" if result.is_valid else "Metadata analysis failed.")
+            elif args.action == "probe":
+                result = service._probe_formats_inprocess(str(args.url), timeout_seconds=args.timeout)
+                payload = _dataclass_payload(result)
+                error = result.error
+            else:
+                payload = service._resolve_selection_size_bytes_inprocess(
+                    str(args.url),
+                    str(args.format_choice or ""),
+                    str(args.quality_choice or ""),
+                    timeout_seconds=args.timeout,
+                )
+                error = "" if payload is not None else "Selection size unavailable."
+        if error:
+            envelope = {"ok": False, "result": None, "error": sanitize_error_text(error)}
+            sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+            return 0
+        envelope = {"ok": True, "result": payload, "error": ""}
+        sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+        return 0
+    except Exception as exc:
+        envelope = {"ok": False, "result": None, "error": sanitize_error_text(exc)}
+        sys.stdout.write(json.dumps(envelope, separators=(",", ":")))
+        return 1

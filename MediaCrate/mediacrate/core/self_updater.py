@@ -41,6 +41,7 @@ _VALID_UPDATE_CHANNELS = {"stable", "nightly"}
 _REQUEST_RETRIES = 3
 _REQUEST_RETRY_DELAY_SECONDS = 0.5
 _UPDATE_STAGING_PREFIX = "mediacrate-update-"
+_MANIFEST_MAX_BYTES = 1024 * 1024
 
 _InstallProgressCallback = Callable[[int, str], None]
 
@@ -316,7 +317,7 @@ class SelfUpdater:
             _emit_install_progress(progress_cb, percent=96, message="Verifying update package...")
             _emit_install_progress(progress_cb, percent=98, message="Ready to install update.")
         except Exception:
-            self._remove_path_tree(target_root)
+            self._remove_path_tree(target_root, allowed_root=self._runtime_storage_dir)
             raise
         return PreparedUpdateInstall(
             latest_version=str(check_data.latest_version or ""),
@@ -342,7 +343,7 @@ class SelfUpdater:
 
     def discard_prepared_update(self, prepared: PreparedUpdateInstall) -> None:
         try:
-            self._remove_path_tree(Path(prepared.staging_root))
+            self._remove_path_tree(Path(prepared.staging_root), allowed_root=self._runtime_storage_dir)
         except Exception:
             return
 
@@ -358,7 +359,11 @@ class SelfUpdater:
     def _fetch_manifest(self, *, stop_event: Event | None = None) -> UpdateManifest:
         if not _url_allowed(self._manifest_url, allowed_hosts=_MANIFEST_ALLOWED_HOSTS):
             raise RuntimeError("Manifest URL is missing or untrusted.")
-        payload, _ = self._request_text(self._manifest_url, stop_event=stop_event)
+        payload, _ = self._request_text(
+            self._manifest_url,
+            stop_event=stop_event,
+            allowed_hosts=_MANIFEST_ALLOWED_HOSTS,
+        )
         data = json.loads(payload)
         if not isinstance(data, dict):
             raise RuntimeError("latest.json did not return a JSON object")
@@ -435,6 +440,7 @@ class SelfUpdater:
         url: str,
         *,
         stop_event: Event | None = None,
+        allowed_hosts: set[str] | None = None,
     ) -> tuple[str, str]:
         _ensure_not_stopped(stop_event)
         request = Request(
@@ -446,8 +452,10 @@ class SelfUpdater:
             request,
             timeout=self._timeout_seconds,
             stop_event=stop_event,
+            max_bytes=_MANIFEST_MAX_BYTES,
         )
-        if not _url_allowed(final_url, allowed_hosts=_UPDATE_ALLOWED_HOSTS):
+        final_allowed_hosts = allowed_hosts or _UPDATE_ALLOWED_HOSTS
+        if not _url_allowed(final_url, allowed_hosts=final_allowed_hosts):
             raise RuntimeError("Update endpoint redirected to an untrusted host.")
         body = payload.decode("utf-8-sig", errors="replace")
         _ensure_not_stopped(stop_event)
@@ -459,16 +467,37 @@ class SelfUpdater:
         *,
         timeout: float,
         stop_event: Event | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[bytes, str]:
         attempts = max(1, int(_REQUEST_RETRIES))
         timeout_seconds = max(0.1, float(timeout))
         delay_base = max(0.0, float(_REQUEST_RETRY_DELAY_SECONDS))
+        byte_limit = max(0, int(max_bytes or 0))
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             _ensure_not_stopped(stop_event)
             try:
                 with urlopen(request, timeout=timeout_seconds) as response:
-                    payload = response.read()
+                    raw_length = str(response.headers.get("content-length") or "").strip()
+                    if byte_limit > 0 and raw_length:
+                        try:
+                            content_length = int(raw_length)
+                        except ValueError:
+                            content_length = 0
+                        if content_length > byte_limit:
+                            raise RuntimeError("Update response exceeded the allowed size.")
+                    chunks: list[bytes] = []
+                    downloaded = 0
+                    while True:
+                        _ensure_not_stopped(stop_event)
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if byte_limit > 0 and downloaded > byte_limit:
+                            raise RuntimeError("Update response exceeded the allowed size.")
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
                     final_url = str(response.geturl() or request.full_url)
                 _ensure_not_stopped(stop_event)
                 return payload, final_url
@@ -519,6 +548,10 @@ class SelfUpdater:
                                 break
                             handle.write(chunk)
                             downloaded += len(chunk)
+                            if expected_size > 0 and downloaded > expected_size:
+                                raise RuntimeError(
+                                    f"Downloaded size exceeded expected setup size of {expected_size} bytes."
+                                )
                             if expected_size > 0:
                                 raw = min(1.0, max(0.0, downloaded / float(expected_size)))
                                 mapped = int(round(raw * 92.0))
@@ -726,15 +759,26 @@ class SelfUpdater:
         for child in self._runtime_storage_dir.iterdir():
             if (not child.is_dir()) or (not child.name.startswith(_UPDATE_STAGING_PREFIX)):
                 continue
-            self._remove_path_tree(child)
+            self._remove_path_tree(child, allowed_root=self._runtime_storage_dir)
 
     def _cleanup_legacy_updates_root(self) -> None:
         if not self._legacy_updates_root.exists() or (not self._legacy_updates_root.is_dir()):
             return
-        self._remove_path_tree(self._legacy_updates_root)
+        self._remove_path_tree(self._legacy_updates_root, allowed_root=self._legacy_updates_root, allow_exact_root=True)
 
     @staticmethod
-    def _remove_path_tree(path: Path) -> None:
+    def _path_is_within_resolved_root(path: Path, root: Path, *, allow_exact_root: bool = False) -> bool:
+        try:
+            resolved_path = path.resolve()
+            resolved_root = root.resolve()
+            return (allow_exact_root and resolved_path == resolved_root) or resolved_root in resolved_path.parents
+        except Exception:
+            return False
+
+    @staticmethod
+    def _remove_path_tree(path: Path, *, allowed_root: Path, allow_exact_root: bool = False) -> None:
+        if not SelfUpdater._path_is_within_resolved_root(path, allowed_root, allow_exact_root=allow_exact_root):
+            return
         try:
             for walk_root, dirs, files in os.walk(path, topdown=False):
                 for file_name in files:

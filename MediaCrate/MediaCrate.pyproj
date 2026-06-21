@@ -23,6 +23,7 @@
   <ItemGroup>
     <Compile Include="MediaCrate.py" />
     <Compile Include="mediacrate\**\*.py" />
+    <Content Include="mediacrate\core\dependency_manifest.json" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

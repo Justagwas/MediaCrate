@@ -19,6 +19,13 @@ from __future__ import annotations
 
 import os
 import sys
+
+if "--metadata-worker" in sys.argv:
+    from mediacrate.core.download_service import run_metadata_worker_cli
+
+    marker_index = sys.argv.index("--metadata-worker")
+    raise SystemExit(run_metadata_worker_cli(sys.argv[marker_index + 1 :]))
+
 import ctypes
 
 from PySide6.QtCore import Qt

@@ -1,0 +1,26 @@
+{
+  "ffmpeg": {
+    "name": "ffmpeg",
+    "version": "8.1.1",
+    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip",
+    "sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
+    "binaries": ["ffmpeg.exe", "ffprobe.exe"],
+    "platform": "windows",
+    "arch": "x64",
+    "install_mode": "binary-copy",
+    "max_members": 4096,
+    "max_extract_bytes": 750000000
+  },
+  "node": {
+    "name": "node",
+    "version": "22.23.0",
+    "url": "https://nodejs.org/download/release/v22.23.0/node-v22.23.0-win-x64.zip",
+    "sha256": "425a5bd68cc95e8eb16bcccd0a75081b48983fc6a26f67126bd4d6c7198231e8",
+    "binaries": ["node.exe"],
+    "platform": "windows",
+    "arch": "x64",
+    "install_mode": "single-binary",
+    "max_members": 8192,
+    "max_extract_bytes": 250000000
+  }
+}

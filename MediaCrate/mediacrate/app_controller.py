@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import webbrowser
+import glob
 from collections import deque
 from datetime import datetime, timezone
 import os
@@ -60,6 +61,7 @@ from .core.download_service import (
     validate_url,
 )
 from .core.formatting import format_size_human
+from .core.partial_files import list_tracked_partial_paths, remove_tracked_partial_paths
 from .core.models import (
     AppConfig,
     BatchEntry,
@@ -108,6 +110,7 @@ BATCH_CONCURRENCY_MAX = 16
 SPEED_LIMIT_KBPS_MAX = 100000
 METADATA_FETCH_TIMEOUT_SECONDS = 8.0
 METADATA_SLOW_WARNING_THRESHOLD_MS = 5000
+SHUTDOWN_DEADLINE_SECONDS = 4.0
 THUMBNAIL_CACHE_MAX_ENTRIES = 350
 THUMBNAIL_CACHE_MAX_BYTES = 24 * 1024 * 1024
 THUMBNAIL_CACHE_ENTRY_TTL_SECONDS = 20 * 60
@@ -133,6 +136,7 @@ _AUDIO_OUTPUT_EXTENSIONS = {
 }
 _DEFAULT_FORMAT_CHOICES = DEFAULT_FORMAT_CHOICES
 _DEFAULT_QUALITY_CHOICES = DEFAULT_QUALITY_CHOICES
+STALE_CLEANUP_FULL_SCAN_INTERVAL_SECONDS = 15 * 60
 TutorialStep = dict[str, str | bool]
 
 
@@ -245,6 +249,7 @@ class AppController(QObject):
         self._stale_cleanup_thread: QThread | None = None
         self._stale_cleanup_worker: StaleCleanupWorker | None = None
         self._stale_cleanup_pending_reason = ""
+        self._last_stale_part_full_scan_at = 0.0
         self._startup_staged_initialized = False
         self._startup_ffmpeg_prompt_completed = False
         self._startup_stage_index = -1
@@ -269,6 +274,7 @@ class AppController(QObject):
         self._close_shutdown_pending = False
         self._close_wait_notice_shown = False
         self._allow_close_after_shutdown = False
+        self._close_shutdown_started_at = 0.0
         self._close_wait_timer = QTimer(self)
         self._close_wait_timer.setSingleShot(False)
         self._close_wait_timer.setInterval(120)
@@ -707,9 +713,9 @@ class AppController(QObject):
                     candidates.add(path.with_suffix(f"{path.suffix}.part"))
                 except ValueError:
                     pass
-                stem_pattern = f"{path.stem}*.part"
+                stem_pattern = f"{glob.escape(path.stem)}*.part"
             else:
-                stem_pattern = f"{path.name}*.part"
+                stem_pattern = f"{glob.escape(path.name)}*.part"
             parent = path.parent
             try:
                 if parent.exists() and parent.is_dir():
@@ -730,12 +736,34 @@ class AppController(QObject):
         return paths
 
     @staticmethod
-    def _delete_part_files(paths: set[Path]) -> int:
+    def _path_is_under_root(path: Path, root: Path) -> bool:
+        try:
+            return os.path.commonpath([str(root), str(path)]) == str(root)
+        except (OSError, ValueError):
+            return False
+
+    def _download_root_for_part_cleanup(self) -> Path | None:
+        raw = str(getattr(getattr(self, "config", None), "download_location", "") or "").strip()
+        if not raw:
+            return None
+        try:
+            root = Path(raw).expanduser().resolve()
+        except Exception:
+            return None
+        if not root.exists() or not root.is_dir():
+            return None
+        return root
+
+    @classmethod
+    def _delete_part_files(cls, paths: set[Path], *, root: Path | None = None) -> int:
         deleted = 0
         for path in paths:
             try:
-                if path.exists() and path.is_file():
-                    path.unlink(missing_ok=True)
+                target = path.expanduser().resolve()
+                if root is not None and not cls._path_is_under_root(target, root):
+                    continue
+                if target.exists() and target.is_file():
+                    target.unlink(missing_ok=True)
                     deleted += 1
             except OSError:
                 continue
@@ -743,19 +771,28 @@ class AppController(QObject):
 
     def _cleanup_unfinished_part_files_from_history_entries(self, entries: list[DownloadHistoryEntry]) -> int:
         paths = self._collect_unfinished_history_part_paths(entries)
-        return self._delete_part_files(paths)
+        return self._delete_part_files(paths, root=self._download_root_for_part_cleanup())
 
     def _cleanup_part_file_for_download_result(self, *, result_state: str, output_path: str) -> int:
         if not self._is_unfinished_history_state(result_state):
             return 0
         paths = self._part_file_candidates_from_output_path(output_path)
-        return self._delete_part_files(paths)
+        return self._delete_part_files(paths, root=self._download_root_for_part_cleanup())
 
     def _stale_cleanup_hours(self) -> int:
         return max(0, int(self.config.stale_part_cleanup_hours))
 
     def _is_stale_cleanup_running(self) -> bool:
         return bool(self._stale_cleanup_thread and self._stale_cleanup_thread.isRunning())
+
+    def _should_scan_stale_part_root(self, *, reason: str) -> bool:
+        normalized_reason = str(reason or "").strip().lower()
+        if normalized_reason in {"startup", "settings", "reset-settings", "manual"}:
+            return True
+        now = monotonic()
+        return (self._last_stale_part_full_scan_at <= 0.0) or (
+            now - self._last_stale_part_full_scan_at >= STALE_CLEANUP_FULL_SCAN_INTERVAL_SECONDS
+        )
 
     def _request_stale_part_cleanup(self, *, reason: str) -> None:
         if self._is_download_running():
@@ -765,11 +802,17 @@ class AppController(QObject):
         if self._is_stale_cleanup_running():
             self._stale_cleanup_pending_reason = str(reason or "").strip() or "queued"
             return
+        cleanup_reason = str(reason or "").strip() or "manual"
+        scan_download_root = self._should_scan_stale_part_root(reason=cleanup_reason)
+        if scan_download_root:
+            self._last_stale_part_full_scan_at = monotonic()
         thread = QThread(self)
         worker = StaleCleanupWorker(
             download_location=str(self.config.download_location or ""),
             max_age_hours=self._stale_cleanup_hours(),
-            reason=str(reason or "").strip() or "manual",
+            reason=cleanup_reason,
+            tracked_part_paths=list_tracked_partial_paths(),
+            scan_download_root=scan_download_root,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -784,7 +827,7 @@ class AppController(QObject):
         thread.start()
 
     def _on_stale_cleanup_summary(self, payload: object) -> None:
-        if (not isinstance(payload, tuple)) or len(payload) != 3:
+        if (not isinstance(payload, tuple)) or len(payload) not in {3, 4}:
             return
         reason = str(payload[0] or "").strip() or "manual"
         try:
@@ -795,6 +838,11 @@ class AppController(QObject):
             hours = max(0, int(payload[2]))
         except (TypeError, ValueError):
             hours = self._stale_cleanup_hours()
+        pruned_paths: list[str] = []
+        if len(payload) >= 4 and isinstance(payload[3], list):
+            pruned_paths = [str(item or "").strip() for item in payload[3] if str(item or "").strip()]
+        if pruned_paths:
+            remove_tracked_partial_paths(pruned_paths)
         if deleted_count <= 0:
             return
         self.window.append_log(
@@ -989,6 +1037,15 @@ class AppController(QObject):
             self._stale_cleanup_worker.stop()
         self._stop_metadata_slow_warning_watch_if_idle()
 
+    def _force_stop_owned_subprocesses(self) -> None:
+        service = getattr(self, "download_service", None)
+        cancel_all = getattr(service, "cancel_all", None)
+        if callable(cancel_all):
+            cancel_all()
+        cancel_metadata_workers = getattr(service, "cancel_metadata_workers", None)
+        if callable(cancel_metadata_workers):
+            cancel_metadata_workers()
+
     def _running_worker_threads(self) -> list[QThread]:
         candidates: list[QThread] = []
         if self._download_thread is not None:
@@ -1088,6 +1145,45 @@ class AppController(QObject):
         except RuntimeError:
             return True
 
+    @staticmethod
+    def _force_stop_thread(thread: QThread | None, *, quit_timeout_ms: int = 250, terminate_timeout_ms: int = 750) -> bool:
+        if thread is None:
+            return True
+        try:
+            if not thread.isRunning():
+                return True
+        except RuntimeError:
+            return True
+        try:
+            thread.requestInterruption()
+        except RuntimeError:
+            pass
+        try:
+            thread.quit()
+        except RuntimeError:
+            pass
+        try:
+            if thread.wait(max(0, int(quit_timeout_ms))):
+                return True
+        except RuntimeError:
+            return True
+        try:
+            thread.terminate()
+        except RuntimeError:
+            return False
+        try:
+            return bool(thread.wait(max(0, int(terminate_timeout_ms))))
+        except RuntimeError:
+            return True
+
+    def _force_stop_running_worker_threads(self) -> bool:
+        self._force_stop_owned_subprocesses()
+        stopped = True
+        for thread in self._running_worker_threads():
+            if not self._force_stop_thread(thread):
+                stopped = False
+        return stopped and (not self._running_worker_threads())
+
     def _wait_for_metadata_threads_to_finish(self, *, timeout_ms: int = 1200) -> bool:
         threads: list[QThread] = []
         if self._single_analysis_thread is not None:
@@ -1101,6 +1197,7 @@ class AppController(QObject):
         return True
 
     def _begin_shutdown_sequence(self) -> None:
+        self._close_shutdown_started_at = monotonic()
         if bool(getattr(self, "_tutorial_active", False)):
             self._end_tutorial(completed=False)
         self._batch_queue_save_timer.stop()
@@ -1116,6 +1213,7 @@ class AppController(QObject):
         self._stop_batch_analysis_workers()
         self._stop_thumbnail_workers()
         self._stop_optional_workers()
+        self._force_stop_owned_subprocesses()
 
     def _finalize_shutdown_sequence(self) -> None:
         self._close_wait_timer.stop()
@@ -1132,22 +1230,78 @@ class AppController(QObject):
         if not self._close_shutdown_pending:
             self._close_wait_timer.stop()
             return
-        if self._running_worker_threads():
+        if self._running_worker_threads() and not self._shutdown_deadline_elapsed():
+            return
+        if self._running_worker_threads() and not self._force_stop_running_worker_threads():
             return
         self._finalize_shutdown_sequence()
         QTimer.singleShot(0, self.window.close)
+
+    def _shutdown_deadline_elapsed(self) -> bool:
+        started = float(getattr(self, "_close_shutdown_started_at", 0.0) or 0.0)
+        if started <= 0:
+            return False
+        return (monotonic() - started) >= SHUTDOWN_DEADLINE_SECONDS
+
+    @staticmethod
+    def _close_running_threads(controller) -> list[object]:
+        running_checker = getattr(controller, "_running_worker_threads", None)
+        if callable(running_checker):
+            return list(running_checker())
+        metadata_waiter = getattr(controller, "_wait_for_metadata_threads_to_finish", None)
+        return [object()] if callable(metadata_waiter) and (not metadata_waiter()) else []
+
+    @staticmethod
+    def _finalize_close_controller(controller) -> None:
+        finalizer = getattr(controller, "_finalize_shutdown_sequence", None)
+        if callable(finalizer):
+            finalizer()
+            return
+        for method_name in ("_apply_pending_format_selection", "_flush_config_save", "_save_download_history"):
+            method = getattr(controller, method_name, None)
+            if callable(method):
+                method()
+
+    @staticmethod
+    def _force_stop_close_threads(controller) -> bool:
+        force_stop_threads = getattr(controller, "_force_stop_running_worker_threads", None)
+        if callable(force_stop_threads):
+            return bool(force_stop_threads())
+        force_stop = getattr(controller, "_force_stop_owned_subprocesses", None)
+        if callable(force_stop):
+            force_stop()
+        return True
+
+    @staticmethod
+    def _close_deadline_elapsed(controller) -> bool:
+        deadline_checker = getattr(controller, "_shutdown_deadline_elapsed", None)
+        return bool(callable(deadline_checker) and deadline_checker())
+
+    @staticmethod
+    def _finalize_if_close_deadline_elapsed(controller) -> bool:
+        if not AppController._close_deadline_elapsed(controller):
+            return False
+        if not AppController._force_stop_close_threads(controller):
+            return False
+        AppController._finalize_close_controller(controller)
+        return True
+
+    @staticmethod
+    def _start_close_wait_timer(controller) -> None:
+        close_wait_timer = getattr(controller, "_close_wait_timer", None)
+        if close_wait_timer is None or not hasattr(close_wait_timer, "isActive") or not hasattr(close_wait_timer, "start"):
+            return
+        if not close_wait_timer.isActive():
+            close_wait_timer.start()
 
     def _on_close_request(self) -> bool:
         if bool(getattr(self, "_allow_close_after_shutdown", False)):
             return True
         if bool(getattr(self, "_close_shutdown_pending", False)):
-            running_checker = getattr(self, "_running_worker_threads", None)
-            if callable(running_checker):
-                running_threads = running_checker()
-            else:
-                metadata_waiter = getattr(self, "_wait_for_metadata_threads_to_finish", None)
-                running_threads = [object()] if callable(metadata_waiter) and (not metadata_waiter()) else []
+            running_threads = AppController._close_running_threads(self)
             if running_threads:
+                if AppController._finalize_if_close_deadline_elapsed(self):
+                    return True
                 if not bool(getattr(self, "_close_wait_notice_shown", False)):
                     self._close_wait_notice_shown = True
                     self._show_info(
@@ -1155,12 +1309,7 @@ class AppController(QObject):
                         "Background tasks are still stopping.\n\nPlease wait a moment.",
                     )
                 return False
-            if callable(getattr(self, "_finalize_shutdown_sequence", None)):
-                self._finalize_shutdown_sequence()
-            else:
-                self._apply_pending_format_selection()
-                self._flush_config_save()
-                self._save_download_history()
+            AppController._finalize_close_controller(self)
             return True
         if not self._confirm_close_during_ffmpeg_install():
             return False
@@ -1170,6 +1319,7 @@ class AppController(QObject):
         if callable(getattr(self, "_begin_shutdown_sequence", None)):
             self._begin_shutdown_sequence()
         else:
+            self._close_shutdown_started_at = monotonic()
             self._batch_queue_save_timer.stop()
             self._config_save_timer.stop()
             self._single_analysis_timer.stop()
@@ -1181,30 +1331,21 @@ class AppController(QObject):
             self._stop_batch_analysis_workers()
             self._stop_thumbnail_workers()
             self._stop_optional_workers()
+            AppController._force_stop_close_threads(self)
 
-        running_checker = getattr(self, "_running_worker_threads", None)
-        if callable(running_checker):
-            running_threads = running_checker()
-        else:
-            metadata_waiter = getattr(self, "_wait_for_metadata_threads_to_finish", None)
-            running_threads = [object()] if callable(metadata_waiter) and (not metadata_waiter()) else []
+        running_threads = AppController._close_running_threads(self)
         if running_threads:
+            if AppController._finalize_if_close_deadline_elapsed(self):
+                return True
             self._close_shutdown_pending = True
             self._close_wait_notice_shown = False
-            close_wait_timer = getattr(self, "_close_wait_timer", None)
-            if close_wait_timer is not None and hasattr(close_wait_timer, "isActive") and hasattr(close_wait_timer, "start"):
-                if not close_wait_timer.isActive():
-                    close_wait_timer.start()
+            AppController._start_close_wait_timer(self)
             self._show_info(
                 "Still shutting down",
                 "Background tasks are still stopping.\n\nThe app will close when shutdown completes.",
             )
             return False
-        if callable(getattr(self, "_finalize_shutdown_sequence", None)):
-            self._finalize_shutdown_sequence()
-        else:
-            self._flush_config_save()
-            self._save_download_history()
+        AppController._finalize_close_controller(self)
         return True
 
     def _on_tutorial_requested(self) -> None:
@@ -2976,6 +3117,17 @@ class AppController(QObject):
         self._download_url_by_job[job.job_id] = job.url
         self._download_total_jobs += 1
 
+    def _unregister_enqueued_job_state(self, *, job: DownloadJob, entry_id: str) -> None:
+        if self._job_to_batch_entry_id.get(job.job_id) == entry_id:
+            self._job_to_batch_entry_id.pop(job.job_id, None)
+        if self._batch_entry_to_active_job_id.get(entry_id) == job.job_id:
+            self._batch_entry_to_active_job_id.pop(entry_id, None)
+        self._download_progress_by_job.pop(job.job_id, None)
+        self._download_attempts_by_job.pop(job.job_id, None)
+        self._download_state_by_job.pop(job.job_id, None)
+        self._download_url_by_job.pop(job.job_id, None)
+        self._download_total_jobs = max(0, self._download_total_jobs - 1)
+
     def _try_enqueue_entry_into_active_download(self, *, entry: BatchEntry, output_dir: str) -> bool:
         if self._download_worker is None:
             return False
@@ -2985,11 +3137,15 @@ class AppController(QObject):
         if not self._is_entry_eligible_for_active_enqueue(entry):
             return False
         job = self._build_download_job_for_entry(entry, output_dir=output_dir)
-        if not self._download_worker.enqueue_job(job):
-            return False
+        previous_state = (entry.status, entry.progress_percent, entry.attempts, entry.error)
         self._register_enqueued_job_state(job=job, entry_id=entry_id)
         self._mark_entry_as_download_queued(entry)
         self.window.update_batch_entry(entry)
+        if not self._download_worker.enqueue_job(job):
+            self._unregister_enqueued_job_state(job=job, entry_id=entry_id)
+            entry.status, entry.progress_percent, entry.attempts, entry.error = previous_state
+            self.window.update_batch_entry(entry)
+            return False
         return True
 
     def _enqueue_entries_into_active_download(self, entries: list[BatchEntry], *, source_label: str) -> int:
@@ -3047,7 +3203,7 @@ class AppController(QObject):
         payload: dict[str, object],
         job_to_entry: dict[str, str] | None,
     ) -> None:
-        active_multi = bool(payload.get("batch_enabled", False) or bool(job_to_entry))
+        active_multi = len(jobs) > 1 or bool(job_to_entry)
         self._download_runtime.initialize_jobs(
             [job.job_id for job in jobs],
             {job.job_id: job.url for job in jobs},
@@ -4100,3 +4256,4 @@ class AppController(QObject):
 
     def _on_history_clear(self) -> None:
         HistoryFlow.on_history_clear(self)
+

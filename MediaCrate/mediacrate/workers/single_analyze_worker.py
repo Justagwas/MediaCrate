@@ -17,7 +17,11 @@ class SingleAnalyzeWorker(BaseWorker):
             if self.is_cancelled():
                 return None
             self.statusChanged.emit("single", "running")
-            analysis_result = self._service.analyze_url(self._url, timeout_seconds=self._timeout_seconds)
+            analysis_result = self._service.analyze_url_cancellable(
+                self._url,
+                timeout_seconds=self._timeout_seconds,
+                cancel_token=self._stop_event,
+            )
             if self.is_cancelled():
                 return None
             return analysis_result

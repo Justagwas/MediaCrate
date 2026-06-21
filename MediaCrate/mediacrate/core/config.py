@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import AppConfig, RetryProfile
 
 APP_NAME = "MediaCrate"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 INNO_SETUP_APP_ID = "MediaCrateJustagwas"
 PROJECT_BASE_URL = "https://www.justagwas.com/projects/mediacrate"
 OFFICIAL_PAGE_URL = PROJECT_BASE_URL
@@ -91,12 +91,13 @@ def _default_background_worker_threads() -> int:
     return max(BACKGROUND_WORKER_THREADS_MIN, min(BACKGROUND_WORKER_THREADS_MAX, int(cpu_count)))
 
 
-def default_config() -> AppConfig:
+def default_config(paths_provider=None) -> AppConfig:
+    paths_module = paths_provider or _paths()
     return AppConfig(
         schema_version=CONFIG_SCHEMA_VERSION,
         theme_mode="dark",
         ui_scale_percent=100,
-        download_location=str(_paths().default_download_dir()),
+        download_location=str(paths_module.default_download_dir()),
         batch_enabled=False,
         batch_concurrency=4,
         skip_existing_files=True,
@@ -122,8 +123,8 @@ def default_config() -> AppConfig:
     )
 
 
-def _sanitize_payload(payload: dict[str, object]) -> AppConfig:
-    defaults = default_config()
+def _sanitize_payload(payload: dict[str, object], paths_provider=None) -> AppConfig:
+    defaults = default_config(paths_provider=paths_provider)
     payload_schema = _coerce_int(payload.get("schema_version", 0), 0, 0, CONFIG_SCHEMA_VERSION)
 
     theme_mode = str(payload.get("theme_mode", defaults.theme_mode)).strip().lower()
@@ -237,14 +238,15 @@ def _sanitize_payload(payload: dict[str, object]) -> AppConfig:
     )
 
 
-def config_path() -> Path:
-    return _paths().runtime_storage_dir() / CONFIG_FILENAME
+def config_path(paths_provider=None) -> Path:
+    paths_module = paths_provider or _paths()
+    return paths_module.runtime_storage_dir() / CONFIG_FILENAME
 
 
-def _legacy_config_candidates() -> list[Path]:
+def _legacy_config_candidates(paths_provider=None) -> list[Path]:
     candidates: list[Path] = []
     seen: set[Path] = set()
-    paths_module = _paths()
+    paths_module = paths_provider or _paths()
     bases = [
         paths_module.runtime_storage_dir(),
         paths_module.app_dir(),
@@ -260,32 +262,32 @@ def _legacy_config_candidates() -> list[Path]:
     return candidates
 
 
-def _load_config_from_path(path: Path) -> AppConfig | None:
+def _load_config_from_path(path: Path, paths_provider=None) -> AppConfig | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            return _sanitize_payload(raw)
+            return _sanitize_payload(raw, paths_provider=paths_provider)
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
     return None
 
 
-def load_config() -> AppConfig:
-    primary = config_path()
+def load_config(paths_provider=None) -> AppConfig:
+    primary = config_path(paths_provider=paths_provider)
     if primary.exists():
-        loaded = _load_config_from_path(primary)
+        loaded = _load_config_from_path(primary, paths_provider=paths_provider)
         if loaded is not None:
             return loaded
 
-    for legacy in _legacy_config_candidates():
+    for legacy in _legacy_config_candidates(paths_provider=paths_provider):
         if not legacy.exists():
             continue
-        loaded = _load_config_from_path(legacy)
+        loaded = _load_config_from_path(legacy, paths_provider=paths_provider)
         if loaded is None:
             continue
-        save_config(loaded)
+        save_config(loaded, paths_provider=paths_provider)
         return loaded
-    return default_config()
+    return default_config(paths_provider=paths_provider)
 
 
 def config_to_dict(config: AppConfig) -> dict[str, object]:
@@ -319,9 +321,9 @@ def config_to_dict(config: AppConfig) -> dict[str, object]:
     }
 
 
-def save_config(config: AppConfig) -> str | None:
+def save_config(config: AppConfig, paths_provider=None) -> str | None:
     payload = config_to_dict(config)
-    path = config_path()
+    path = config_path(paths_provider=paths_provider)
     tmp_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

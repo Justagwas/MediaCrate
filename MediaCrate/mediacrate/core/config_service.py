@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-import threading
-from typing import Iterator
-
 from . import config as _config
 from .models import AppConfig
 from .paths import app_dir, appdata_dir, default_download_dir, runtime_storage_dir
@@ -43,8 +39,6 @@ RETRY_PROFILE_VALUES = _config.RETRY_PROFILE_VALUES
 DEFAULT_FILENAME_TEMPLATE = _config.DEFAULT_FILENAME_TEMPLATE
 
 config_to_dict = _config.config_to_dict
-_sanitize_payload = _config._sanitize_payload
-_CONFIG_PATH_PATCH_LOCK = threading.RLock()
 
 
 class _PathsProxy:
@@ -65,43 +59,29 @@ class _PathsProxy:
         return default_download_dir()
 
 
-@contextmanager
-def _using_config_paths() -> Iterator[None]:
-    # Route config.py path lookups through this module so existing tests/mocks
-    # that patch config_service.* path helpers keep working.
-    with _CONFIG_PATH_PATCH_LOCK:
-        original = _config._paths
-        _config._paths = lambda: _PathsProxy  # type: ignore[assignment]
-        try:
-            yield
-        finally:
-            _config._paths = original  # type: ignore[assignment]
+def _sanitize_payload(payload: dict[str, object]) -> AppConfig:
+    return _config._sanitize_payload(payload, paths_provider=_PathsProxy)
 
 
 def default_config() -> AppConfig:
-    with _using_config_paths():
-        return _config.default_config()
+    return _config.default_config(paths_provider=_PathsProxy)
 
 
 def config_path():
-    with _using_config_paths():
-        return _config.config_path()
+    return _config.config_path(paths_provider=_PathsProxy)
 
 
 def _legacy_config_candidates():
-    with _using_config_paths():
-        return _config._legacy_config_candidates()
+    return _config._legacy_config_candidates(paths_provider=_PathsProxy)
 
 
 def _load_config_from_path(path):
-    return _config._load_config_from_path(path)
+    return _config._load_config_from_path(path, paths_provider=_PathsProxy)
 
 
 def load_config() -> AppConfig:
-    with _using_config_paths():
-        return _config.load_config()
+    return _config.load_config(paths_provider=_PathsProxy)
 
 
 def save_config(config: AppConfig) -> str | None:
-    with _using_config_paths():
-        return _config.save_config(config)
+    return _config.save_config(config, paths_provider=_PathsProxy)

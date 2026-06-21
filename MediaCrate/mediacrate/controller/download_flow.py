@@ -380,7 +380,7 @@ class DownloadFlow:
                 controller.window.reset_download_progress()
             controller._last_download_progress_hundredths = 0
             return
-        if controller._active_download_is_multi:
+        if controller._active_download_is_multi and len(controller._download_progress_by_job) > 1:
             DownloadFlow.refresh_multi_overall_download_progress(controller)
             return
         DownloadFlow.refresh_single_overall_download_progress(controller)
