@@ -9,7 +9,7 @@
     "arch": "x64",
     "install_mode": "binary-copy",
     "max_members": 16,
-    "max_extract_bytes": 180000000
+    "max_extract_bytes": 300000000
   },
   "node": {
     "name": "node",
