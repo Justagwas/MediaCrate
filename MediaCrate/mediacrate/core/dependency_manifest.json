@@ -2,14 +2,14 @@
   "ffmpeg": {
     "name": "ffmpeg",
     "version": "8.1.1",
-    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip",
-    "sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
+    "url": "https://downloads.justagwas.com/mediacrate/ffmpeg.zip",
+    "sha256": "6b0e8f5f7f4203ff6bfac57c482076d2db9a490089eb7cce8cab67bfef8c0b12",
     "binaries": ["ffmpeg.exe", "ffprobe.exe"],
     "platform": "windows",
     "arch": "x64",
     "install_mode": "binary-copy",
-    "max_members": 4096,
-    "max_extract_bytes": 750000000
+    "max_members": 16,
+    "max_extract_bytes": 180000000
   },
   "node": {
     "name": "node",
