@@ -104,6 +104,13 @@ def build_batch_entry_view_state(entry: BatchEntry) -> BatchEntryViewState:
 
     size_text = format_size_human(entry.expected_size_bytes)
     title_text = str(entry.title or "").strip() or "Unknown title"
+    transfer_eta = str(getattr(entry, "transfer_eta", "") or "").strip()
+    transfer_speed = str(getattr(entry, "transfer_speed", "") or "").strip()
+    eta_text = transfer_eta or "--"
+    speed_text = transfer_speed or "--/s"
+    if transfer_speed and not transfer_speed.endswith("/s"):
+        speed_text = f"{transfer_speed}/s"
+
     if entry.error:
         detail_text = (
             f"{title_text}  |  "
@@ -111,10 +118,12 @@ def build_batch_entry_view_state(entry: BatchEntry) -> BatchEntryViewState:
             f"{entry.error}"
         )
     else:
+        progress_text = f"Progress: {max(0.0, min(100.0, float(entry.progress_percent))):.2f}%"
+        progress_text = f"{progress_text}  |  ETA: {eta_text}  |  {speed_text}"
         detail_text = (
             f"{title_text}"
             f"  |  Size: {size_text}"
-            f"  |  Progress: {max(0.0, min(100.0, float(entry.progress_percent))):.2f}%"
+            f"  |  {progress_text}"
             f"  |  Attempts: {max(0, int(entry.attempts))}"
         )
 
@@ -151,6 +160,8 @@ def build_batch_entry_view_state(entry: BatchEntry) -> BatchEntryViewState:
         selected_quality,
         max(0, int(entry.attempts)),
         round(max(0.0, min(100.0, float(entry.progress_percent))), 3),
+        transfer_eta,
+        transfer_speed,
         str(entry.error or "").strip(),
         tuple(formats),
         tuple(qualities),

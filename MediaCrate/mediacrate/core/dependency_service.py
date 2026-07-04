@@ -13,6 +13,7 @@ import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from zipfile import ZipFile, ZipInfo
 
 import requests
@@ -25,6 +26,12 @@ DEPENDENCY_MANIFEST_FILENAME = "dependency_manifest.json"
 COPY_CHUNK_SIZE = 1024 * 256
 DEPENDENCY_DOWNLOAD_TIMEOUT_SECONDS = 10 * 60
 DEPENDENCY_DOWNLOAD_EXTRA_BYTES = 1024 * 1024
+DEPENDENCY_MAX_REDIRECTS = 3
+DEPENDENCY_ALLOWED_HOSTS = {
+    "downloads.justagwas.com",
+    "nodejs.org",
+    "www.nodejs.org",
+}
 
 
 class DependencyInstallCancelled(RuntimeError):
@@ -65,6 +72,51 @@ def _load_dependency_manifest(path: Path | None = None) -> dict[str, object]:
     return raw
 
 
+def _dependency_url_allowed(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = str(parsed.hostname or "").strip().lower()
+    return bool(host and host in DEPENDENCY_ALLOWED_HOSTS)
+
+
+def _dependency_redirect_target(response: requests.Response, current_url: str) -> str:
+    location = str(response.headers.get("location") or "").strip()
+    if not location:
+        return ""
+    return urljoin(str(current_url or ""), location)
+
+
+def _open_dependency_response(url: str) -> requests.Response:
+    current_url = str(url or "").strip()
+    if not _dependency_url_allowed(current_url):
+        raise RuntimeError("Dependency manifest URL is missing or untrusted.")
+    for _attempt in range(DEPENDENCY_MAX_REDIRECTS + 1):
+        if not _dependency_url_allowed(current_url):
+            raise RuntimeError("Dependency download redirected to an untrusted host.")
+        response = requests.get(
+            current_url,
+            stream=True,
+            timeout=20,
+            allow_redirects=False,
+        )
+        if not (300 <= int(response.status_code) < 400):
+            final_url = str(response.url or current_url)
+            if not _dependency_url_allowed(final_url):
+                response.close()
+                raise RuntimeError("Dependency download redirected to an untrusted host.")
+            return response
+        next_url = _dependency_redirect_target(response, current_url)
+        response.close()
+        if not next_url:
+            raise RuntimeError("Dependency download redirect did not include a target URL.")
+        current_url = next_url
+    raise RuntimeError("Dependency download redirected too many times.")
+
+
 def _package_from_payload(name: str, payload: object) -> DependencyPackage:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Dependency manifest entry is invalid for {name}.")
@@ -84,7 +136,15 @@ def _package_from_payload(name: str, payload: object) -> DependencyPackage:
         max_extract_bytes = max(1, int(payload.get("max_extract_bytes", 512 * 1024 * 1024)))
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"Dependency manifest limits are invalid for {name}.") from exc
-    if package_name != name or not url or len(sha256) != 64 or not binaries or not target_platform or not arch or not install_mode:
+    if (
+        package_name != name
+        or not _dependency_url_allowed(url)
+        or len(sha256) != 64
+        or not binaries
+        or not target_platform
+        or not arch
+        or not install_mode
+    ):
         raise RuntimeError(f"Dependency manifest entry is incomplete for {name}.")
     return DependencyPackage(
         name=name,
@@ -309,7 +369,7 @@ class DependencyService:
             extract_dir.mkdir(parents=True, exist_ok=True)
 
             download_deadline = time.monotonic() + DEPENDENCY_DOWNLOAD_TIMEOUT_SECONDS
-            with requests.get(package.url, stream=True, timeout=20) as response:
+            with _open_dependency_response(package.url) as response:
                 response.raise_for_status()
                 total = _safe_content_length(response.headers.get("content-length"))
                 max_download_bytes = _archive_download_limit_bytes(package)

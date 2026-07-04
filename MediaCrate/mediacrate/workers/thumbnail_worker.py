@@ -46,7 +46,7 @@ def _thumbnail_url_is_safe(url: str) -> bool:
         parsed = urlparse(str(url or "").strip())
     except Exception:
         return False
-    if parsed.scheme.lower() not in {"http", "https"}:
+    if parsed.scheme.lower() != "https":
         return False
     host = str(parsed.hostname or "").strip()
     return _is_public_address(host)
@@ -85,6 +85,10 @@ class ThumbnailWorker(BaseWorker):
             )
             if not (300 <= int(response.status_code) < 400):
                 if not _thumbnail_url_is_safe(str(response.url or current_url)):
+                    response.close()
+                    return None
+                final_host = str(urlparse(str(response.url or current_url)).hostname or "").strip()
+                if not _is_public_address(final_host):
                     response.close()
                     return None
                 return response

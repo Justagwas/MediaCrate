@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -776,22 +777,68 @@ class SelfUpdater:
             return False
 
     @staticmethod
+    def _path_is_reparse_point(path: Path) -> bool:
+        try:
+            if path.is_symlink():
+                return True
+            stat_result = path.lstat()
+            file_attributes = int(getattr(stat_result, "st_file_attributes", 0))
+            reparse_attribute = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+            return bool(file_attributes & reparse_attribute)
+        except Exception:
+            return True
+
+    @staticmethod
     def _remove_path_tree(path: Path, *, allowed_root: Path, allow_exact_root: bool = False) -> None:
         if not SelfUpdater._path_is_within_resolved_root(path, allowed_root, allow_exact_root=allow_exact_root):
             return
         try:
-            for walk_root, dirs, files in os.walk(path, topdown=False):
-                for file_name in files:
-                    try:
-                        Path(walk_root, file_name).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            roots_to_remove: list[Path] = []
+            files_to_remove: list[Path] = []
+            for walk_root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+                walk_path = Path(walk_root)
+                if not SelfUpdater._path_is_within_resolved_root(
+                    walk_path,
+                    allowed_root,
+                    allow_exact_root=allow_exact_root,
+                ):
+                    dirs[:] = []
+                    continue
+                safe_dirs: list[str] = []
                 for dir_name in dirs:
-                    try:
-                        Path(walk_root, dir_name).rmdir()
-                    except Exception:
-                        pass
-            path.rmdir()
+                    child_dir = walk_path / dir_name
+                    if not SelfUpdater._path_is_within_resolved_root(
+                        child_dir,
+                        allowed_root,
+                        allow_exact_root=allow_exact_root,
+                    ):
+                        continue
+                    if SelfUpdater._path_is_reparse_point(child_dir):
+                        continue
+                    safe_dirs.append(dir_name)
+                dirs[:] = safe_dirs
+                roots_to_remove.append(walk_path)
+                for file_name in files:
+                    candidate = walk_path / file_name
+                    if not SelfUpdater._path_is_within_resolved_root(
+                        candidate,
+                        allowed_root,
+                        allow_exact_root=allow_exact_root,
+                    ):
+                        continue
+                    if SelfUpdater._path_is_reparse_point(candidate):
+                        continue
+                    files_to_remove.append(candidate)
+            for file_path in files_to_remove:
+                try:
+                    file_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            for dir_path in reversed(roots_to_remove):
+                try:
+                    dir_path.rmdir()
+                except Exception:
+                    pass
         except Exception:
             return
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import AppConfig, RetryProfile
 
 APP_NAME = "MediaCrate"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 INNO_SETUP_APP_ID = "MediaCrateJustagwas"
 PROJECT_BASE_URL = "https://www.justagwas.com/projects/mediacrate"
 OFFICIAL_PAGE_URL = PROJECT_BASE_URL
@@ -102,7 +102,7 @@ def default_config(paths_provider=None) -> AppConfig:
         batch_concurrency=4,
         skip_existing_files=True,
         auto_start_ready_links=False,
-        batch_retry_count=0,
+        batch_retry_count=1,
         filename_template=DEFAULT_FILENAME_TEMPLATE,
         conflict_policy="skip",
         download_speed_limit_kbps=0,
@@ -114,7 +114,7 @@ def default_config(paths_provider=None) -> AppConfig:
         disable_history=False,
         retry_profile=RetryProfile.BASIC.value,
         fallback_download_on_metadata_error=True,
-        accurate_size_enabled=False,
+        accurate_size_enabled=True,
         save_metadata_to_file=False,
         retain_format_selection_enabled=True,
         saved_format_choice="VIDEO",

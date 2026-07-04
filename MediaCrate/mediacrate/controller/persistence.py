@@ -160,6 +160,8 @@ def deserialize_batch_entry(
         quality_choice=quality_choice,
         attempts=attempts,
         progress_percent=progress,
+        transfer_eta="",
+        transfer_speed="",
         error=error,
         is_duplicate=bool(payload.get("is_duplicate")),
         thumbnail_url=str(payload.get("thumbnail_url") or ""),

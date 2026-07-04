@@ -132,7 +132,7 @@ class AppConfig:
     disable_history: bool = False
     retry_profile: str = RetryProfile.BASIC.value
     fallback_download_on_metadata_error: bool = True
-    accurate_size_enabled: bool = False
+    accurate_size_enabled: bool = True
     save_metadata_to_file: bool = False
     retain_format_selection_enabled: bool = True
     saved_format_choice: str = "VIDEO"
@@ -162,6 +162,8 @@ class BatchEntry:
     quality_choice: str = "BEST QUALITY"
     attempts: int = 0
     progress_percent: float = 0.0
+    transfer_eta: str = ""
+    transfer_speed: str = ""
     error: str = ""
     is_duplicate: bool = False
     thumbnail_url: str = ""

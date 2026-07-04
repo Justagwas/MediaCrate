@@ -100,7 +100,7 @@ _FILENAME_TEMPLATE_PRESETS: tuple[tuple[str, str, str], ...] = (
 _FILENAME_TEMPLATE_CUSTOM_ID = "custom"
 _RETRY_PROFILE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Off", RetryProfile.OFF.value),
-    ("Basic (Default)", RetryProfile.BASIC.value),
+    ("Standard", RetryProfile.BASIC.value),
     ("Aggressive", RetryProfile.AGGRESSIVE.value),
 )
 _STALE_PART_CLEANUP_HOURS_OPTIONS: tuple[int, ...] = (0, 6, 12, 24, 48, 72, 168, 336, 720)
@@ -871,7 +871,7 @@ class MainWindow(QMainWindow):
             + self._single_features_layout.contentsMargins().bottom()
         )
         self.single_features_row.setFixedHeight(single_frame_h)
-        self._single_progress_gap.setFixedHeight(self._scaled(16, scale, 10))
+        self._single_progress_gap.setFixedHeight(0)
         self._apply_format_quality_width_policy()
 
     def _apply_scaled_footer_metrics(self, scale: float) -> None:
@@ -1381,7 +1381,7 @@ class MainWindow(QMainWindow):
         self._single_progress_gap = QWidget(input_card)
         self._single_progress_gap.setObjectName("singleProgressGap")
         self._single_progress_gap.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self._single_progress_gap.setFixedHeight(10)
+        self._single_progress_gap.setFixedHeight(0)
         input_layout.addWidget(self._single_progress_gap)
 
         self.download_progress = QProgressBar(input_card)
@@ -1535,8 +1535,9 @@ class MainWindow(QMainWindow):
         self._build_download_behavior_toggles(downloads_card, downloads_layout)
         self._build_retry_controls(downloads_card, downloads_layout)
         self._build_speed_limit_controls(downloads_card, downloads_layout)
-        self.adaptive_concurrency_checkbox = QCheckBox('Adaptive concurrency guard', downloads_card)
+        self.adaptive_concurrency_checkbox = QCheckBox('Balanced batch scheduling', downloads_card)
         self.adaptive_concurrency_checkbox.setChecked(True)
+        self.adaptive_concurrency_checkbox.hide()
         downloads_layout.addWidget(self.adaptive_concurrency_checkbox)
         settings_layout.addWidget(downloads_card)
 
@@ -1555,7 +1556,7 @@ class MainWindow(QMainWindow):
         downloads_layout.addWidget(self.download_path_browse_btn)
 
     def _build_filename_template_controls(self, downloads_card: QFrame, downloads_layout: QVBoxLayout) -> None:
-        self.filename_template_label = QLabel('Filename template', downloads_card)
+        self.filename_template_label = QLabel('Advanced filename template', downloads_card)
         self.filename_template_label.setObjectName("settingsSubtext")
         downloads_layout.addWidget(self.filename_template_label)
         self.filename_template_combo = ChevronComboBox(downloads_card)
@@ -1572,7 +1573,7 @@ class MainWindow(QMainWindow):
         self._update_filename_template_preview()
 
     def _build_conflict_policy_controls(self, downloads_card: QFrame, downloads_layout: QVBoxLayout) -> None:
-        self.conflict_policy_label = QLabel('When file already exists', downloads_card)
+        self.conflict_policy_label = QLabel('File conflict behavior', downloads_card)
         self.conflict_policy_label.setObjectName("settingsSubtext")
         downloads_layout.addWidget(self.conflict_policy_label)
         self.conflict_policy_combo = ChevronComboBox(downloads_card)
@@ -1601,7 +1602,7 @@ class MainWindow(QMainWindow):
         worker_row = QHBoxLayout()
         worker_row.setSpacing(6)
         self._background_workers_row_layout = worker_row
-        self.background_workers_label = QLabel('Background threads', downloads_card)
+        self.background_workers_label = QLabel('Preview workers', downloads_card)
         self.background_workers_label.setToolTip("Controls metadata and thumbnail worker concurrency.")
         self.background_workers_label.setObjectName("settingsSubtext")
         worker_row.addWidget(self.background_workers_label)
@@ -1626,23 +1627,24 @@ class MainWindow(QMainWindow):
     def _build_download_behavior_toggles(self, downloads_card: QFrame, downloads_layout: QVBoxLayout) -> None:
         self.skip_existing_checkbox = QCheckBox('Skip existing files', downloads_card)
         self.skip_existing_checkbox.setChecked(True)
+        self.skip_existing_checkbox.hide()
         downloads_layout.addWidget(self.skip_existing_checkbox)
-        self.auto_start_ready_links_checkbox = QCheckBox('Auto-start ready links', downloads_card)
+        self.auto_start_ready_links_checkbox = QCheckBox('Automatically start analyzed batch rows', downloads_card)
         self.auto_start_ready_links_checkbox.setChecked(False)
         downloads_layout.addWidget(self.auto_start_ready_links_checkbox)
-        self.disable_metadata_fetch_checkbox = QCheckBox('Disable metadata fetching', downloads_card)
-        self.disable_metadata_fetch_checkbox.setChecked(False)
+        self.disable_metadata_fetch_checkbox = QCheckBox('Load metadata previews', downloads_card)
+        self.disable_metadata_fetch_checkbox.setChecked(True)
         downloads_layout.addWidget(self.disable_metadata_fetch_checkbox)
-        self.fallback_metadata_checkbox = QCheckBox('Fallback download when metadata fails', downloads_card)
+        self.fallback_metadata_checkbox = QCheckBox('Fallback to direct download if preview fails', downloads_card)
         self.fallback_metadata_checkbox.setChecked(True)
         downloads_layout.addWidget(self.fallback_metadata_checkbox)
-        self.accurate_size_checkbox = QCheckBox('Accurate file size estimates (slower)', downloads_card)
-        self.accurate_size_checkbox.setChecked(False)
+        self.accurate_size_checkbox = QCheckBox('Prefer accurate file sizes', downloads_card)
+        self.accurate_size_checkbox.setChecked(True)
         downloads_layout.addWidget(self.accurate_size_checkbox)
-        self.save_metadata_to_file_checkbox = QCheckBox('Save metadata to file', downloads_card)
+        self.save_metadata_to_file_checkbox = QCheckBox('Save metadata as .info.json', downloads_card)
         self.save_metadata_to_file_checkbox.setChecked(False)
         downloads_layout.addWidget(self.save_metadata_to_file_checkbox)
-        self.retain_format_selection_checkbox = QCheckBox('Retain format/quality selections', downloads_card)
+        self.retain_format_selection_checkbox = QCheckBox('Remember selected format and quality', downloads_card)
         self.retain_format_selection_checkbox.setChecked(True)
         downloads_layout.addWidget(self.retain_format_selection_checkbox)
 
@@ -1650,8 +1652,9 @@ class MainWindow(QMainWindow):
         retry_row = QHBoxLayout()
         retry_row.setSpacing(6)
         self._retry_row_layout = retry_row
-        self.retries_label = QLabel('Retries', downloads_card)
+        self.retries_label = QLabel('Retry failed downloads', downloads_card)
         self.retries_label.setObjectName("settingsSubtext")
+        self.retries_label.hide()
         retry_row.addWidget(self.retries_label)
         retry_row.addStretch(1)
         self.batch_retry_value_label = QLabel("0", downloads_card)
@@ -1666,8 +1669,10 @@ class MainWindow(QMainWindow):
         self.batch_retry_slider.setPageStep(1)
         self.batch_retry_slider.setTickInterval(1)
         self.batch_retry_slider.setValue(0)
+        self.batch_retry_slider.hide()
+        self.batch_retry_value_label.hide()
         downloads_layout.addWidget(self.batch_retry_slider)
-        self.retry_profile_label = QLabel('Retry profile', downloads_card)
+        self.retry_profile_label = QLabel('Retry failed downloads', downloads_card)
         self.retry_profile_label.setObjectName("settingsSubtext")
         downloads_layout.addWidget(self.retry_profile_label)
         self.retry_profile_combo = ChevronComboBox(downloads_card)
@@ -1756,10 +1761,10 @@ class MainWindow(QMainWindow):
         self.history_hint_label.setObjectName("settingsSubtext")
         history_layout.addWidget(self.history_hint_label)
         self.disable_history_checkbox = QCheckBox(
-            'Disable history and auto-delete unfinished files',
+            'Keep download history',
             history_card,
         )
-        self.disable_history_checkbox.setChecked(False)
+        self.disable_history_checkbox.setChecked(True)
         history_layout.addWidget(self.disable_history_checkbox)
         self.stale_cleanup_label = QLabel('Stale .part cleanup age', history_card)
         self.stale_cleanup_label.setObjectName("settingsSubtext")
@@ -1911,7 +1916,9 @@ class MainWindow(QMainWindow):
         self.background_workers_slider.valueChanged.connect(self._on_background_workers_changed)
         self.skip_existing_checkbox.toggled.connect(self.skipExistingFilesChanged.emit)
         self.auto_start_ready_links_checkbox.toggled.connect(self.autoStartReadyLinksChanged.emit)
-        self.disable_metadata_fetch_checkbox.toggled.connect(self.metadataFetchDisabledChanged.emit)
+        self.disable_metadata_fetch_checkbox.toggled.connect(
+            lambda checked: self.metadataFetchDisabledChanged.emit(not bool(checked))
+        )
         self.fallback_metadata_checkbox.toggled.connect(self.fallbackDownloadOnMetadataErrorChanged.emit)
         self.accurate_size_checkbox.toggled.connect(self.accurateSizeChanged.emit)
         self.save_metadata_to_file_checkbox.toggled.connect(self.saveMetadataToFileChanged.emit)
@@ -1924,7 +1931,9 @@ class MainWindow(QMainWindow):
         self.speed_limit_slider.valueChanged.connect(self._on_speed_limit_changed)
         self.adaptive_concurrency_checkbox.toggled.connect(self.adaptiveConcurrencyChanged.emit)
         self.auto_updates_checkbox.toggled.connect(self.autoCheckUpdatesChanged.emit)
-        self.disable_history_checkbox.toggled.connect(self.disableHistoryChanged.emit)
+        self.disable_history_checkbox.toggled.connect(
+            lambda checked: self.disableHistoryChanged.emit(not bool(checked))
+        )
         self.stale_part_cleanup_combo.currentIndexChanged.connect(self._on_stale_cleanup_changed)
         self.download_path_browse_btn.clicked.connect(self._browse_download_location)
 
@@ -2102,42 +2111,42 @@ class MainWindow(QMainWindow):
         if hasattr(self, "download_path_browse_btn"):
             self.download_path_browse_btn.setText('Change save folder')
         if hasattr(self, "filename_template_label"):
-            self.filename_template_label.setText('Filename template')
+            self.filename_template_label.setText('Advanced filename template')
         if hasattr(self, "filename_template_combo"):
             self._populate_filename_template_combo()
             self._update_filename_template_preview()
         if hasattr(self, "conflict_policy_label"):
-            self.conflict_policy_label.setText('When file already exists')
+            self.conflict_policy_label.setText('File conflict behavior')
         if hasattr(self, "conflict_policy_combo"):
             self._populate_conflict_policy_combo()
         if hasattr(self, "batch_concurrency_label"):
             self.batch_concurrency_label.setText('Batch concurrency')
         if hasattr(self, "background_workers_label"):
-            self.background_workers_label.setText('Background threads')
+            self.background_workers_label.setText('Preview workers')
         if hasattr(self, "skip_existing_checkbox"):
             self.skip_existing_checkbox.setText('Skip existing files')
         if hasattr(self, "auto_start_ready_links_checkbox"):
-            self.auto_start_ready_links_checkbox.setText('Auto-start ready links')
+            self.auto_start_ready_links_checkbox.setText('Automatically start analyzed batch rows')
         if hasattr(self, "disable_metadata_fetch_checkbox"):
-            self.disable_metadata_fetch_checkbox.setText('Disable metadata fetching')
+            self.disable_metadata_fetch_checkbox.setText('Load metadata previews')
         if hasattr(self, "fallback_metadata_checkbox"):
-            self.fallback_metadata_checkbox.setText('Fallback download when metadata fails')
+            self.fallback_metadata_checkbox.setText('Fallback to direct download if preview fails')
         if hasattr(self, "accurate_size_checkbox"):
-            self.accurate_size_checkbox.setText('Accurate file size estimates (slower)')
+            self.accurate_size_checkbox.setText('Prefer accurate file sizes')
         if hasattr(self, "save_metadata_to_file_checkbox"):
-            self.save_metadata_to_file_checkbox.setText('Save metadata to file')
+            self.save_metadata_to_file_checkbox.setText('Save metadata as .info.json')
         if hasattr(self, "retain_format_selection_checkbox"):
-            self.retain_format_selection_checkbox.setText('Retain format/quality selections')
+            self.retain_format_selection_checkbox.setText('Remember selected format and quality')
         if hasattr(self, "retries_label"):
-            self.retries_label.setText('Retries')
+            self.retries_label.setText('Retry failed downloads')
         if hasattr(self, "retry_profile_label"):
-            self.retry_profile_label.setText('Retry profile')
+            self.retry_profile_label.setText('Retry failed downloads')
         if hasattr(self, "retry_profile_combo"):
             self._populate_retry_profile_combo()
         if hasattr(self, "speed_limit_label"):
             self.speed_limit_label.setText('Speed limit per download')
         if hasattr(self, "adaptive_concurrency_checkbox"):
-            self.adaptive_concurrency_checkbox.setText('Adaptive concurrency guard')
+            self.adaptive_concurrency_checkbox.setText('Balanced batch scheduling')
         if hasattr(self, "auto_updates_checkbox"):
             self.auto_updates_checkbox.setText('Automatic update')
         if hasattr(self, "check_updates_button"):
@@ -2155,7 +2164,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "history_hint_label"):
             self.history_hint_label.setText('Recent downloads for quick open/retry.')
         if hasattr(self, "disable_history_checkbox"):
-            self.disable_history_checkbox.setText('Disable history and auto-delete unfinished files')
+            self.disable_history_checkbox.setText('Keep download history')
         if hasattr(self, "stale_cleanup_label"):
             self.stale_cleanup_label.setText('Stale .part cleanup age')
         if hasattr(self, "stale_part_cleanup_combo"):
@@ -2895,8 +2904,24 @@ class MainWindow(QMainWindow):
             return value
         return RetryProfile.BASIC.value
 
+    @staticmethod
+    def _retry_count_for_profile(profile: str) -> int:
+        normalized = str(profile or "").strip().lower()
+        if normalized == RetryProfile.OFF.value:
+            return 0
+        if normalized == RetryProfile.AGGRESSIVE.value:
+            return 3
+        return 1
+
     def _on_retry_profile_changed(self, _text: str) -> None:
-        self.retryProfileChanged.emit(self._current_retry_profile())
+        profile = self._current_retry_profile()
+        retries = self._retry_count_for_profile(profile)
+        self.batch_retry_slider.blockSignals(True)
+        self.batch_retry_slider.setValue(retries)
+        self.batch_retry_slider.blockSignals(False)
+        self.batch_retry_value_label.setText(str(retries))
+        self.batchRetryCountChanged.emit(retries)
+        self.retryProfileChanged.emit(profile)
 
     def _on_stale_cleanup_changed(self, _index: int) -> None:
         raw = self.stale_part_cleanup_combo.currentData(Qt.UserRole)
@@ -4424,7 +4449,7 @@ class MainWindow(QMainWindow):
                 extras.extend(
                     [
                         'Metadata preview is disabled.',
-                        'Enable metadata fetching in Settings',
+                        'Enable metadata previews in Settings',
                         'to load title, size, and formats.',
                     ]
                 )
@@ -4838,7 +4863,9 @@ class MainWindow(QMainWindow):
 
         self._run_with_blocked_signals(
             self.skip_existing_checkbox,
-            lambda: self.skip_existing_checkbox.setChecked(bool(config.skip_existing_files)),
+            lambda: self.skip_existing_checkbox.setChecked(
+                str(config.conflict_policy or "skip").strip().lower() == "skip"
+            ),
         )
         self._run_with_blocked_signals(
             self.auto_start_ready_links_checkbox,
@@ -4846,7 +4873,7 @@ class MainWindow(QMainWindow):
         )
         self._run_with_blocked_signals(
             self.disable_metadata_fetch_checkbox,
-            lambda: self.disable_metadata_fetch_checkbox.setChecked(bool(config.disable_metadata_fetch)),
+            lambda: self.disable_metadata_fetch_checkbox.setChecked(not bool(config.disable_metadata_fetch)),
         )
         self._run_with_blocked_signals(
             self.fallback_metadata_checkbox,
@@ -4866,12 +4893,9 @@ class MainWindow(QMainWindow):
                 bool(config.retain_format_selection_enabled)
             ),
         )
-        self._run_with_blocked_signals(
-            self.batch_retry_slider,
-            lambda: self.batch_retry_slider.setValue(max(0, min(3, int(config.batch_retry_count)))),
-        )
-        self._on_batch_retry_changed(self.batch_retry_slider.value())
         retry_profile = str(config.retry_profile or RetryProfile.BASIC.value).strip().lower()
+        if retry_profile == RetryProfile.BASIC.value and int(config.batch_retry_count) <= 0:
+            retry_profile = RetryProfile.OFF.value
         retry_index = self.retry_profile_combo.findData(retry_profile, Qt.UserRole)
         if retry_index < 0:
             retry_index = self.retry_profile_combo.findData(RetryProfile.BASIC.value, Qt.UserRole)
@@ -4903,7 +4927,7 @@ class MainWindow(QMainWindow):
 
         self._run_with_blocked_signals(
             self.adaptive_concurrency_checkbox,
-            lambda: self.adaptive_concurrency_checkbox.setChecked(bool(config.adaptive_batch_concurrency)),
+            lambda: self.adaptive_concurrency_checkbox.setChecked(True),
         )
 
         preferred_format = str(config.saved_format_choice or "VIDEO").strip().upper() or "VIDEO"
@@ -4927,7 +4951,7 @@ class MainWindow(QMainWindow):
         )
         self._run_with_blocked_signals(
             self.disable_history_checkbox,
-            lambda: self.disable_history_checkbox.setChecked(bool(config.disable_history)),
+            lambda: self.disable_history_checkbox.setChecked(not bool(config.disable_history)),
         )
         cleanup_hours = max(0, int(config.stale_part_cleanup_hours))
         stale_index = self.stale_part_cleanup_combo.findData(cleanup_hours, Qt.UserRole)
@@ -4955,6 +4979,10 @@ class MainWindow(QMainWindow):
 
     def download_payload(self) -> dict[str, object]:
         fmt = self.format_combo.currentText().strip() or "VIDEO"
+        conflict_policy = str(self.conflict_policy_combo.currentData(Qt.UserRole) or "skip").strip().lower()
+        if conflict_policy not in {"skip", "rename", "overwrite"}:
+            conflict_policy = "skip"
+        retry_profile = self._current_retry_profile()
         return {
             "url_text": self._current_url_text(),
             "format_choice": fmt,
@@ -4963,21 +4991,17 @@ class MainWindow(QMainWindow):
             "download_location": self.download_location_edit.text().strip(),
             "batch_concurrency": int(self.batch_concurrency_slider.value()),
             "background_worker_threads": int(self.background_workers_slider.value()),
-            "skip_existing_files": bool(self.skip_existing_checkbox.isChecked()),
+            "skip_existing_files": conflict_policy == "skip",
             "auto_start_ready_links": bool(self.auto_start_ready_links_checkbox.isChecked()),
-            "disable_metadata_fetch": bool(self.disable_metadata_fetch_checkbox.isChecked()),
+            "disable_metadata_fetch": not bool(self.disable_metadata_fetch_checkbox.isChecked()),
             "fallback_download_on_metadata_error": bool(self.fallback_metadata_checkbox.isChecked()),
             "save_metadata_to_file": bool(self.save_metadata_to_file_checkbox.isChecked()),
-            "batch_retry_count": int(self.batch_retry_slider.value()),
-            "retry_profile": self._current_retry_profile(),
+            "batch_retry_count": self._retry_count_for_profile(retry_profile),
+            "retry_profile": retry_profile,
             "filename_template": self._effective_filename_template(),
-            "conflict_policy": (
-                str(self.conflict_policy_combo.currentData(Qt.UserRole) or "skip").strip().lower()
-                if str(self.conflict_policy_combo.currentData(Qt.UserRole) or "skip").strip().lower() in {"skip", "rename", "overwrite"}
-                else "skip"
-            ),
+            "conflict_policy": conflict_policy,
             "speed_limit_kbps": int(_speed_limit_kbps_from_slider_value(self.speed_limit_slider.value())),
-            "adaptive_batch_concurrency": bool(self.adaptive_concurrency_checkbox.isChecked()),
+            "adaptive_batch_concurrency": True,
             "stale_part_cleanup_hours": int(self.stale_part_cleanup_combo.currentData(Qt.UserRole) or 0),
         }
 
@@ -5023,10 +5047,14 @@ class MainWindow(QMainWindow):
     def clear_log(self) -> None:
         self.console_output.clear()
 
-    def set_download_progress(self, percent: float | int) -> None:
+    def set_download_progress(self, percent: float | int, detail: str = "") -> None:
         clamped = max(0.0, min(100.0, float(percent)))
         scaled = int(round(clamped * 100))
-        label = 'Download complete' if scaled >= 10000 else f"{clamped:.2f}%"
+        detail_text = str(detail or "").strip() or "ETA -- | --/s"
+        if scaled >= 10000:
+            label = f"Download complete  |  {detail_text}"
+        else:
+            label = f"{clamped:.2f}%  |  {detail_text}"
         if self.download_progress.value() == scaled and self.download_progress.format() == label:
             return
         if self.download_progress.value() != scaled:

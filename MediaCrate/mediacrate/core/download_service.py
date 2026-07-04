@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -41,6 +42,7 @@ from .partial_files import discard_partial_candidates, record_partial_candidates
 from .paths import resolve_binary
 
 _PROGRESS_RE = re.compile(r"(?P<percent>\d+(?:\.\d+)?)%")
+_DOWNLOAD_LINE_TOTAL_RE = re.compile(r"\bof\s+(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?i?B|[KMGTPE]?B)\b", re.IGNORECASE)
 SingleProgressCallback = Callable[[float, str], None]
 BatchProgressCallback = Callable[[str, float, str], None]
 StatusCallback = Callable[[str, str], None]
@@ -1010,15 +1012,144 @@ def _progress_percent_from_payload(payload: dict[str, Any]) -> float | None:
     return None
 
 
-def _progress_message_from_payload(payload: dict[str, Any]) -> str:
-    for key in ("_percent_str", "_progress_str"):
-        text = sanitize_error_text(payload.get(key))
-        if text:
-            return text
+def _format_eta_seconds(value: object) -> str:
+    seconds = _progress_number(value)
+    if seconds is None or seconds < 0:
+        return ""
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _format_speed_bytes_per_second(value: object) -> str:
+    speed = _progress_number(value)
+    if speed is None or speed <= 0:
+        return ""
+    return f"{_format_size_human(int(speed))}/s"
+
+
+def _parse_size_bytes(value: str, unit: str) -> int | None:
+    try:
+        number = float(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    normalized_unit = str(unit or "").strip().lower()
+    powers = {
+        "b": 0,
+        "kb": 1,
+        "kib": 1,
+        "mb": 2,
+        "mib": 2,
+        "gb": 3,
+        "gib": 3,
+        "tb": 4,
+        "tib": 4,
+        "pb": 5,
+        "pib": 5,
+        "eb": 6,
+        "eib": 6,
+    }
+    power = powers.get(normalized_unit)
+    if power is None:
+        return None
+    return int(number * (1024 ** power))
+
+
+class _TransferRateEstimator:
+    def __init__(self) -> None:
+        self._samples: deque[tuple[float, float]] = deque()
+        self._last_detail = ("", "")
+        self._last_detail_at = 0.0
+
+    def update(self, *, downloaded_bytes: float | None, total_bytes: float | None) -> tuple[str, str]:
+        if downloaded_bytes is None or downloaded_bytes < 0:
+            return self._last_detail
+        now = time.monotonic()
+        if self._samples and downloaded_bytes < self._samples[-1][1]:
+            self._samples.clear()
+            self._last_detail = ("", "")
+            self._last_detail_at = 0.0
+        if not self._samples or (now - self._samples[-1][0]) >= 0.35 or downloaded_bytes > self._samples[-1][1]:
+            self._samples.append((now, float(downloaded_bytes)))
+        while len(self._samples) > 2 and (now - self._samples[0][0]) > 12.0:
+            self._samples.popleft()
+        if (now - self._last_detail_at) < 1.5 and any(self._last_detail):
+            return self._last_detail
+        if len(self._samples) < 2:
+            return self._last_detail
+        oldest_time, oldest_bytes = self._samples[0]
+        newest_time, newest_bytes = self._samples[-1]
+        elapsed = newest_time - oldest_time
+        transferred = newest_bytes - oldest_bytes
+        if elapsed < 1.0 or transferred <= 0:
+            return self._last_detail
+        speed = transferred / elapsed
+        speed_text = _format_speed_bytes_per_second(speed)
+        eta_text = ""
+        if total_bytes is not None and total_bytes > newest_bytes and speed > 0:
+            eta_text = _format_eta_seconds((total_bytes - newest_bytes) / speed)
+        self._last_detail = (eta_text, speed_text)
+        self._last_detail_at = now
+        return self._last_detail
+
+
+def _progress_message_from_payload(payload: dict[str, Any], estimator: _TransferRateEstimator | None = None) -> str:
+    parts = ["Downloading..."]
+    percent_text = sanitize_error_text(payload.get("_percent_str"))
+    if percent_text:
+        parts.append(percent_text)
+    else:
+        percent = _progress_percent_from_payload(payload)
+        if percent is not None:
+            parts.append(f"{max(0.0, min(99.0, percent)):.2f}%")
     downloaded = _progress_number(payload.get("downloaded_bytes"))
-    if downloaded is not None and downloaded > 0:
-        return f"Downloading... {_format_size_human(int(downloaded))}"
-    return "Downloading..."
+    total = _progress_number(payload.get("total_bytes")) or _progress_number(payload.get("total_bytes_estimate"))
+    eta = ""
+    speed = ""
+    if estimator is not None:
+        eta, speed = estimator.update(downloaded_bytes=downloaded, total_bytes=total)
+    if eta:
+        parts.append(f"ETA {eta}")
+    if speed:
+        parts.append(speed)
+    return " | ".join(parts)
+
+
+def _progress_message_from_download_line(line: str, estimator: _TransferRateEstimator | None = None) -> str:
+    clean = sanitize_error_text(line)
+    if clean.lower().startswith("[download]"):
+        detail = clean[len("[download]") :].strip()
+        if detail:
+            parts = ["Downloading..."]
+            percent_match = _PROGRESS_RE.search(detail)
+            total_match = _DOWNLOAD_LINE_TOTAL_RE.search(detail)
+            percent = str(percent_match.group("percent") if percent_match else "").strip()
+            eta = ""
+            speed = ""
+            if estimator is not None and percent_match and total_match:
+                total = _parse_size_bytes(total_match.group("size"), total_match.group("unit"))
+                downloaded = None
+                if total is not None:
+                    try:
+                        downloaded = (float(percent) / 100.0) * float(total)
+                    except ValueError:
+                        downloaded = None
+                eta, speed = estimator.update(downloaded_bytes=downloaded, total_bytes=float(total) if total else None)
+            if percent:
+                parts.append(f"{percent}%")
+            if eta:
+                parts.append(f"ETA {eta}")
+            if speed:
+                parts.append(speed)
+            if len(parts) > 1:
+                return " | ".join(parts)
+            return f"Downloading... | {detail}"
+    return clean
 
 
 def _resolved_node_js_runtime_path() -> str:
@@ -1996,6 +2127,7 @@ class DownloadService:
             if stream is None:
                 return self._make_result(job, state=DownloadState.ERROR.value, error="No output stream")
 
+            progress_estimator = _TransferRateEstimator()
             for line in iter(stream.readline, ""):
                 interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
                 if interrupt_state == DownloadState.CANCELLED.value:
@@ -2022,7 +2154,10 @@ class DownloadService:
                         percent = float(match.group("percent"))
                     except ValueError:
                         percent = 0.0
-                    progress_cb(max(0.0, min(99.0, percent)), clean)
+                    progress_cb(
+                        max(0.0, min(99.0, percent)),
+                        _progress_message_from_download_line(clean, progress_estimator),
+                    )
 
             return_code = process.wait()
             interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
@@ -2173,6 +2308,7 @@ class DownloadService:
                     self.last_error_text = clean
 
         logger = _YdlLogger()
+        progress_estimator = _TransferRateEstimator()
 
         def progress_hook(payload: dict[str, Any]) -> None:
             interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
@@ -2191,7 +2327,7 @@ class DownloadService:
                 return
 
             percent = _progress_percent_from_payload(payload)
-            line = _progress_message_from_payload(payload)
+            line = _progress_message_from_payload(payload, progress_estimator)
             progress_cb(max(0.0, min(99.0, percent or 0.0)), line)
 
         ydl_opts: dict[str, Any] = {

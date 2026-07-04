@@ -66,11 +66,13 @@ from .core.models import (
     AppConfig,
     BatchEntry,
     BatchEntryStatus,
+    CONVERSION_CONTAINER_CHOICES,
     DownloadJob,
     DownloadHistoryEntry,
     DownloadResult,
     DownloadState,
     DownloadSummary,
+    FormatChoice,
     FormatProbeResult,
     RetryProfile,
     TERMINAL_DOWNLOAD_STATES,
@@ -80,6 +82,7 @@ from .core.models import (
     is_audio_format_choice,
 )
 from .core.paths import (
+    resolve_binary,
     resolve_app_asset,
 )
 from .core.update_service import UpdateService
@@ -104,7 +107,6 @@ SINGLE_ANALYSIS_DEBOUNCE_MS = 500
 STARTUP_STAGE_DEPENDENCY_DELAY_MS = 120
 STARTUP_STAGE_QUEUE_RESTORE_DELAY_MS = 260
 STARTUP_STAGE_HISTORY_DELAY_MS = 420
-STARTUP_STAGE_FFMPEG_PROMPT_DELAY_MS = 1700
 AUTO_UPDATE_START_DELAY_MS = 2600
 BATCH_CONCURRENCY_MAX = 16
 SPEED_LIMIT_KBPS_MAX = 100000
@@ -178,6 +180,8 @@ class AppController(QObject):
         self._single_selection_size_worker: SelectionSizeWorker | None = None
         self._single_selection_size_pending: tuple[str, str, str] | None = None
         self._single_selection_size_queued: tuple[str, str, str] | None = None
+        self._batch_selection_size_queue: deque[tuple[str, str, str]] = deque()
+        self._batch_selection_size_queued: set[tuple[str, str, str]] = set()
         self._single_selection_size_cache: dict[str, dict[str, int]] = {}
         self._single_selection_size_failed: dict[str, set[str]] = {}
         self._single_selection_size_failed_at: dict[str, dict[str, float]] = {}
@@ -202,6 +206,8 @@ class AppController(QObject):
         self._download_total_jobs = 0
         self._download_completed_jobs = 0
         self._last_download_progress_hundredths = -1
+        self._single_download_transfer_status: tuple[str, str] = ("", "")
+        self._last_single_download_progress_detail = ""
         self._batch_entries_by_id: dict[str, BatchEntry] = {}
         self._batch_entry_order: list[str] = []
         self._batch_analysis_result_by_entry_id: dict[str, UrlAnalysisResult] = {}
@@ -251,7 +257,6 @@ class AppController(QObject):
         self._stale_cleanup_pending_reason = ""
         self._last_stale_part_full_scan_at = 0.0
         self._startup_staged_initialized = False
-        self._startup_ffmpeg_prompt_completed = False
         self._startup_stage_index = -1
         self._startup_stage_sequence: list[tuple[str, int, object]] = []
         self._startup_stage_timer = QTimer(self)
@@ -326,16 +331,14 @@ class AppController(QObject):
         dependency_gap = STARTUP_STAGE_DEPENDENCY_DELAY_MS
         queue_restore_gap = max(0, STARTUP_STAGE_QUEUE_RESTORE_DELAY_MS - STARTUP_STAGE_DEPENDENCY_DELAY_MS)
         history_gap = max(0, STARTUP_STAGE_HISTORY_DELAY_MS - STARTUP_STAGE_QUEUE_RESTORE_DELAY_MS)
-        ffmpeg_gap = max(0, STARTUP_STAGE_FFMPEG_PROMPT_DELAY_MS - STARTUP_STAGE_HISTORY_DELAY_MS)
         stages: list[tuple[str, int, object]] = [
             ("dependency-status", dependency_gap, self._run_startup_stage_dependency),
             ("restore-batch-queue", queue_restore_gap, self._run_startup_stage_restore_queue),
             ("download-history", history_gap, self._run_startup_stage_history),
             ("stale-part-cleanup", 0, self._run_startup_stage_stale_cleanup),
-            ("ffmpeg-required-gate", ffmpeg_gap, self._run_startup_stage_ffmpeg_gate),
         ]
         if self.config.auto_check_updates:
-            update_gap = max(0, AUTO_UPDATE_START_DELAY_MS - STARTUP_STAGE_FFMPEG_PROMPT_DELAY_MS)
+            update_gap = max(0, AUTO_UPDATE_START_DELAY_MS - STARTUP_STAGE_HISTORY_DELAY_MS)
             stages.append(("auto-update-check", update_gap, self._run_startup_stage_auto_update))
         return stages
 
@@ -364,29 +367,8 @@ class AppController(QObject):
     def _run_startup_stage_stale_cleanup(self) -> None:
         self._request_stale_part_cleanup(reason="startup")
 
-    def _run_startup_stage_ffmpeg_gate(self) -> None:
-        self._prompt_startup_ffmpeg_requirement()
-
     def _run_startup_stage_auto_update(self) -> None:
         self.start_update_check(manual=False)
-
-    def _prompt_startup_ffmpeg_requirement(self) -> None:
-        if self._startup_ffmpeg_prompt_completed:
-            return
-        self._startup_ffmpeg_prompt_completed = True
-        status = dependency_status().get("ffmpeg")
-        if status and status.installed:
-            return
-        answer = self._ask_yes_no(
-            "FFmpeg required",
-            "FFmpeg is required for MediaCrate to merge/download media.\n\nInstall FFmpeg now?",
-            default_button=QMessageBox.Yes,
-        )
-        if answer == QMessageBox.Yes:
-            self.install_dependency("ffmpeg")
-            return
-        self._show_warning("FFmpeg required", "MediaCrate requires FFmpeg and will now close.")
-        QTimer.singleShot(0, self.app.quit)
 
     def _connect_signals(self) -> None:
         self._connect_window_action_signals()
@@ -1508,6 +1490,12 @@ class AppController(QObject):
         if requested not in valid_profiles:
             requested = RetryProfile.BASIC.value
         self.config.retry_profile = requested
+        if requested == RetryProfile.OFF.value:
+            self.config.batch_retry_count = 0
+        elif requested == RetryProfile.AGGRESSIVE.value:
+            self.config.batch_retry_count = 3
+        else:
+            self.config.batch_retry_count = 1
         self._save_config(deferred=True)
 
     def _on_fallback_metadata_changed(self, value: bool) -> None:
@@ -1524,9 +1512,15 @@ class AppController(QObject):
         if not self._is_accurate_size_enabled():
             self._stop_single_selection_size_worker()
             self._refresh_single_selection_size_from_cache()
+            for entry in self._batch_entries_by_id.values():
+                self._apply_entry_size_for_selection(entry)
+            self._refresh_batch_entries_view()
             return
         self._refresh_single_selection_size_from_cache()
         self._request_single_selection_size_refresh()
+        for entry in self._batch_entries_by_id.values():
+            self._apply_entry_size_for_selection(entry)
+        self._refresh_batch_entries_view()
 
     def _on_save_metadata_to_file_changed(self, value: bool) -> None:
         self.config.save_metadata_to_file = bool(value)
@@ -1558,6 +1552,7 @@ class AppController(QObject):
         if policy not in {"skip", "rename", "overwrite"}:
             policy = "skip"
         self.config.conflict_policy = policy
+        self.config.skip_existing_files = policy == "skip"
         self._save_config()
 
     def _on_speed_limit_changed(self, value: int) -> None:
@@ -1565,7 +1560,8 @@ class AppController(QObject):
         self._save_config(deferred=True)
 
     def _on_adaptive_concurrency_changed(self, value: bool) -> None:
-        self.config.adaptive_batch_concurrency = bool(value)
+        del value
+        self.config.adaptive_batch_concurrency = True
         self._save_config()
 
     def _on_auto_updates_changed(self, value: bool) -> None:
@@ -1745,7 +1741,7 @@ class AppController(QObject):
             "disabled",
             title="Metadata preview disabled",
             size_text="Unknown",
-            message="Enable metadata fetching in Settings to load metadata.",
+            message="Enable metadata previews in Settings to load metadata.",
         )
 
     def _apply_metadata_fetch_policy_to_batch_entries(self) -> None:
@@ -1937,6 +1933,8 @@ class AppController(QObject):
             self._single_selection_size_worker.stop()
         self._single_selection_size_pending = None
         self._single_selection_size_queued = None
+        self._batch_selection_size_queue.clear()
+        self._batch_selection_size_queued.clear()
 
     def _cached_single_selection_size_value(
         self,
@@ -1948,7 +1946,10 @@ class AppController(QObject):
         normalized_url = normalize_batch_url(coerce_http_url(str(url or "").strip()))
         if not normalized_url:
             return None
-        cache = self._single_selection_size_cache.get(normalized_url)
+        cache_map = getattr(self, "_single_selection_size_cache", None)
+        if not isinstance(cache_map, dict):
+            return None
+        cache = cache_map.get(normalized_url)
         if not isinstance(cache, dict):
             return None
         normalized_format, normalized_quality = self._selection_size_key(format_choice, quality_choice)
@@ -2018,6 +2019,59 @@ class AppController(QObject):
             if self._single_selection_size_pending == signature:
                 return
             self._single_selection_size_queued = signature
+            return
+        self._single_selection_size_pending = signature
+        self._single_selection_size_queued = None
+        self._start_single_selection_size_worker(
+            url=normalized_url,
+            format_choice=normalized_format,
+            quality_choice=normalized_quality,
+        )
+
+    def _request_batch_entry_selection_size_refresh(self, entry: BatchEntry) -> None:
+        if self._is_metadata_fetch_disabled() or (not self._is_accurate_size_enabled()):
+            return
+        if entry.status not in {
+            BatchEntryStatus.VALID.value,
+            BatchEntryStatus.DOWNLOAD_QUEUED.value,
+            BatchEntryStatus.DOWNLOADING.value,
+            BatchEntryStatus.PAUSED.value,
+        }:
+            return
+        normalized_url = normalize_batch_url(coerce_http_url(str(entry.url_normalized or entry.url_raw or "").strip()))
+        if not normalized_url:
+            return
+        normalized_format, normalized_quality = self._selection_size_key(entry.format_choice, entry.quality_choice)
+        cached = self._cached_single_selection_size_value(
+            url=normalized_url,
+            format_choice=normalized_format,
+            quality_choice=normalized_quality,
+        )
+        if cached is not None:
+            entry.expected_size_bytes = cached
+            return
+        if not all(
+            hasattr(self, attr)
+            for attr in (
+                "_single_selection_size_pending",
+                "_single_selection_size_thread",
+                "_batch_selection_size_queue",
+                "_batch_selection_size_queued",
+            )
+        ):
+            return
+        if self._has_single_selection_size_failed(
+            url=normalized_url,
+            format_choice=normalized_format,
+            quality_choice=normalized_quality,
+        ):
+            return
+        signature = (normalized_url, normalized_format, normalized_quality)
+        if self._single_selection_size_pending == signature or signature in self._batch_selection_size_queued:
+            return
+        if self._single_selection_size_thread is not None and self._single_selection_size_thread.isRunning():
+            self._batch_selection_size_queue.append(signature)
+            self._batch_selection_size_queued.add(signature)
             return
         self._single_selection_size_pending = signature
         self._single_selection_size_queued = None
@@ -2173,12 +2227,14 @@ class AppController(QObject):
         cache[key] = int(size_bytes)
         self._track_single_selection_size_url(normalized_url)
         self._trim_single_selection_size_cache_maps()
-        failed = self._single_selection_size_failed.get(normalized_url)
+        failed_map = getattr(self, "_single_selection_size_failed", None)
+        failed = failed_map.get(normalized_url) if isinstance(failed_map, dict) else None
         if failed is not None:
             failed.discard(key)
             if not failed:
                 self._single_selection_size_failed.pop(normalized_url, None)
-        failed_at = self._single_selection_size_failed_at.get(normalized_url)
+        failed_at_map = getattr(self, "_single_selection_size_failed_at", None)
+        failed_at = failed_at_map.get(normalized_url) if isinstance(failed_at_map, dict) else None
         if failed_at is not None:
             failed_at.pop(key, None)
             if not failed_at:
@@ -2196,9 +2252,13 @@ class AppController(QObject):
             return
         normalized_format, normalized_quality = self._selection_size_key(format_choice, quality_choice)
         key = f"{normalized_format}|{normalized_quality}"
-        failed = self._single_selection_size_failed.setdefault(normalized_url, set())
+        failed_map = getattr(self, "_single_selection_size_failed", None)
+        failed_at_map = getattr(self, "_single_selection_size_failed_at", None)
+        if not isinstance(failed_map, dict) or not isinstance(failed_at_map, dict):
+            return
+        failed = failed_map.setdefault(normalized_url, set())
         failed.add(key)
-        failed_at = self._single_selection_size_failed_at.setdefault(normalized_url, {})
+        failed_at = failed_at_map.setdefault(normalized_url, {})
         failed_at[key] = monotonic()
         self._track_single_selection_size_url(normalized_url)
         self._trim_single_selection_size_cache_maps()
@@ -2215,13 +2275,19 @@ class AppController(QObject):
             return False
         normalized_format, normalized_quality = self._selection_size_key(format_choice, quality_choice)
         key = f"{normalized_format}|{normalized_quality}"
-        failed = self._single_selection_size_failed.get(normalized_url)
+        failed_map = getattr(self, "_single_selection_size_failed", None)
+        if not isinstance(failed_map, dict):
+            return False
+        failed = failed_map.get(normalized_url)
         if not failed:
             return False
         if key not in failed:
             return False
         now = monotonic()
-        failed_at = self._single_selection_size_failed_at.setdefault(normalized_url, {})
+        failed_at_map = getattr(self, "_single_selection_size_failed_at", None)
+        if not isinstance(failed_at_map, dict):
+            return True
+        failed_at = failed_at_map.setdefault(normalized_url, {})
         marked_at = failed_at.get(key)
         if not isinstance(marked_at, (int, float)):
             failed_at[key] = now
@@ -2262,16 +2328,11 @@ class AppController(QObject):
             return
         if self._is_metadata_fetch_disabled():
             return
-        if bool(self.window.download_payload().get("batch_enabled")):
-            return
         if not self._is_accurate_size_enabled():
             return
         url, format_choice, quality_choice, size_bytes = payload
         normalized_url = normalize_batch_url(coerce_http_url(str(url or "").strip()))
         if not normalized_url:
-            return
-        current_url = normalize_batch_url(coerce_http_url(self._first_url_from_input()))
-        if current_url != normalized_url:
             return
         size_value = size_bytes if isinstance(size_bytes, int) else None
         if size_value is None or size_value <= 0:
@@ -2287,12 +2348,32 @@ class AppController(QObject):
                 quality_choice=str(quality_choice or ""),
                 size_bytes=size_value,
             )
-        current_format, current_quality = self._current_default_choices()
-        current_format, current_quality = self._selection_size_key(current_format, current_quality)
         requested_format, requested_quality = self._selection_size_key(
             str(format_choice or ""),
             str(quality_choice or ""),
         )
+        if bool(self.window.download_payload().get("batch_enabled")):
+            updated = False
+            for entry in self._batch_entries_by_id.values():
+                entry_url = normalize_batch_url(coerce_http_url(str(entry.url_normalized or entry.url_raw or "").strip()))
+                if entry_url != normalized_url:
+                    continue
+                entry_format, entry_quality = self._selection_size_key(entry.format_choice, entry.quality_choice)
+                if (entry_format, entry_quality) != (requested_format, requested_quality):
+                    continue
+                if size_value is not None and size_value > 0:
+                    entry.expected_size_bytes = size_value
+                    self.window.update_batch_entry(entry)
+                    updated = True
+            if updated:
+                self._mark_batch_queue_dirty()
+                self._update_batch_stats_header()
+            return
+        current_url = normalize_batch_url(coerce_http_url(self._first_url_from_input()))
+        if current_url != normalized_url:
+            return
+        current_format, current_quality = self._current_default_choices()
+        current_format, current_quality = self._selection_size_key(current_format, current_quality)
         if (current_format, current_quality) != (requested_format, requested_quality):
             return
         cached = self._cached_single_result_for_url(str(url or "").strip())
@@ -2306,35 +2387,68 @@ class AppController(QObject):
         self._single_selection_size_worker = None
         self._single_selection_size_pending = None
         self._single_selection_size_queued = None
-        if queued is None:
+        batch_enabled = bool(self.window.download_payload().get("batch_enabled"))
+
+        def start_queued_single_request() -> bool:
+            if queued is None:
+                return False
+            if self._is_metadata_fetch_disabled():
+                return False
+            if not self._is_accurate_size_enabled():
+                return False
+            current_url = normalize_batch_url(coerce_http_url(self._first_url_from_input()))
+            if current_url != queued[0]:
+                return False
+            if self._cached_single_selection_size_value(
+                url=queued[0],
+                format_choice=queued[1],
+                quality_choice=queued[2],
+            ) is not None:
+                return False
+            if self._has_single_selection_size_failed(
+                url=queued[0],
+                format_choice=queued[1],
+                quality_choice=queued[2],
+            ):
+                return False
+            self._single_selection_size_pending = queued
+            self._start_single_selection_size_worker(
+                url=queued[0],
+                format_choice=queued[1],
+                quality_choice=queued[2],
+            )
+            return True
+
+        if (not batch_enabled) and start_queued_single_request():
             return
-        if self._is_metadata_fetch_disabled():
+
+        while self._batch_selection_size_queue:
+            next_request = self._batch_selection_size_queue.popleft()
+            self._batch_selection_size_queued.discard(next_request)
+            if self._cached_single_selection_size_value(
+                url=next_request[0],
+                format_choice=next_request[1],
+                quality_choice=next_request[2],
+            ) is not None:
+                continue
+            if self._has_single_selection_size_failed(
+                url=next_request[0],
+                format_choice=next_request[1],
+                quality_choice=next_request[2],
+            ):
+                continue
+            if self._is_metadata_fetch_disabled() or (not self._is_accurate_size_enabled()):
+                return
+            self._single_selection_size_pending = next_request
+            self._start_single_selection_size_worker(
+                url=next_request[0],
+                format_choice=next_request[1],
+                quality_choice=next_request[2],
+            )
             return
-        if not self._is_accurate_size_enabled():
+        if batch_enabled:
             return
-        if bool(self.window.download_payload().get("batch_enabled")):
-            return
-        current_url = normalize_batch_url(coerce_http_url(self._first_url_from_input()))
-        if current_url != queued[0]:
-            return
-        if self._cached_single_selection_size_value(
-            url=queued[0],
-            format_choice=queued[1],
-            quality_choice=queued[2],
-        ) is not None:
-            return
-        if self._has_single_selection_size_failed(
-            url=queued[0],
-            format_choice=queued[1],
-            quality_choice=queued[2],
-        ):
-            return
-        self._single_selection_size_pending = queued
-        self._start_single_selection_size_worker(
-            url=queued[0],
-            format_choice=queued[1],
-            quality_choice=queued[2],
-        )
+        start_queued_single_request()
 
     def _validate_single_selection_before_download(
         self,
@@ -2407,12 +2521,22 @@ class AppController(QObject):
         analysis = self._batch_analysis_results().get(key)
         if analysis is None:
             return
+        if self._is_accurate_size_enabled():
+            selected_size = self._accurate_selection_size_bytes_for_result(
+                analysis,
+                format_choice=str(entry.format_choice or "VIDEO"),
+                quality_choice=str(entry.quality_choice or "BEST QUALITY"),
+            )
+            if isinstance(selected_size, int) and selected_size > 0:
+                entry.expected_size_bytes = selected_size
+                return
         selected_size = estimate_selection_size_bytes(
             analysis,
             str(entry.format_choice or "VIDEO"),
             str(entry.quality_choice or "BEST QUALITY"),
         )
         entry.expected_size_bytes = selected_size
+        self._request_batch_entry_selection_size_refresh(entry)
 
     def _entry_has_analysis_metadata(self, entry: BatchEntry | None) -> bool:
         return entry_has_analysis_metadata(entry)
@@ -3099,9 +3223,50 @@ class AppController(QObject):
         )
 
     @staticmethod
+    def _job_requires_ffmpeg(job: DownloadJob, *, save_metadata_to_file: bool) -> bool:
+        choice = str(job.format_choice or "").strip().upper()
+        needs_ffmpeg_processing = (
+            choice in {FormatChoice.VIDEO.value, FormatChoice.MP4.value}
+            or (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
+            or choice in CONVERSION_CONTAINER_CHOICES
+        )
+        return bool(needs_ffmpeg_processing or save_metadata_to_file)
+
+    def _jobs_require_ffmpeg(self, jobs: list[DownloadJob], *, payload: dict[str, object]) -> bool:
+        if resolve_binary("ffmpeg"):
+            return False
+        save_metadata_to_file = bool(payload.get("save_metadata_to_file", self.config.save_metadata_to_file))
+        return any(self._job_requires_ffmpeg(job, save_metadata_to_file=save_metadata_to_file) for job in jobs)
+
+    def _confirm_install_ffmpeg_for_download(self, jobs: list[DownloadJob], *, payload: dict[str, object]) -> bool:
+        if not self._jobs_require_ffmpeg(jobs, payload=payload):
+            return True
+        if self._is_dependency_install_running("ffmpeg"):
+            self._show_info(
+                "FFmpeg is installing",
+                "FFmpeg is already being installed. Start the download again when it finishes.",
+            )
+            return False
+        answer = self._ask_yes_no(
+            "Install FFmpeg?",
+            "This download needs FFmpeg for the selected format or metadata option.\n\nInstall FFmpeg now?",
+            default_button=QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.install_dependency("ffmpeg")
+            return False
+        self._show_warning(
+            "FFmpeg required",
+            "Choose a format that does not need conversion, turn off metadata files, or install FFmpeg from Settings.",
+        )
+        return False
+
+    @staticmethod
     def _mark_entry_as_download_queued(entry: BatchEntry) -> None:
         entry.status = BatchEntryStatus.DOWNLOAD_QUEUED.value
         entry.progress_percent = 0.0
+        entry.transfer_eta = ""
+        entry.transfer_speed = ""
         entry.attempts = 0
         entry.error = ""
 
@@ -3156,6 +3321,9 @@ class AppController(QObject):
 
         payload = self.window.download_payload()
         output_dir = self._resolve_download_output_dir(payload)
+        candidate_jobs = [self._build_download_job_for_entry(entry, output_dir=output_dir) for entry in entries]
+        if not self._confirm_install_ffmpeg_for_download(candidate_jobs, payload=payload):
+            return 0
         added = 0
         for entry in entries:
             if self._try_enqueue_entry_into_active_download(entry=entry, output_dir=output_dir):
@@ -3184,6 +3352,11 @@ class AppController(QObject):
             jobs.append(job)
             job_id = job.job_id
             job_to_entry[job_id] = str(entry.entry_id)
+
+        if not self._confirm_install_ffmpeg_for_download(jobs, payload=payload):
+            return
+
+        for entry in entries:
             self._mark_entry_as_download_queued(entry)
 
         self._refresh_batch_entries_view()
@@ -3211,6 +3384,8 @@ class AppController(QObject):
             job_to_entry=job_to_entry,
         )
         self._post_processing_notice_job_ids.clear()
+        self._single_download_transfer_status = ("", "")
+        self._last_single_download_progress_detail = ""
         self.window.reset_download_progress()
         self._refresh_overall_download_progress()
         self.window.set_controls_busy(True)
@@ -3230,9 +3405,7 @@ class AppController(QObject):
                 int(payload.get("speed_limit_kbps", self.config.download_speed_limit_kbps)),
             ),
         )
-        adaptive_enabled = bool(
-            payload.get("adaptive_batch_concurrency", self.config.adaptive_batch_concurrency)
-        )
+        adaptive_enabled = job_count > 1
         effective_concurrency = self._effective_batch_concurrency(
             requested_concurrency,
             job_count,
@@ -3241,7 +3414,7 @@ class AppController(QObject):
         )
         if effective_concurrency != requested_concurrency and job_count > 1:
             self.window.append_log(
-                f"Adaptive concurrency: {requested_concurrency} -> {effective_concurrency}"
+                f"Balanced batch scheduling: {requested_concurrency} -> {effective_concurrency}"
             )
         return effective_concurrency, speed_limit_kbps
 
@@ -3301,6 +3474,7 @@ class AppController(QObject):
             speed_limit_kbps=speed_limit_kbps,
         )
         self._connect_download_worker(thread=thread, worker=worker)
+        self.window.append_log("Downloading...")
         thread.start()
 
         self._download_thread = thread
@@ -3374,7 +3548,10 @@ class AppController(QObject):
             normalized_url = normalize_batch_url(coerce_http_url(str(result.url_raw or "").strip()))
         if not normalized_url:
             return None
-        cache = self._single_selection_size_cache.get(normalized_url)
+        cache_map = getattr(self, "_single_selection_size_cache", None)
+        if not isinstance(cache_map, dict):
+            return None
+        cache = cache_map.get(normalized_url)
         if not isinstance(cache, dict):
             return None
         normalized_format, normalized_quality = self._selection_size_key(format_choice, quality_choice)
@@ -3823,6 +4000,8 @@ class AppController(QObject):
             quality_choice=quality_choice,
         ):
             return
+        if not self._confirm_install_ffmpeg_for_download(jobs, payload=payload):
+            return
         skip_existing_files = bool(payload.get("skip_existing_files", self.config.skip_existing_files))
         conflict_policy = str(payload.get("conflict_policy", self.config.conflict_policy)).strip().lower()
         filename_template = str(payload.get("filename_template", self.config.filename_template))
@@ -4000,7 +4179,7 @@ class AppController(QObject):
     ) -> None:
         if self._is_metadata_fetch_disabled():
             if show_errors:
-                self._show_info("Metadata disabled", "Enable metadata fetching in Settings to load format metadata.")
+                self._show_info("Metadata previews disabled", "Enable metadata previews in Settings to load format metadata.")
             return
         first_url = self._first_url_from_input()
         if not self._can_start_probe(
@@ -4256,4 +4435,3 @@ class AppController(QObject):
 
     def _on_history_clear(self) -> None:
         HistoryFlow.on_history_clear(self)
-

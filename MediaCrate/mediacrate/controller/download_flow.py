@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import re
 from typing import Protocol
 
 from PySide6.QtCore import QTimer
 
 from ..core.download_service import normalize_download_state
 from ..core.models import BatchEntry, BatchEntryStatus, DownloadResult, DownloadState, TERMINAL_DOWNLOAD_STATES
+
+_ETA_RE = re.compile(r"\bETA\s+(?P<eta>[^\s|]+)", re.IGNORECASE)
+_SPEED_RE = re.compile(r"(?P<speed>[0-9][0-9.,]*\s*[KMGTPE]?i?B/s|[0-9][0-9.,]*\s*[KMGTPE]?B/s)", re.IGNORECASE)
 
 
 class DownloadFlowWindow(Protocol):
@@ -15,7 +19,7 @@ class DownloadFlowWindow(Protocol):
 
     def set_download_progress_count(self, completed: int, total: int) -> None: ...
 
-    def set_download_progress(self, percent: float) -> None: ...
+    def set_download_progress(self, percent: float, detail: str = "") -> None: ...
 
     def reset_download_progress(self) -> None: ...
 
@@ -170,6 +174,41 @@ class DownloadFlow:
                 controller.window.append_log(f"[{category.upper()}] {value}")
 
     @staticmethod
+    def _parse_transfer_status(message: str) -> tuple[str, str]:
+        value = str(message or "").strip()
+        if not value:
+            return "", ""
+        eta_match = _ETA_RE.search(value)
+        speed_match = _SPEED_RE.search(value)
+        eta = str(eta_match.group("eta") if eta_match else "").strip()
+        speed = str(speed_match.group("speed") if speed_match else "").strip()
+        return eta, speed
+
+    @staticmethod
+    def _apply_transfer_status(
+        entry: BatchEntry,
+        *,
+        message: str,
+    ) -> bool:
+        eta, speed = DownloadFlow._parse_transfer_status(message)
+        changed = False
+        if getattr(entry, "transfer_eta", "") != eta:
+            entry.transfer_eta = eta
+            changed = True
+        if getattr(entry, "transfer_speed", "") != speed:
+            entry.transfer_speed = speed
+            changed = True
+        return changed
+
+    @staticmethod
+    def _set_single_transfer_status(controller: DownloadFlowController, message: str) -> bool:
+        eta, speed = DownloadFlow._parse_transfer_status(message)
+        previous = getattr(controller, "_single_download_transfer_status", ("", ""))
+        current = (eta, speed)
+        setattr(controller, "_single_download_transfer_status", current)
+        return previous != current
+
+    @staticmethod
     def on_download_progress(controller: DownloadFlowController, job_id: str, percent: float, message: str) -> None:
         identifier = str(job_id or "").strip()
         if not identifier or identifier not in controller._download_progress_by_job:
@@ -186,17 +225,25 @@ class DownloadFlow:
             controller._post_processing_notice_job_ids.add(identifier)
             if not bool(getattr(controller, "_active_download_is_multi", False)):
                 controller.window.append_log("Post-processing...")
-        if abs(clamped - previous) < 0.005:
-            return
-        controller._download_progress_by_job[identifier] = clamped
         mapped_entry_id = controller._job_to_batch_entry_id.get(identifier, identifier)
         entry = controller._batch_entries_by_id.get(mapped_entry_id)
+        transfer_changed = False
+        if bool(getattr(controller, "_active_download_is_multi", False)) and entry is not None:
+            transfer_changed = DownloadFlow._apply_transfer_status(entry, message=message)
+        elif not bool(getattr(controller, "_active_download_is_multi", False)):
+            transfer_changed = DownloadFlow._set_single_transfer_status(controller, message)
+        progress_changed = abs(clamped - previous) >= 0.005
+        if not progress_changed and not transfer_changed:
+            return
+        if progress_changed:
+            controller._download_progress_by_job[identifier] = clamped
         if entry is not None:
             entry.progress_percent = clamped
             if entry.status == BatchEntryStatus.DOWNLOAD_QUEUED.value:
                 entry.status = BatchEntryStatus.DOWNLOADING.value
             controller.window.update_batch_entry(entry)
-        DownloadFlow.mark_ui_refresh_dirty(controller, overall_progress=True)
+        if progress_changed or ((not bool(getattr(controller, "_active_download_is_multi", False))) and transfer_changed):
+            DownloadFlow.mark_ui_refresh_dirty(controller, overall_progress=True)
 
     @staticmethod
     def should_skip_download_status_update(
@@ -253,10 +300,14 @@ class DownloadFlow:
         entry.attempts = controller._download_attempts_by_job[identifier]
         if normalized == DownloadState.RETRYING.value:
             entry.status = BatchEntryStatus.DOWNLOAD_QUEUED.value
+            entry.transfer_eta = ""
+            entry.transfer_speed = ""
         elif normalized == DownloadState.DOWNLOADING.value:
             entry.status = BatchEntryStatus.DOWNLOADING.value
         elif normalized == DownloadState.PAUSED.value:
             entry.status = BatchEntryStatus.PAUSED.value
+            entry.transfer_eta = ""
+            entry.transfer_speed = ""
         controller.window.update_batch_entry(entry)
 
     @staticmethod
@@ -268,6 +319,8 @@ class DownloadFlow:
     ) -> None:
         if entry is None:
             return
+        entry.transfer_eta = ""
+        entry.transfer_speed = ""
         if normalized == DownloadState.ERROR.value:
             entry.status = BatchEntryStatus.FAILED.value
             if not entry.error:
@@ -368,10 +421,22 @@ class DownloadFlow:
         total = sum(max(0.0, min(100.0, float(value))) for value in controller._download_progress_by_job.values())
         overall_percent = total / len(controller._download_progress_by_job)
         overall_hundredths = int(round(overall_percent * 100))
-        if overall_hundredths == controller._last_download_progress_hundredths:
+        eta, speed = getattr(controller, "_single_download_transfer_status", ("", ""))
+        detail_parts = []
+        if eta:
+            detail_parts.append(f"ETA {eta}")
+        if speed:
+            detail_parts.append(speed)
+        detail = " | ".join(detail_parts)
+        last_detail = str(getattr(controller, "_last_single_download_progress_detail", "") or "")
+        if overall_hundredths == controller._last_download_progress_hundredths and detail == last_detail:
             return
         controller._last_download_progress_hundredths = overall_hundredths
-        controller.window.set_download_progress(overall_hundredths / 100.0)
+        setattr(controller, "_last_single_download_progress_detail", detail)
+        try:
+            controller.window.set_download_progress(overall_hundredths / 100.0, detail=detail)
+        except TypeError:
+            controller.window.set_download_progress(overall_hundredths / 100.0)
 
     @staticmethod
     def refresh_overall_download_progress(controller: DownloadFlowController) -> None:
