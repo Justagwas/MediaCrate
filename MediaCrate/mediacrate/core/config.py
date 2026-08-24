@@ -7,7 +7,7 @@ from pathlib import Path
 from .models import AppConfig, RetryProfile
 
 APP_NAME = "MediaCrate"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 INNO_SETUP_APP_ID = "MediaCrateJustagwas"
 PROJECT_BASE_URL = "https://www.justagwas.com/projects/mediacrate"
 OFFICIAL_PAGE_URL = PROJECT_BASE_URL
@@ -20,7 +20,8 @@ UPDATE_SOURCEFORGE_RSS_URL = "https://sourceforge.net/projects/mediacrate/rss?pa
 
 CONFIG_FILENAME = "MediaCrate_config.json"
 LEGACY_CONFIG_FILENAMES = ("MediaCrate_config_v2.json",)
-CONFIG_SCHEMA_VERSION = 10
+CONFIG_SCHEMA_VERSION = 11
+LEGACY_UNLIMITED_SPEED_SENTINEL_CUTOFF_SCHEMA = 10
 
 THEME_VALUES = {"dark", "light"}
 UI_SCALE_MIN = 75
@@ -76,7 +77,10 @@ def _coerce_bool(value: object, *, default: bool) -> bool:
 
 def _sanitize_speed_limit_kbps(value: object, *, schema_version: int, default: int) -> int:
     parsed = _coerce_int(value, default, SPEED_LIMIT_KBPS_MIN, SPEED_LIMIT_KBPS_MAX)
-    if schema_version < CONFIG_SCHEMA_VERSION and parsed == LEGACY_UNLIMITED_SPEED_SENTINEL_KBPS:
+    if (
+        schema_version < LEGACY_UNLIMITED_SPEED_SENTINEL_CUTOFF_SCHEMA
+        and parsed == LEGACY_UNLIMITED_SPEED_SENTINEL_KBPS
+    ):
         return 0
     return parsed
 
@@ -88,7 +92,7 @@ def _coerce_non_empty_text(value: object, *, default: str) -> str:
 
 def _default_background_worker_threads() -> int:
     cpu_count = os.cpu_count() or 4
-    return max(BACKGROUND_WORKER_THREADS_MIN, min(BACKGROUND_WORKER_THREADS_MAX, int(cpu_count)))
+    return max(BACKGROUND_WORKER_THREADS_MIN, min(4, BACKGROUND_WORKER_THREADS_MAX, int(cpu_count)))
 
 
 def default_config(paths_provider=None) -> AppConfig:

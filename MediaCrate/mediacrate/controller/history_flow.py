@@ -105,8 +105,8 @@ class HistoryFlow:
         path = HistoryFlow.resolve_history_target(controller, path_value, action_title="Open folder")
         if path is None:
             return
-        folder = path.parent if path.suffix else path
-        if not folder.exists():
+        folder = path if path.exists() and path.is_dir() else path.parent
+        if not folder.exists() or not folder.is_dir():
             controller._show_warning("Open folder", "The folder no longer exists.")
             return
         HistoryFlow.open_path_in_shell(controller, folder, failure_title="Open folder failed")

@@ -369,37 +369,38 @@ class SelfUpdater:
         if not isinstance(data, dict):
             raise RuntimeError("latest.json did not return a JSON object")
 
-        requested_channel = _normalize_channel(data.get("channel"), default=self._default_channel)
-        selected_channel = requested_channel
+        selected_channel = self._default_channel
         source = data
         channels_payload = data.get("channels")
-        if isinstance(channels_payload, dict):
+        uses_channel_manifest = isinstance(channels_payload, dict)
+        if uses_channel_manifest:
             normalized_channels: dict[str, object] = {}
             for key, value in channels_payload.items():
                 normalized_channels[_normalize_channel(key, default="stable")] = value
             channel_candidate = normalized_channels.get(selected_channel)
-            if not isinstance(channel_candidate, dict):
+            if not isinstance(channel_candidate, dict) and selected_channel != "stable":
                 selected_channel = "stable"
                 channel_candidate = normalized_channels.get("stable")
-            if isinstance(channel_candidate, dict):
-                source = channel_candidate
+            if not isinstance(channel_candidate, dict):
+                raise RuntimeError(f"latest.json did not contain the {selected_channel} update channel")
+            source = channel_candidate
+        else:
+            selected_channel = _normalize_channel(data.get("channel"), default=self._default_channel)
 
         def _pick_value(*keys: str) -> object:
             for key in keys:
                 if key in source and source.get(key) not in (None, ""):
                     return source.get(key)
-            for key in keys:
-                if key in data and data.get(key) not in (None, ""):
-                    return data.get(key)
+            if not uses_channel_manifest:
+                for key in keys:
+                    if key in data and data.get(key) not in (None, ""):
+                        return data.get(key)
             return ""
 
         version_candidate = (
             source.get("version")
             or source.get("latest")
             or source.get("app_version")
-            or data.get("version")
-            or data.get("latest")
-            or data.get("app_version")
             or ""
         )
         if not isinstance(version_candidate, str):

@@ -22,6 +22,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
 from .config import DEFAULT_FILENAME_TEMPLATE
+from .dependency_service import resolve_ffmpeg_binaries
 from .node_runtime import NODE_MIN_MAJOR_VERSION, is_supported_node_runtime
 from .models import (
     DownloadJob,
@@ -68,18 +69,11 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
 _TRACKING_QUERY_KEYS = {
-    "feature",
-    "si",
-    "spm",
-    "source",
     "fbclid",
     "gclid",
     "igshid",
-    "ref",
-    "ref_src",
-    "tracking_id",
-    "trk",
 }
+_YOUTUBE_TRACKING_QUERY_KEYS = {"feature", "si"}
 
 _RETRYABLE_ERROR_TOKENS = (
     "temporary",
@@ -130,6 +124,7 @@ _METADATA_WORKER_ENV = "MEDIACRATE_METADATA_WORKER"
 _METADATA_MODE_ENV = "MEDIACRATE_METADATA_MODE"
 _METADATA_WORKER_GRACE_SECONDS = 1.5
 _METADATA_STDERR_TAIL_BYTES = 16 * 1024
+_METADATA_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
 _SIZE_ESTIMATE_DEFAULT_KEY = "__DEFAULT__"
 _MC_QUALITY_TOKEN_RE = re.compile(r"%\((_?mc_quality)\)[^%a-zA-Z]*[a-zA-Z]", re.IGNORECASE)
 _QUALITY_BRACKET_TOKEN_RE = re.compile(r"\[quality\]", re.IGNORECASE)
@@ -319,6 +314,9 @@ def _best_video_size(
     for item in formats:
         vcodec = str(item.get("vcodec") or "").strip().lower()
         if not vcodec or vcodec == "none":
+            continue
+        acodec = str(item.get("acodec") or "").strip().lower()
+        if acodec != "none":
             continue
         size_value = item.get("_size_estimate")
         if not isinstance(size_value, int) or size_value <= 0:
@@ -624,10 +622,15 @@ def normalize_batch_url(url: str) -> str:
         if not path:
             path = "/"
 
+    host = str(parsed.hostname or "").strip().lower()
+    host_tracking_keys = set(_TRACKING_QUERY_KEYS)
+    if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+        host_tracking_keys.update(_YOUTUBE_TRACKING_QUERY_KEYS)
+
     retained_pairs: list[tuple[str, str]] = []
     for key, val in parse_qsl(parsed.query, keep_blank_values=True):
         lowered = key.strip().lower()
-        if lowered.startswith("utm_") or lowered in _TRACKING_QUERY_KEYS:
+        if lowered.startswith("utm_") or lowered in host_tracking_keys:
             continue
         retained_pairs.append((key, val))
     retained_pairs.sort(key=lambda pair: (pair[0].lower(), pair[1]))
@@ -774,7 +777,8 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
         post_args.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
         return "bestaudio", post_args
     if is_audio_format_choice(choice):
-        post_args.extend(["--extract-audio", "--audio-format", raw_choice.lower()])
+        audio_codec = "vorbis" if choice == "OGG" else raw_choice.lower()
+        post_args.extend(["--extract-audio", "--audio-format", audio_codec])
         return "bestaudio", post_args
 
     if height is None:
@@ -787,7 +791,7 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
             f"bestvideo[ext=mp4]{height_selector}+bestaudio[ext=m4a]/"
             f"best[ext=mp4]{height_selector}/best{height_selector}"
         )
-        post_args.extend(["--merge-output-format", "mp4"])
+        post_args.extend(["--recode-video", "mp4"])
         return selector, post_args
 
     if choice not in {
@@ -802,7 +806,7 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
                 f"bestvideo{height_selector}+bestaudio/"
                 f"best{height_selector}/best"
             )
-            post_args.extend(["--merge-output-format", ext])
+            post_args.extend(["--recode-video", ext])
             return selector, post_args
         selector = (
             f"bestvideo[ext={ext}]{height_selector}+bestaudio/"
@@ -817,37 +821,32 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
     return selector, post_args
 
 
-def _fixed_output_extension(format_choice: str) -> str | None:
-    raw_choice = str(format_choice or "").strip()
-    if not raw_choice:
-        return None
-    choice = raw_choice.upper()
-    if choice == FormatChoice.MP3.value:
-        return "mp3"
-    if choice == FormatChoice.MP4.value:
-        return "mp4"
-    if choice in CONVERSION_CONTAINER_CHOICES:
+def _final_output_extension(format_choice: str) -> str:
+    choice = str(format_choice or "").strip().upper()
+    if not choice or choice in {FormatChoice.VIDEO.value, FormatChoice.AUDIO.value}:
+        return ""
+    if choice == "OGG":
+        return "ogg"
+    if is_audio_format_choice(choice) or choice == FormatChoice.MP4.value or choice in CONVERSION_CONTAINER_CHOICES:
         return choice.lower()
-    if choice in {
-        FormatChoice.VIDEO.value,
-        FormatChoice.AUDIO.value,
-    }:
-        return None
-    candidate = re.sub(r"[^a-z0-9]+", "", raw_choice.lower())
-    return candidate or None
+    return ""
 
 
-def _with_forced_extension(output_template: str, extension: str | None) -> str:
+def _with_dynamic_extension(output_template: str) -> str:
     template = str(output_template or "").strip()
-    ext = str(extension or "").strip().lower()
-    if not template or not ext:
+    if not template or "%(ext)s" in template:
         return template
-    if "%(ext)s" in template:
-        return template.replace("%(ext)s", ext)
-    suffix = f".{ext}"
-    if template.lower().endswith(suffix):
-        return template
-    return f"{template}{suffix}"
+    # yt-dlp must see the source extension while downloading so post-processors
+    # can reliably replace it with the requested output extension.
+    known_extensions = {
+        "aac", "aif", "aiff", "alac", "amr", "avi", "flac", "flv",
+        "m4a", "mkv", "mov", "mp2", "mp3", "mp4", "oga", "ogg",
+        "opus", "wav", "webm", "wma",
+    }
+    suffix = Path(template).suffix
+    if suffix and suffix[1:].lower() in known_extensions:
+        return f"{template[:-len(suffix)]}.%(ext)s"
+    return f"{template}.%(ext)s"
 
 
 def _with_rename_number(output_template: str, number: int) -> str:
@@ -932,10 +931,7 @@ def _resolve_output_template(
         format_choice=job.format_choice,
         quality_choice=job.quality_choice,
     )
-    return _with_forced_extension(
-        str(output_dir / runtime_template),
-        _fixed_output_extension(job.format_choice),
-    )
+    return _with_dynamic_extension(str(output_dir / runtime_template))
 
 
 def normalize_conflict_policy(value: str) -> str:
@@ -1227,7 +1223,6 @@ def retry_limit_for_profile(*, retry_count: int, retry_profile: str) -> int:
 
 
 def retry_backoff_seconds(*, attempt_index: int, retry_profile: str) -> float:
-                                           
     attempt = max(1, int(attempt_index))
     normalized_profile = normalize_retry_profile(retry_profile)
     if normalized_profile == RetryProfile.OFF.value:
@@ -1401,11 +1396,12 @@ class DownloadService:
         env[_METADATA_WORKER_ENV] = "1"
         env.setdefault("PYTHONIOENCODING", "utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        stdout_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
         stderr_stream = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
         try:
             process = subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
+                stdout=stdout_stream,
                 stderr=stderr_stream,
                 text=True,
                 encoding="utf-8",
@@ -1414,6 +1410,10 @@ class DownloadService:
                 creationflags=creationflags,
             )
         except Exception as exc:
+            try:
+                stdout_stream.close()
+            except Exception:
+                pass
             try:
                 stderr_stream.close()
             except Exception:
@@ -1442,10 +1442,21 @@ class DownloadService:
                 time.sleep(min(0.1, remaining))
 
             try:
-                stdout, _stderr = process.communicate(timeout=1.0)
+                process.communicate(timeout=1.0)
             except Exception:
+                pass
+            try:
+                stdout_stream.seek(0, os.SEEK_END)
+                response_size = int(stdout_stream.tell())
+                stdout_stream.seek(0)
+                stdout = stdout_stream.read(_METADATA_RESPONSE_MAX_BYTES + 1)
+            except Exception:
+                response_size = 0
                 stdout = ""
             stderr = _read_metadata_stderr_tail(stderr_stream)
+
+            if response_size > _METADATA_RESPONSE_MAX_BYTES:
+                return False, None, "Metadata worker returned an oversized response."
 
             output = str(stdout or "").strip()
             if process.returncode != 0 and not output:
@@ -1464,6 +1475,10 @@ class DownloadService:
             return ok, result, error
         finally:
             self._unregister_metadata_process(process)
+            try:
+                stdout_stream.close()
+            except Exception:
+                pass
             try:
                 stderr_stream.close()
             except Exception:
@@ -1790,18 +1805,21 @@ class DownloadService:
             "-o",
             output_template,
             "--print",
+            "before_dl:filepath",
+            "--print",
             "after_move:filepath",
         ]
 
-        ffmpeg_path = resolve_binary("ffmpeg")
+        ffmpeg_path, ffprobe_path = resolve_ffmpeg_binaries()
         choice = str(job.format_choice or "").strip().upper()
         needs_conversion = (
-            (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
+            choice in {FormatChoice.VIDEO.value, FormatChoice.MP4.value}
+            or (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
             or choice in CONVERSION_CONTAINER_CHOICES
         )
-        if needs_conversion and not ffmpeg_path:
+        if needs_conversion and (not ffmpeg_path or not ffprobe_path):
             raise FileNotFoundError(
-                "ffmpeg is required for the selected format conversion. Install ffmpeg and retry."
+                "ffmpeg and ffprobe are required for the selected format conversion. Install ffmpeg and retry."
             )
         if save_metadata_to_file and not ffmpeg_path:
             raise FileNotFoundError(
@@ -1817,8 +1835,6 @@ class DownloadService:
             command.append("--force-overwrites")
 
         if skip_existing_files and normalized_conflict_policy != "rename":
-                                                                                    
-                                                                                      
             if "--force-overwrites" in command:
                 command = [item for item in command if item != "--force-overwrites"]
             if "--no-overwrites" not in command:
@@ -2085,6 +2101,7 @@ class DownloadService:
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
         output_template_for_part_tracking = ""
+        tracked_output_paths: set[str] = set()
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
         force_no_overwrite = normalized_conflict_policy == "rename"
         try:
@@ -2099,6 +2116,7 @@ class DownloadService:
             )
         except Exception as exc:
             return self._make_result(job, state=DownloadState.ERROR.value, error=str(exc))
+        tracked_output_paths.add(output_template_for_part_tracking)
         record_partial_candidates(output_template_for_part_tracking)
 
         output_path = ""
@@ -2127,8 +2145,20 @@ class DownloadService:
             if stream is None:
                 return self._make_result(job, state=DownloadState.ERROR.value, error="No output stream")
 
+            line_queue: queue.Queue[object] = queue.Queue()
+            stream_finished = object()
+
+            def read_output() -> None:
+                try:
+                    for output_line in iter(stream.readline, ""):
+                        line_queue.put(output_line)
+                finally:
+                    line_queue.put(stream_finished)
+
+            reader = threading.Thread(target=read_output, name="MediaCrate-yt-dlp-output", daemon=True)
+            reader.start()
             progress_estimator = _TransferRateEstimator()
-            for line in iter(stream.readline, ""):
+            while True:
                 interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
                 if interrupt_state == DownloadState.CANCELLED.value:
                     self._kill_process_tree(process)
@@ -2137,6 +2167,16 @@ class DownloadService:
                     self._kill_process_tree(process)
                     return self._make_result(job, state=DownloadState.PAUSED.value, output_path=output_path)
 
+                try:
+                    queued_line = line_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if process.poll() is not None and not reader.is_alive():
+                        break
+                    continue
+                if queued_line is stream_finished:
+                    break
+                line = str(queued_line or "")
+
                 last_error, output_path, saw_already_downloaded, clean = self._consume_download_line(
                     line,
                     log_cb=log_cb,
@@ -2144,6 +2184,8 @@ class DownloadService:
                     output_path=output_path,
                     saw_already_downloaded=saw_already_downloaded,
                 )
+                if output_path:
+                    tracked_output_paths.add(output_path)
                 if (not post_processing_notified) and _is_post_processing_line(clean):
                     post_processing_notified = True
                     if progress_cb:
@@ -2173,8 +2215,9 @@ class DownloadService:
             )
         finally:
             self._unregister_process(process, job.job_id)
-            if output_template_for_part_tracking and process.poll() == 0:
-                discard_partial_candidates(output_template_for_part_tracking)
+            if process.poll() == 0:
+                for tracked_path in tracked_output_paths:
+                    discard_partial_candidates(tracked_path)
             try:
                 if process.stdout:
                     process.stdout.close()
@@ -2266,6 +2309,7 @@ class DownloadService:
         output_path = ""
         last_error = ""
         saw_already_downloaded = False
+        tracked_output_paths = {output_template}
 
         def capture_output_candidate(payload: object) -> None:
             nonlocal output_path
@@ -2275,6 +2319,7 @@ class DownloadService:
                 value = str(payload.get(key) or "").strip()
                 if value:
                     output_path = value
+                    tracked_output_paths.add(output_path)
                     record_partial_candidates(output_path)
                     break
 
@@ -2340,18 +2385,22 @@ class DownloadService:
             "progress_hooks": [progress_hook],
             "logger": logger,
         }
+        final_ext = _final_output_extension(job.format_choice)
+        if final_ext:
+            ydl_opts["final_ext"] = final_ext
 
-        ffmpeg_path = resolve_binary("ffmpeg")
+        ffmpeg_path, ffprobe_path = resolve_ffmpeg_binaries()
         choice = str(job.format_choice or "").strip().upper()
         needs_conversion = (
-            (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
+            choice in {FormatChoice.VIDEO.value, FormatChoice.MP4.value}
+            or (is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value)
             or choice in CONVERSION_CONTAINER_CHOICES
         )
-        if needs_conversion and not ffmpeg_path:
+        if needs_conversion and (not ffmpeg_path or not ffprobe_path):
             return self._make_result(
                 job,
                 state=DownloadState.ERROR.value,
-                error="ffmpeg is required for the selected format conversion. Install ffmpeg and retry.",
+                error="ffmpeg and ffprobe are required for the selected format conversion. Install ffmpeg and retry.",
             )
         if save_metadata_to_file and not ffmpeg_path:
             return self._make_result(
@@ -2375,23 +2424,22 @@ class DownloadService:
             ydl_opts["ratelimit"] = rate_limit * 1024
 
         postprocessors: list[dict[str, Any]] = []
-        if choice == FormatChoice.MP3.value:
-            postprocessors.append(
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "0",
-                }
-            )
+        if is_audio_format_choice(choice) and choice != FormatChoice.AUDIO.value:
+            audio_processor: dict[str, Any] = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "vorbis" if choice == "OGG" else choice.lower(),
+            }
+            if choice == FormatChoice.MP3.value:
+                audio_processor["preferredquality"] = "0"
+            postprocessors.append(audio_processor)
+        if choice == FormatChoice.MP4.value:
+            postprocessors.append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
+        elif choice in CONVERSION_CONTAINER_CHOICES:
+            postprocessors.append({"key": "FFmpegVideoConvertor", "preferedformat": choice.lower()})
         if save_metadata_to_file:
             postprocessors.append({"key": "FFmpegMetadata"})
         if postprocessors:
             ydl_opts["postprocessors"] = postprocessors
-
-        if choice == FormatChoice.MP4.value:
-            ydl_opts["merge_output_format"] = "mp4"
-        elif choice in CONVERSION_CONTAINER_CHOICES:
-            ydl_opts["merge_output_format"] = choice.lower()
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -2428,7 +2476,8 @@ class DownloadService:
             last_error=fallback_error,
         )
         if result.state in {DownloadState.DONE.value, DownloadState.SKIPPED.value}:
-            discard_partial_candidates(output_template)
+            for tracked_path in tracked_output_paths:
+                discard_partial_candidates(tracked_path)
         return result
 
     def _run_single_inprocess(

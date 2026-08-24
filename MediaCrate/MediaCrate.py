@@ -41,6 +41,7 @@ class SingleInstanceGuard:
     def __init__(self, mutex_name: str) -> None:
         self._mutex_name = str(mutex_name or "").strip() or "MediaCrateMutex"
         self._handle = None
+        self.error_message = ""
 
     def acquire(self) -> bool:
         if os.name != "nt":
@@ -51,6 +52,7 @@ class SingleInstanceGuard:
             kernel32.CreateMutexW.restype = ctypes.c_void_p
             handle = kernel32.CreateMutexW(None, 0, self._mutex_name)
             if not handle:
+                self.error_message = "Windows could not create the single-instance lock."
                 return False
             error_already_exists = 183
             if kernel32.GetLastError() == error_already_exists:
@@ -58,8 +60,9 @@ class SingleInstanceGuard:
                 return False
             self._handle = handle
             return True
-        except Exception:
-            return True
+        except Exception as exc:
+            self.error_message = f"Unable to establish the single-instance lock: {exc}"
+            return False
 
     def release(self) -> None:
         if os.name != "nt":
@@ -147,11 +150,11 @@ def main() -> int:
     instance_guard = SingleInstanceGuard(MUTEX_NAME)
     if not instance_guard.acquire():
         splash.close()
-        QMessageBox.information(
-            None,
-            APP_NAME,
-            f"{APP_NAME} is already running.",
-        )
+        message = instance_guard.error_message or f"{APP_NAME} is already running."
+        if instance_guard.error_message:
+            QMessageBox.critical(None, APP_NAME, message)
+            return 1
+        QMessageBox.information(None, APP_NAME, message)
         return 0
 
     try:

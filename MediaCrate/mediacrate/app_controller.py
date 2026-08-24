@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import uuid
 import webbrowser
-import glob
 from collections import deque
 from datetime import datetime, timezone
 import os
@@ -26,7 +25,7 @@ from .core.config import (
     save_config,
 )
 from .core.batch_utils import build_download_signature
-from .core.dependency_service import DependencyService, dependency_status
+from .core.dependency_service import DependencyService, resolve_ffmpeg_binaries
 from .controller import persistence as state_persistence
 from .controller.batch_logic import (
     build_start_all_skip_log_message,
@@ -81,16 +80,14 @@ from .core.models import (
     DEFAULT_QUALITY_CHOICES,
     is_audio_format_choice,
 )
-from .core.paths import (
-    resolve_binary,
-    resolve_app_asset,
-)
+from .core.paths import resolve_app_asset
 from .core.update_service import UpdateService
 from .core.url_input import first_non_empty_line, iter_non_empty_lines
 from .ui.dialogs import exec_dialog
 from .ui.main_window import MainWindow
 from .ui.theme import get_theme
 from .workers.dependency_worker import DependencyWorker
+from .workers.dependency_status_worker import DependencyStatusWorker
 from .workers.batch_analyze_worker import BatchAnalyzeWorker
 from .workers.download_worker import DownloadWorker
 from .workers.probe_worker import ProbeWorker
@@ -120,25 +117,8 @@ THUMBNAIL_CACHE_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000
 SINGLE_SELECTION_SIZE_FAILURE_RETRY_SECONDS = 60.0
 SINGLE_SELECTION_SIZE_CACHE_MAX_URLS = 256
 _METADATA_FALLBACK_MESSAGE = "Metadata unavailable; using fallback download mode."
-_AUDIO_OUTPUT_EXTENSIONS = {
-    ".aac",
-    ".aif",
-    ".aiff",
-    ".alac",
-    ".amr",
-    ".flac",
-    ".m4a",
-    ".mp2",
-    ".mp3",
-    ".oga",
-    ".ogg",
-    ".opus",
-    ".wav",
-    ".wma",
-}
 _DEFAULT_FORMAT_CHOICES = DEFAULT_FORMAT_CHOICES
 _DEFAULT_QUALITY_CHOICES = DEFAULT_QUALITY_CHOICES
-STALE_CLEANUP_FULL_SCAN_INTERVAL_SECONDS = 15 * 60
 TutorialStep = dict[str, str | bool]
 
 
@@ -171,6 +151,8 @@ class AppController(QObject):
         self._download_worker: DownloadWorker | None = None
         self._dependency_threads: dict[str, QThread] = {}
         self._dependency_workers: dict[str, DependencyWorker] = {}
+        self._dependency_status_thread: QThread | None = None
+        self._dependency_status_worker: DependencyStatusWorker | None = None
         self._probe_thread: QThread | None = None
         self._probe_worker: ProbeWorker | None = None
         self._last_probe_url = ""
@@ -255,7 +237,6 @@ class AppController(QObject):
         self._stale_cleanup_thread: QThread | None = None
         self._stale_cleanup_worker: StaleCleanupWorker | None = None
         self._stale_cleanup_pending_reason = ""
-        self._last_stale_part_full_scan_at = 0.0
         self._startup_staged_initialized = False
         self._startup_stage_index = -1
         self._startup_stage_sequence: list[tuple[str, int, object]] = []
@@ -310,7 +291,7 @@ class AppController(QObject):
         self.window.show()
         self._schedule_startup_initialization()
 
-    def _run_startup_guarded(self, label: str, callback) -> None:                
+    def _run_startup_guarded(self, label: str, callback) -> None:
         try:
             callback()
         except Exception as exc:
@@ -695,17 +676,6 @@ class AppController(QObject):
                     candidates.add(path.with_suffix(f"{path.suffix}.part"))
                 except ValueError:
                     pass
-                stem_pattern = f"{glob.escape(path.stem)}*.part"
-            else:
-                stem_pattern = f"{glob.escape(path.name)}*.part"
-            parent = path.parent
-            try:
-                if parent.exists() and parent.is_dir():
-                    for match in parent.glob(stem_pattern):
-                        if match.is_file():
-                            candidates.add(match)
-            except OSError:
-                pass
         return candidates
 
     @classmethod
@@ -738,11 +708,13 @@ class AppController(QObject):
 
     @classmethod
     def _delete_part_files(cls, paths: set[Path], *, root: Path | None = None) -> int:
+        if root is None:
+            return 0
         deleted = 0
         for path in paths:
             try:
                 target = path.expanduser().resolve()
-                if root is not None and not cls._path_is_under_root(target, root):
+                if not cls._path_is_under_root(target, root):
                     continue
                 if target.exists() and target.is_file():
                     target.unlink(missing_ok=True)
@@ -767,15 +739,6 @@ class AppController(QObject):
     def _is_stale_cleanup_running(self) -> bool:
         return bool(self._stale_cleanup_thread and self._stale_cleanup_thread.isRunning())
 
-    def _should_scan_stale_part_root(self, *, reason: str) -> bool:
-        normalized_reason = str(reason or "").strip().lower()
-        if normalized_reason in {"startup", "settings", "reset-settings", "manual"}:
-            return True
-        now = monotonic()
-        return (self._last_stale_part_full_scan_at <= 0.0) or (
-            now - self._last_stale_part_full_scan_at >= STALE_CLEANUP_FULL_SCAN_INTERVAL_SECONDS
-        )
-
     def _request_stale_part_cleanup(self, *, reason: str) -> None:
         if self._is_download_running():
             return
@@ -785,16 +748,12 @@ class AppController(QObject):
             self._stale_cleanup_pending_reason = str(reason or "").strip() or "queued"
             return
         cleanup_reason = str(reason or "").strip() or "manual"
-        scan_download_root = self._should_scan_stale_part_root(reason=cleanup_reason)
-        if scan_download_root:
-            self._last_stale_part_full_scan_at = monotonic()
         thread = QThread(self)
         worker = StaleCleanupWorker(
             download_location=str(self.config.download_location or ""),
             max_age_hours=self._stale_cleanup_hours(),
             reason=cleanup_reason,
             tracked_part_paths=list_tracked_partial_paths(),
-            scan_download_root=scan_download_root,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1017,6 +976,8 @@ class AppController(QObject):
             self._single_analysis_worker.stop()
         if self._stale_cleanup_worker:
             self._stale_cleanup_worker.stop()
+        if self._dependency_status_worker:
+            self._dependency_status_worker.stop()
         self._stop_metadata_slow_warning_watch_if_idle()
 
     def _force_stop_owned_subprocesses(self) -> None:
@@ -1046,6 +1007,8 @@ class AppController(QObject):
             candidates.extend(self._thumbnail_flow.running_threads())
         if self._stale_cleanup_thread is not None:
             candidates.append(self._stale_cleanup_thread)
+        if self._dependency_status_thread is not None:
+            candidates.append(self._dependency_status_thread)
         candidates.extend(list(self._dependency_threads.values()))
         candidates.extend(list(self._batch_analysis_threads.values()))
         running: list[QThread] = []
@@ -1128,7 +1091,7 @@ class AppController(QObject):
             return True
 
     @staticmethod
-    def _force_stop_thread(thread: QThread | None, *, quit_timeout_ms: int = 250, terminate_timeout_ms: int = 750) -> bool:
+    def _force_stop_thread(thread: QThread | None, *, quit_timeout_ms: int = 250) -> bool:
         if thread is None:
             return True
         try:
@@ -1149,14 +1112,10 @@ class AppController(QObject):
                 return True
         except RuntimeError:
             return True
-        try:
-            thread.terminate()
-        except RuntimeError:
-            return False
-        try:
-            return bool(thread.wait(max(0, int(terminate_timeout_ms))))
-        except RuntimeError:
-            return True
+        # QThread.terminate() can interrupt Python while it holds locks or is
+        # updating application state. Workers use cancellation tokens and
+        # bounded subprocesses, so keep waiting for cooperative shutdown.
+        return False
 
     def _force_stop_running_worker_threads(self) -> bool:
         self._force_stop_owned_subprocesses()
@@ -1435,7 +1394,7 @@ class AppController(QObject):
         try:
             parsed = int(value)
         except (TypeError, ValueError):
-            parsed = os.cpu_count() or 4
+            parsed = 4
         return max(BACKGROUND_WORKER_THREADS_MIN, min(BACKGROUND_WORKER_THREADS_MAX, parsed))
 
     def _apply_background_worker_threads(self, value: object, *, save: bool) -> None:
@@ -1540,13 +1499,6 @@ class AppController(QObject):
         self.config.filename_template = template or DEFAULT_FILENAME_TEMPLATE
         self._save_config()
 
-    @staticmethod
-    def _template_uses_quality_marker(template: str) -> bool:
-        value = str(template or "").strip().lower()
-        if not value:
-            return False
-        return ("[quality]" in value) or ("%(mc_quality" in value) or ("%(_mc_quality" in value)
-
     def _on_conflict_policy_changed(self, value: str) -> None:
         policy = str(value or "skip").strip().lower()
         if policy not in {"skip", "rename", "overwrite"}:
@@ -1602,6 +1554,7 @@ class AppController(QObject):
         self._pending_saved_quality_choice = None
         self.window.set_theme(get_theme(self.config.theme_mode), self.config.theme_mode)
         self.window.set_config(self.config)
+        self._apply_background_worker_threads(self.config.background_worker_threads, save=False)
         self._apply_metadata_fetch_policy()
         self._apply_history_policy(show_feedback=False)
         self._request_stale_part_cleanup(reason="reset-settings")
@@ -1981,10 +1934,9 @@ class AppController(QObject):
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_single_selection_size_finished, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(thread.deleteLater)
-        thread.start()
-
         self._single_selection_size_thread = thread
         self._single_selection_size_worker = worker
+        thread.start()
 
     def _request_single_selection_size_refresh(self) -> None:
         if self._is_metadata_fetch_disabled():
@@ -2666,7 +2618,11 @@ class AppController(QObject):
         existing_by_normalized = self._existing_batch_entries_by_normalized()
         parsed_url_cache: dict[str, tuple[bool, str]] = {}
         added = 0
+        limit_reached = False
         for raw_url in urls:
+            if len(self._batch_entry_order) >= QUEUE_SNAPSHOT_MAX_ENTRIES:
+                limit_reached = True
+                break
             url_raw = str(raw_url or "").strip()
             if not url_raw:
                 continue
@@ -2694,6 +2650,15 @@ class AppController(QObject):
         if added:
             self._refresh_batch_entries_view()
             self._mark_batch_queue_dirty()
+        if limit_reached:
+            self.window.append_log(
+                f"Queue limit reached: MediaCrate keeps at most {QUEUE_SNAPSHOT_MAX_ENTRIES} URLs at once."
+            )
+            self._show_info(
+                "Queue limit reached",
+                f"Only the first {QUEUE_SNAPSHOT_MAX_ENTRIES} queue items were kept. "
+                "Finish or remove some items before adding more.",
+            )
 
     def _waiting_duplicate_entries_for_normalized(
         self,
@@ -3233,10 +3198,19 @@ class AppController(QObject):
         return bool(needs_ffmpeg_processing or save_metadata_to_file)
 
     def _jobs_require_ffmpeg(self, jobs: list[DownloadJob], *, payload: dict[str, object]) -> bool:
-        if resolve_binary("ffmpeg"):
-            return False
         save_metadata_to_file = bool(payload.get("save_metadata_to_file", self.config.save_metadata_to_file))
-        return any(self._job_requires_ffmpeg(job, save_metadata_to_file=save_metadata_to_file) for job in jobs)
+        requires_runtime = any(
+            self._job_requires_ffmpeg(job, save_metadata_to_file=save_metadata_to_file)
+            for job in jobs
+        )
+        if not requires_runtime:
+            return False
+        status_known = getattr(self.window, "dependency_status_known", None)
+        is_installed = getattr(self.window, "dependency_is_installed", None)
+        if callable(status_known) and callable(is_installed) and status_known("ffmpeg"):
+            return not bool(is_installed("ffmpeg"))
+        ffmpeg_path, ffprobe_path = resolve_ffmpeg_binaries()
+        return not bool(ffmpeg_path and ffprobe_path)
 
     def _confirm_install_ffmpeg_for_download(self, jobs: list[DownloadJob], *, payload: dict[str, object]) -> bool:
         if not self._jobs_require_ffmpeg(jobs, payload=payload):
@@ -3475,10 +3449,9 @@ class AppController(QObject):
         )
         self._connect_download_worker(thread=thread, worker=worker)
         self.window.append_log("Downloading...")
-        thread.start()
-
         self._download_thread = thread
         self._download_worker = worker
+        thread.start()
 
     def _open_official_page(self) -> None:
         webbrowser.open(OFFICIAL_PAGE_URL)
@@ -3922,46 +3895,6 @@ class AppController(QObject):
         ]
         return jobs, payload
 
-    @staticmethod
-    def _path_matches_requested_format(path: Path, format_choice: str) -> bool:
-        normalized_format = str(format_choice or "VIDEO").strip().upper() or "VIDEO"
-        suffix = str(path.suffix or "").strip().lower()
-        if normalized_format == "VIDEO":
-            return bool(suffix) and suffix not in _AUDIO_OUTPUT_EXTENSIONS
-        if normalized_format == "AUDIO":
-            return suffix in _AUDIO_OUTPUT_EXTENSIONS
-        if is_audio_format_choice(normalized_format):
-            return suffix == f".{normalized_format.lower()}"
-        return suffix == f".{normalized_format.lower()}"
-
-    def _find_existing_single_download_path(self, *, url: str, format_choice: str) -> Path | None:
-        if self._is_history_disabled():
-            return None
-        normalized_url = normalize_batch_url(str(url or "").strip())
-        if not normalized_url:
-            return None
-        for entry in self._download_history:
-            if normalize_download_state(str(entry.state or "")) not in {
-                DownloadState.DONE.value,
-                DownloadState.SKIPPED.value,
-            }:
-                continue
-            if normalize_batch_url(str(entry.url or "").strip()) != normalized_url:
-                continue
-            raw_output = str(entry.output_path or "").strip()
-            if not raw_output:
-                continue
-            try:
-                output_path = Path(raw_output).expanduser()
-            except Exception:
-                continue
-            if (not output_path.exists()) or (not output_path.is_file()):
-                continue
-            if not self._path_matches_requested_format(output_path, format_choice):
-                continue
-            return output_path
-        return None
-
     def _is_download_running(self) -> bool:
         return bool(self._download_thread and self._download_thread.isRunning())
 
@@ -4002,32 +3935,6 @@ class AppController(QObject):
             return
         if not self._confirm_install_ffmpeg_for_download(jobs, payload=payload):
             return
-        skip_existing_files = bool(payload.get("skip_existing_files", self.config.skip_existing_files))
-        conflict_policy = str(payload.get("conflict_policy", self.config.conflict_policy)).strip().lower()
-        filename_template = str(payload.get("filename_template", self.config.filename_template))
-        if (
-            skip_existing_files
-            and conflict_policy != "overwrite"
-            and (not self._template_uses_quality_marker(filename_template))
-        ):
-            existing_path = self._find_existing_single_download_path(
-                url=str(jobs[0].url or ""),
-                format_choice=format_choice,
-            )
-            if existing_path is not None:
-                self.window.clear_log()
-                self.window.append_log("Starting download...")
-                self.window.append_log(f"Already downloaded. File exists: {existing_path}")
-                self.window.set_download_progress(100.0)
-                self._record_download_history(
-                    DownloadState.SKIPPED.value,
-                    url=str(jobs[0].url or ""),
-                    job_id=str(jobs[0].job_id or ""),
-                    output_path=str(existing_path),
-                    details="File already exists.",
-                )
-                return
-
         self.window.clear_log()
         self.window.append_log("Starting download...")
         self._start_download_worker(jobs, payload=payload, job_to_entry={})
@@ -4231,10 +4138,9 @@ class AppController(QObject):
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_probe_finished, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(thread.deleteLater)
-        thread.start()
-
         self._probe_thread = thread
         self._probe_worker = worker
+        thread.start()
 
     def _on_probe_summary(self, result: FormatProbeResult) -> None:
         self._on_probe_result(
@@ -4285,9 +4191,51 @@ class AppController(QObject):
         self._probe_pending_show_errors = False
 
     def _refresh_dependency_status(self) -> None:
-        status = dependency_status()
-        self.window.set_dependency_state("ffmpeg", status["ffmpeg"].installed, status["ffmpeg"].path)
-        self.window.set_dependency_state("node", status["node"].installed, status["node"].path)
+        # Keep the worker owned until its queued thread-finished callback has
+        # cleared it. Replacing a just-finished thread here could let the older
+        # callback erase the references to the newer, still-running check.
+        if self._dependency_status_thread is not None:
+            return
+        self.window.set_dependency_status_checking("ffmpeg", True)
+        self.window.set_dependency_status_checking("node", True)
+        thread = QThread(self)
+        worker = DependencyStatusWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finishedSummary.connect(self._on_dependency_status_summary, Qt.ConnectionType.QueuedConnection)
+        worker.errorRaised.connect(self._on_dependency_status_error, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_dependency_status_finished, Qt.ConnectionType.QueuedConnection)
+        thread.finished.connect(thread.deleteLater)
+        self._dependency_status_thread = thread
+        self._dependency_status_worker = worker
+        thread.start()
+
+    def _on_dependency_status_summary(self, status: object) -> None:
+        if not isinstance(status, dict):
+            return
+        ffmpeg = status.get("ffmpeg")
+        node = status.get("node")
+        if ffmpeg is not None:
+            self.window.set_dependency_state("ffmpeg", bool(ffmpeg.installed), str(ffmpeg.path or ""))
+        if node is not None:
+            self.window.set_dependency_state("node", bool(node.installed), str(node.path or ""))
+
+    def _on_dependency_status_error(self, _name: str, error: str) -> None:
+        detail = str(error or "").strip()
+        if detail:
+            self.window.append_log(f"Dependency status check failed: {detail}")
+        # The check could not confirm either runtime. Present installation as a
+        # recovery option instead of leaving the settings controls disabled.
+        self.window.set_dependency_state("ffmpeg", False, "")
+        self.window.set_dependency_state("node", False, "")
+
+    def _on_dependency_status_finished(self) -> None:
+        self.window.set_dependency_status_checking("ffmpeg", False)
+        self.window.set_dependency_status_checking("node", False)
+        self._dependency_status_thread = None
+        self._dependency_status_worker = None
 
     def _is_dependency_install_running(self, dependency_name: str) -> bool:
         existing = self._dependency_threads.get(dependency_name)
@@ -4310,11 +4258,13 @@ class AppController(QObject):
         worker.statusChanged.connect(self._on_dependency_status, Qt.ConnectionType.QueuedConnection)
         worker.logChanged.connect(self._on_dependency_worker_log, Qt.ConnectionType.QueuedConnection)
         worker.errorRaised.connect(self._on_dependency_error, Qt.ConnectionType.QueuedConnection)
+        worker.finishedSummary.connect(self._on_dependency_install_summary, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(self._on_dependency_worker_finished, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_dependency_thread_finished, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(thread.deleteLater)
+        self._dependency_threads[dependency_name] = thread
+        self._dependency_workers[dependency_name] = worker
         thread.start()
         return thread, worker
 
@@ -4322,17 +4272,16 @@ class AppController(QObject):
         normalized = str(name or "").strip().lower()
         if normalized not in {"ffmpeg", "node"}:
             return
-        status = dependency_status().get(normalized)
-        if status and status.installed:
+        if self._is_dependency_install_running(normalized):
+            return
+        if not self.window.dependency_status_known(normalized):
             self._refresh_dependency_status()
             return
-        if self._is_dependency_install_running(normalized):
+        if self.window.dependency_is_installed(normalized):
             return
 
         self._set_dependency_install_start_state(normalized)
-        thread, worker = self._start_dependency_install_worker(normalized)
-        self._dependency_threads[normalized] = thread
-        self._dependency_workers[normalized] = worker
+        self._start_dependency_install_worker(normalized)
 
     def _on_dependency_status(self, dependency_name: str, state: str) -> None:
         normalized_state = str(state or "").strip().lower()
@@ -4363,23 +4312,30 @@ class AppController(QObject):
             dependency_name = str(sender.property("dependency_name") or "").strip().lower()
         self._on_dependency_log(dependency_name, message)
 
+    def _on_dependency_install_summary(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        dependency_name = str(payload.get("name") or "").strip().lower()
+        if dependency_name not in {"ffmpeg", "node"}:
+            return
+        installed = bool(payload.get("installed"))
+        if installed:
+            path = str(payload.get("path") or "").strip()
+            self.window.set_dependency_state(dependency_name, True, path)
+            return
+        # Installation is transactional, so a failure may have restored a
+        # previously valid runtime. Re-detect it rather than trusting a generic
+        # failure payload that cannot describe the rollback result.
+        self._refresh_dependency_status()
+
     def _on_dependency_finished(self, dependency_name: str) -> None:
         normalized = str(dependency_name or "").strip().lower()
         if not normalized:
             return
-        self._refresh_dependency_status()
         self.window.set_dependency_install_busy(normalized, False)
         self._dependency_progress_bucket.pop(normalized, None)
         self._dependency_threads.pop(normalized, None)
         self._dependency_workers.pop(normalized, None)
-
-    def _on_dependency_worker_finished(self) -> None:
-        sender = self.sender()
-        dependency_name = ""
-        if isinstance(sender, QObject):
-            dependency_name = str(sender.property("dependency_name") or "").strip().lower()
-        if dependency_name:
-            self._on_dependency_finished(dependency_name)
 
     def _on_dependency_thread_finished(self) -> None:
         sender = self.sender()

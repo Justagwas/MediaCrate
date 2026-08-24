@@ -201,7 +201,7 @@ class BatchEntryRowWidget(QFrame):
             pixmap = pixmap.scaled(
                 safe_width,
                 safe_height,
-                Qt.KeepAspectRatioByExpanding,
+                Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
         self._thumbnail_original = pixmap
@@ -610,4 +610,3 @@ class BatchEntryRowWidget(QFrame):
             self._update_compact_layout()
             return
         self._schedule_deferred_elide_refresh()
-

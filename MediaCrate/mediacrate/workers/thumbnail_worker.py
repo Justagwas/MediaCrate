@@ -13,32 +13,48 @@ THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024
 THUMBNAIL_MAX_REDIRECTS = 3
 
 
-def _is_public_address(host: str) -> bool:
+def _is_public_ip_address(value: object) -> bool:
+    raw = str(value or "").strip().split("%", 1)[0]
+    if not raw:
+        return False
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    return bool(
+        parsed.is_global
+        and not parsed.is_loopback
+        and not parsed.is_link_local
+        and not parsed.is_multicast
+        and not parsed.is_reserved
+        and not parsed.is_unspecified
+    )
+
+
+def _public_addresses(host: str) -> frozenset[str]:
     value = str(host or "").strip()
     if not value:
-        return False
+        return frozenset()
     try:
         addresses = socket.getaddrinfo(value, None, type=socket.SOCK_STREAM)
     except OSError:
-        return False
+        return frozenset()
+    public_addresses: set[str] = set()
     if not addresses:
-        return False
+        return frozenset()
     for item in addresses:
         try:
             raw_address = item[4][0]
-            parsed = ipaddress.ip_address(raw_address)
-        except (IndexError, TypeError, ValueError):
-            return False
-        if (
-            parsed.is_loopback
-            or parsed.is_private
-            or parsed.is_link_local
-            or parsed.is_multicast
-            or parsed.is_reserved
-            or parsed.is_unspecified
-        ):
-            return False
-    return True
+        except (IndexError, TypeError):
+            return frozenset()
+        if not _is_public_ip_address(raw_address):
+            return frozenset()
+        public_addresses.add(str(ipaddress.ip_address(str(raw_address).split("%", 1)[0])))
+    return frozenset(public_addresses)
+
+
+def _is_public_address(host: str) -> bool:
+    return bool(_public_addresses(host))
 
 
 def _thumbnail_url_is_safe(url: str) -> bool:
@@ -50,6 +66,51 @@ def _thumbnail_url_is_safe(url: str) -> bool:
         return False
     host = str(parsed.hostname or "").strip()
     return _is_public_address(host)
+
+
+def _response_peer_address(response: requests.Response) -> str:
+    raw = getattr(response, "raw", None)
+    if raw is None:
+        return ""
+    candidate_paths = (
+        ("_connection", "sock"),
+        ("_connection", "_sock"),
+        ("connection", "sock"),
+        ("_fp", "fp", "raw", "_sock"),
+        ("_original_response", "fp", "raw", "_sock"),
+    )
+    for path in candidate_paths:
+        candidate = raw
+        for attribute in path:
+            candidate = getattr(candidate, attribute, None)
+            if candidate is None:
+                break
+        if candidate is None:
+            continue
+        try:
+            peer = candidate.getpeername()
+        except (AttributeError, OSError):
+            continue
+        if isinstance(peer, tuple) and peer:
+            return str(peer[0] or "").strip()
+    return ""
+
+
+def _response_uses_proxy(response: requests.Response) -> bool:
+    raw = getattr(response, "raw", None)
+    connection = getattr(raw, "_connection", None) or getattr(raw, "connection", None)
+    if connection is None:
+        return False
+    return bool(
+        getattr(connection, "proxy", None)
+        or getattr(connection, "_has_connected_to_proxy", False)
+    )
+
+
+def _response_peer_is_public(response: requests.Response) -> bool:
+    # With an HTTPS proxy the socket peer is the configured proxy, while TLS
+    # still authenticates the requested origin through the CONNECT tunnel.
+    return _response_uses_proxy(response) or _is_public_ip_address(_response_peer_address(response))
 
 
 def _redirect_target(response: requests.Response, current_url: str) -> str:
@@ -75,7 +136,18 @@ class ThumbnailWorker(BaseWorker):
     def _open_response(self) -> requests.Response | None:
         current_url = self._url
         for _attempt in range(THUMBNAIL_MAX_REDIRECTS + 1):
-            if self._stop_event.is_set() or (not current_url) or (not _thumbnail_url_is_safe(current_url)):
+            try:
+                requested_url = urlparse(current_url)
+                requested_host = str(requested_url.hostname or "").strip()
+            except Exception:
+                return None
+            addresses_before = _public_addresses(requested_host)
+            if (
+                self._stop_event.is_set()
+                or (not current_url)
+                or requested_url.scheme.lower() != "https"
+                or (not addresses_before)
+            ):
                 return None
             response = requests.get(
                 current_url,
@@ -83,12 +155,13 @@ class ThumbnailWorker(BaseWorker):
                 timeout=THUMBNAIL_TIMEOUT_SECONDS,
                 allow_redirects=False,
             )
+            if not _response_peer_is_public(response):
+                response.close()
+                return None
             if not (300 <= int(response.status_code) < 400):
-                if not _thumbnail_url_is_safe(str(response.url or current_url)):
-                    response.close()
-                    return None
-                final_host = str(urlparse(str(response.url or current_url)).hostname or "").strip()
-                if not _is_public_address(final_host):
+                final_url = urlparse(str(response.url or current_url))
+                final_host = str(final_url.hostname or "").strip()
+                if final_url.scheme.lower() != "https" or final_host.lower() != requested_host.lower():
                     response.close()
                     return None
                 return response

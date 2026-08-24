@@ -163,18 +163,6 @@ def _format_stale_cleanup_label(
     return f"{clamped} {suffix}"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 class MainWindow(QMainWindow):
     startDownloadRequested = Signal()
     stopRequested = Signal()
@@ -286,6 +274,8 @@ class MainWindow(QMainWindow):
         self._settings_card_layouts: list[QVBoxLayout] = []
         self._settings_card_headers: dict[str, QLabel] = {}
         self._dependency_installed: dict[str, bool] = {"ffmpeg": False, "node": False}
+        self._dependency_status_known: dict[str, bool] = {"ffmpeg": False, "node": False}
+        self._dependency_install_busy: dict[str, bool] = {"ffmpeg": False, "node": False}
         self._history_entries: list[DownloadHistoryEntry] = []
         self._filename_template_updating = False
         self._post_show_layout_synced = False
@@ -1738,6 +1728,7 @@ class MainWindow(QMainWindow):
         self.ffmpeg_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.ffmpeg_install_button = QPushButton('Install FFmpeg', dependency_card)
         self.ffmpeg_install_button.setObjectName("settingsActionButton")
+        self.ffmpeg_install_button.setEnabled(False)
         dependency_layout.addWidget(self.ffmpeg_status_label)
         dependency_layout.addWidget(self.ffmpeg_install_button)
 
@@ -1747,6 +1738,7 @@ class MainWindow(QMainWindow):
         self.node_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.node_install_button = QPushButton('Install Node.js', dependency_card)
         self.node_install_button.setObjectName("settingsActionButton")
+        self.node_install_button.setEnabled(False)
         dependency_layout.addWidget(self.node_status_label)
         dependency_layout.addWidget(self.node_install_button)
 
@@ -2284,7 +2276,19 @@ class MainWindow(QMainWindow):
         if not selected:
             return
         file_path = Path(selected)
-        content = ""
+        try:
+            file_size = file_path.stat().st_size
+        except OSError as exc:
+            self._show_info_dialog('Import failed', f'Could not inspect file:\n{exc}')
+            return
+        max_import_bytes = 2 * 1024 * 1024
+        if file_size > max_import_bytes:
+            self._show_info_dialog(
+                'Import failed',
+                'The URL list is larger than 2 MB. Split it into smaller files before importing.',
+            )
+            return
+        content: str | None = None
         for encoding in ("utf-8", "utf-8-sig", "cp1252"):
             try:
                 content = file_path.read_text(encoding=encoding)
@@ -2297,6 +2301,12 @@ class MainWindow(QMainWindow):
                     'Could not read file:\n{error}'.format(error=str(exc)),
                 )
                 return
+        if content is None:
+            self._show_info_dialog(
+                'Import failed',
+                'The selected file is not valid UTF-8 or Windows text.',
+            )
+            return
         content = content.strip()
         if not content:
             self._show_info_dialog(
@@ -2555,7 +2565,7 @@ class MainWindow(QMainWindow):
         if self._is_cursor_refresh_event(event_type) and self._is_interactive_control(watched):
             self._set_widget_cursor(watched)
 
-    def _handle_wheel_event(self, watched: object, event) -> bool:                
+    def _handle_wheel_event(self, watched: object, event) -> bool:
         if event.type() != QEvent.Wheel:
             return False
         if self._is_multi_entries_descendant(watched) and bool(event.modifiers() & Qt.ShiftModifier):
@@ -2588,7 +2598,7 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def eventFilter(self, watched, event):                
+    def eventFilter(self, watched, event):
         try:
             self._handle_cursor_refresh_event(watched, event.type())
             if self._tutorial_mode and not self._is_tutorial_descendant(watched):
@@ -2755,7 +2765,7 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-    def showEvent(self, event) -> None:                
+    def showEvent(self, event) -> None:
         super().showEvent(event)
         if not self._post_show_layout_synced:
             self._post_show_layout_synced = True
@@ -3462,10 +3472,6 @@ class MainWindow(QMainWindow):
                 BatchEntryStatus.CANCELLED.value,
         }
         return True
-
-    def _entry_matches_filter(self, entry: BatchEntry) -> bool:
-        query, mode = self._batch_filter_state()
-        return self._entry_matches_filter_state(entry, query=query, mode=mode)
 
     def _is_default_batch_filter(self) -> bool:
         if self.multi_search_input.text().strip():
@@ -4284,7 +4290,6 @@ class MainWindow(QMainWindow):
         self._paste_text_color_anim.stop()
         start = QColor(self.theme.accent)
         end = QColor(self.theme.text_primary)
-                                                                   
         self.single_url_input.setStyleSheet(f"QLineEdit#singleUrlInput {{ color: {start.name()}; }}")
         self._paste_text_color_anim.setStartValue(start)
         self._paste_text_color_anim.setKeyValueAt(0.14, start)
@@ -5145,44 +5150,74 @@ class MainWindow(QMainWindow):
         tooltip = str(path or "").strip() if installed else ""
         lowered = name.lower()
         self._dependency_installed[lowered] = bool(installed)
+        self._dependency_status_known[lowered] = True
+        busy = self._dependency_install_busy.get(lowered, False)
         if lowered == "ffmpeg":
             self.ffmpeg_status_label.setText(text)
             self.ffmpeg_status_label.setToolTip(tooltip)
             self.ffmpeg_install_button.setText(
-                'Already installed' if installed else 'Install FFmpeg'
+                'Installing...' if busy else 'Already installed' if installed else 'Install FFmpeg'
             )
-            self.ffmpeg_install_button.setEnabled(not installed)
+            self.ffmpeg_install_button.setEnabled((not busy) and (not installed))
         elif lowered == "node":
             self.node_status_label.setText(text)
             self.node_status_label.setToolTip(tooltip)
             self.node_install_button.setText(
-                'Already installed' if installed else 'Install Node.js'
+                'Installing...' if busy else 'Already installed' if installed else 'Install Node.js'
             )
-            self.node_install_button.setEnabled(not installed)
+            self.node_install_button.setEnabled((not busy) and (not installed))
+        self._set_interaction_cursors()
+
+    def dependency_status_known(self, name: str) -> bool:
+        return bool(self._dependency_status_known.get(str(name or "").strip().lower(), False))
+
+    def dependency_is_installed(self, name: str) -> bool:
+        lowered = str(name or "").strip().lower()
+        return self.dependency_status_known(lowered) and bool(self._dependency_installed.get(lowered, False))
+
+    def set_dependency_status_checking(self, name: str, checking: bool) -> None:
+        lowered = str(name or "").strip().lower()
+        if lowered not in {"ffmpeg", "node"}:
+            return
+        if checking:
+            self._dependency_status_known[lowered] = False
+        busy = self._dependency_install_busy.get(lowered, False)
+        installed = self._dependency_installed.get(lowered, False)
+        if lowered == "ffmpeg":
+            if checking:
+                self.ffmpeg_status_label.setText("FFmpeg: checking...")
+            self.ffmpeg_install_button.setEnabled((not checking) and (not busy) and (not installed))
+        else:
+            if checking:
+                self.node_status_label.setText("Node.js: checking...")
+            self.node_install_button.setEnabled((not checking) and (not busy) and (not installed))
         self._set_interaction_cursors()
 
     def set_dependency_install_busy(self, name: str, busy: bool) -> None:
         lowered = name.lower()
+        self._dependency_install_busy[lowered] = bool(busy)
         if lowered == "ffmpeg":
             if busy:
                 self.ffmpeg_install_button.setText('Installing...')
                 self.ffmpeg_install_button.setEnabled(False)
             else:
                 installed = self._dependency_installed.get("ffmpeg", False)
+                status_known = self._dependency_status_known.get("ffmpeg", False)
                 self.ffmpeg_install_button.setText(
                     'Already installed' if installed else 'Install FFmpeg'
                 )
-                self.ffmpeg_install_button.setEnabled(not installed)
+                self.ffmpeg_install_button.setEnabled(status_known and (not installed))
         elif lowered == "node":
             if busy:
                 self.node_install_button.setText('Installing...')
                 self.node_install_button.setEnabled(False)
             else:
                 installed = self._dependency_installed.get("node", False)
+                status_known = self._dependency_status_known.get("node", False)
                 self.node_install_button.setText(
                     'Already installed' if installed else 'Install Node.js'
                 )
-                self.node_install_button.setEnabled(not installed)
+                self.node_install_button.setEnabled(status_known and (not installed))
         self._set_interaction_cursors()
 
     def set_update_button_busy(self, busy: bool) -> None:

@@ -15,14 +15,12 @@ class StaleCleanupWorker(BaseWorker):
         max_age_hours: int,
         reason: str,
         tracked_part_paths: list[str] | None = None,
-        scan_download_root: bool = True,
     ) -> None:
         super().__init__()
         self._download_location = str(download_location or "").strip()
         self._max_age_hours = max(0, int(max_age_hours))
         self._reason = str(reason or "").strip() or "manual"
         self._tracked_part_paths = [str(item or "").strip() for item in (tracked_part_paths or []) if str(item or "").strip()]
-        self._scan_download_root = bool(scan_download_root)
 
     def run(self) -> None:
         deleted_paths: list[str] = []
@@ -81,15 +79,7 @@ class StaleCleanupWorker(BaseWorker):
                 tracked_paths.add(str(Path(path_value).expanduser().resolve()))
             except OSError:
                 continue
-        candidate_paths = set(tracked_paths)
-        if self._scan_download_root:
-            try:
-                for part_path in root.rglob("*.part"):
-                    candidate_paths.add(str(part_path.expanduser().resolve()))
-            except OSError:
-                pass
-
-        for path_value in sorted(candidate_paths):
+        for path_value in sorted(tracked_paths):
             if self.is_cancelled():
                 break
             try:

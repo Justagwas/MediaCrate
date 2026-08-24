@@ -52,7 +52,7 @@ class DependencyPackage:
     max_extract_bytes: int
 
 
-def _ensure_not_cancelled(cancel_token, dependency_name: str) -> None:                
+def _ensure_not_cancelled(cancel_token, dependency_name: str) -> None:
     if cancel_token.is_set():
         raise DependencyInstallCancelled(f"{dependency_name} installation cancelled")
 
@@ -220,11 +220,30 @@ def _is_supported_node_binary(path: str) -> bool:
     return is_supported_node_runtime(path, minimum_major=NODE_MIN_MAJOR_VERSION)
 
 
-def dependency_status() -> dict[str, DependencyStatus]:
+def resolve_ffmpeg_binaries() -> tuple[str | None, str | None]:
     ffmpeg = resolve_binary("ffmpeg")
+    if not ffmpeg:
+        return None, None
+    ffmpeg_path = Path(ffmpeg).expanduser()
+    ffprobe_name = "ffprobe.exe" if ffmpeg_path.suffix.lower() == ".exe" else "ffprobe"
+    ffprobe_path = ffmpeg_path.parent / ffprobe_name
+    if not ffprobe_path.is_file():
+        return str(ffmpeg_path), None
+    try:
+        return str(ffmpeg_path.resolve()), str(ffprobe_path.resolve())
+    except OSError:
+        return str(ffmpeg_path), str(ffprobe_path)
+
+
+def dependency_status() -> dict[str, DependencyStatus]:
+    ffmpeg, ffprobe = resolve_ffmpeg_binaries()
     node = resolve_binary("node")
     return {
-        "ffmpeg": DependencyStatus(name="ffmpeg", installed=bool(ffmpeg), path=ffmpeg or ""),
+        "ffmpeg": DependencyStatus(
+            name="ffmpeg",
+            installed=bool(ffmpeg and ffprobe),
+            path=ffmpeg or "",
+        ),
         "node": DependencyStatus(
             name="node",
             installed=bool(node and _is_supported_node_binary(node)),
@@ -356,6 +375,7 @@ class DependencyService:
         _verify_supported_package_runtime(package)
 
         target_dir = runtime_storage_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
         if progress_cb:
             progress_cb(0, f"Preparing {name} installer")
         if log_cb:

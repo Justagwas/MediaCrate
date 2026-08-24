@@ -21,7 +21,7 @@ def rounded_pixmap(source: QPixmap, target_size: QSize, radius: int) -> QPixmap:
     safe_size = QSize(max(1, int(target_size.width())), max(1, int(target_size.height())))
     scaled = source.scaled(
         safe_size,
-        Qt.KeepAspectRatioByExpanding,
+        Qt.KeepAspectRatio,
         Qt.SmoothTransformation,
     )
     rounded = QPixmap(safe_size)
@@ -38,6 +38,8 @@ def rounded_pixmap(source: QPixmap, target_size: QSize, radius: int) -> QPixmap:
         float(max(0, int(radius))),
     )
     painter.setClipPath(path)
-    painter.drawPixmap(0, 0, scaled)
+    offset_x = (safe_size.width() - scaled.width()) // 2
+    offset_y = (safe_size.height() - scaled.height()) // 2
+    painter.drawPixmap(offset_x, offset_y, scaled)
     painter.end()
     return rounded
