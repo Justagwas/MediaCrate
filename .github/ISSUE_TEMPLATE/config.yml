@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: MediaCrate documentation
+    url: https://github.com/Justagwas/MediaCrate/wiki
+    about: Read the usage, format, dependency, and troubleshooting documentation.
+  - name: Private security report
+    url: mailto:email@justagwas.com
+    about: Report suspected vulnerabilities privately instead of opening a public issue.

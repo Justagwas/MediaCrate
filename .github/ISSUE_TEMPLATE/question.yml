@@ -1,0 +1,27 @@
+name: Question
+description: Ask about using or configuring MediaCrate.
+title: "[Question]: "
+labels:
+  - question
+assignees:
+  - Justagwas
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: What would you like clarified?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Include the MediaCrate version, Windows version, relevant settings, and what you have already tried.
+    validations:
+      required: false

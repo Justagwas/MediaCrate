@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible problem with downloading, conversion, queues, history, or the interface.
+title: "[Bug]: "
+labels:
+  - bug
+assignees:
+  - Justagwas
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Do not post account credentials, cookies, tokens, private links, or copyrighted media.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the result you received and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open MediaCrate...
+        2. Choose...
+        3. Start...
+        4. Observe...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MediaCrate version
+      placeholder: v2.x.x
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation
+      options:
+        - Official installer
+        - Portable or packaged build
+        - Running from source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: download
+    attributes:
+      label: Download context
+      description: Describe the site or source type, selected format and quality, and whether this was a single or queued download. Do not include a private URL.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or screenshots
+      description: Include only the relevant portion after removing private information.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and read the troubleshooting documentation.
+          required: true
+        - label: I removed credentials, private links, personal information, and copyrighted media.
+          required: true

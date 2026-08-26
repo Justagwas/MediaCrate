@@ -6,7 +6,7 @@ These terms apply to use of MediaCrate binaries/releases distributed through thi
 
 ## 1. License scope
 
-Use, redistribution, and modification rights for source code are governed by this repository's `LICENSE` file.
+Use, copying, redistribution, and modification rights for MediaCrate and its distributed copies are governed by this repository's `LICENSE` file.
 
 ## 2. No warranty
 
@@ -22,4 +22,4 @@ You are responsible for complying with all applicable laws and platform terms wh
 
 ## 5. Support
 
-Support is provided on a best-effort basis. See `.github/SUPPORT.md`.
+Support is provided on a best-effort basis. See the shared [Support Policy](https://github.com/Justagwas/.github/blob/main/SUPPORT.md).

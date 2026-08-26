@@ -1,0 +1,36 @@
+name: Feature proposal
+description: Suggest an improvement to MediaCrate's download or queue workflow.
+title: "[Feature]: "
+labels:
+  - enhancement
+assignees:
+  - Justagwas
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult or currently unavailable?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed experience
+      description: Describe what the user should be able to do and how it should fit the current application.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds or simpler approaches when applicable.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples or interface references without including private or copyrighted material.
+    validations:
+      required: false
