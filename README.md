@@ -13,7 +13,7 @@
     width="128"
     height="128"
     alt="MediaCrate Logo"
-    src="https://github.com/user-attachments/assets/6293a8af-3d7e-4856-a939-ca063cd6185c"
+    src="https://github.com/user-attachments/assets/182d07d1-1a41-4fec-bcb5-da7660179ba2"
   />
 </p>
 
@@ -44,13 +44,14 @@ MediaCrate is a Windows application for saving video or audio from supported web
 
 Helpful previews show the title, thumbnail, available formats, quality choices, and estimated size when the website provides them. Each download keeps its own progress and controls, so it is always clear what is happening and where the finished file will go.
 
-MediaCrate's performance:
-- ~0% CPU usage while idle
-- ~1% CPU usage during active use
-- ~60 MB memory usage
-- Download speed depends on the internet connection and the website providing the media.
+MediaCrate's performance:  
+~0% CPU usage while idle  
+~1% CPU usage during active use  
+~60 MB memory usage      
+  
+Download speed depends on the internet connection and the website providing the media.  
 
-- [View the current supported site list](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md).
+[View the current supported site list](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md).
 
 ## Basic usage
 
