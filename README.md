@@ -13,7 +13,7 @@
     width="128"
     height="128"
     alt="MediaCrate Logo"
-    src="https://github.com/user-attachments/assets/182d07d1-1a41-4fec-bcb5-da7660179ba2"
+    src="MediaCrate/icon.ico"
   />
 </p>
 

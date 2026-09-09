@@ -1702,7 +1702,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(updates_card)
 
     def _build_updates_controls(self, updates_card: QFrame, updates_layout: QVBoxLayout) -> None:
-        self.auto_updates_checkbox = QCheckBox('Automatic update', updates_card)
+        self.auto_updates_checkbox = QCheckBox('Automatic updates', updates_card)
         updates_layout.addWidget(self.auto_updates_checkbox)
         self.check_updates_button = QPushButton('Check for updates now', updates_card)
         self.check_updates_button.setObjectName("settingsActionButton")
@@ -2140,7 +2140,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "adaptive_concurrency_checkbox"):
             self.adaptive_concurrency_checkbox.setText('Balanced batch scheduling')
         if hasattr(self, "auto_updates_checkbox"):
-            self.auto_updates_checkbox.setText('Automatic update')
+            self.auto_updates_checkbox.setText('Automatic updates')
         if hasattr(self, "check_updates_button"):
             self.check_updates_button.setText('Check for updates now')
         if hasattr(self, "reset_settings_button"):

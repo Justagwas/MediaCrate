@@ -23,6 +23,7 @@ from ..core.config import DEFAULT_DOWNLOAD_URL
 from ..core.models import UpdateCheckResult
 from ..core.update_service import UpdateService
 from ..ui.dialogs import apply_dialog_theme
+from ..ui.widgets.controls import SquareCheckBoxStyle
 from ..workers.update_install_worker import UpdateInstallWorker
 from ..workers.update_worker import UpdateWorker
 
@@ -49,6 +50,25 @@ def _apply_update_dialog_chrome(dialog: QDialog, parent: QWidget | None) -> None
     for view in dialog.findChildren(QAbstractItemView):
         view.setCursor(Qt.PointingHandCursor if view.isEnabled() else Qt.ArrowCursor)
     dialog.setCursor(Qt.ArrowCursor)
+
+
+def _apply_update_checkbox_styles(dialog: QDialog, parent: QWidget | None) -> None:
+    theme = getattr(parent, "theme", None) if parent is not None else None
+    if theme is None:
+        return
+    styles: list[SquareCheckBoxStyle] = []
+    for checkbox in dialog.findChildren(QCheckBox):
+        style = SquareCheckBoxStyle(
+            border_color=theme.border,
+            fill_color=theme.accent,
+            check_color=theme.text_primary,
+            size=20,
+            radius=4,
+            parent=checkbox,
+        )
+        checkbox.setStyle(style)
+        styles.append(style)
+    dialog._update_checkbox_styles = styles
 
 
 def _exec_modal(dialog: QDialog, parent: QWidget | None) -> int:
@@ -345,6 +365,8 @@ class UpdateFlowCoordinator(QObject):
         later_button.clicked.connect(dialog.reject)
         continue_button.clicked.connect(dialog.accept)
 
+        _apply_update_checkbox_styles(dialog, parent)
+        _apply_update_dialog_chrome(dialog, parent)
         accepted = _exec_modal(dialog, parent) == QDialog.Accepted
         auto_install = bool(auto_install_checkbox.isEnabled() and auto_install_checkbox.isChecked())
         return accepted, auto_install
@@ -410,6 +432,8 @@ class UpdateFlowCoordinator(QObject):
         abort_button.clicked.connect(dialog.reject)
         continue_button.clicked.connect(dialog.accept)
 
+        _apply_update_checkbox_styles(dialog, parent)
+        _apply_update_dialog_chrome(dialog, parent)
         accepted = _exec_modal(dialog, parent) == QDialog.Accepted
         restart_after = bool(restart_checkbox.isChecked())
         return accepted, restart_after
@@ -451,6 +475,15 @@ class UpdateFlowCoordinator(QObject):
             dialog = _UpdateInstallProgressDialog(parent)
             dialog.set_progress(0, "Preparing update...")
             dialog.canceled.connect(self._on_install_cancel_requested)
+            _apply_update_dialog_chrome(dialog, parent)
+            theme = getattr(parent, "theme", None) if parent is not None else None
+            if theme is not None:
+                dialog._progress.setStyleSheet(
+                    "QProgressBar { "
+                    f"border: 1px solid {theme.border}; border-radius: 6px; "
+                    "text-align: center; } "
+                    f"QProgressBar::chunk {{ background-color: {theme.accent}; border-radius: 5px; }}"
+                )
             self._install_progress_dialog = dialog
         dialog.set_cancel_enabled(True)
         dialog.show()
