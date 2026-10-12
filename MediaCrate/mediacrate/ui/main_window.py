@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..controller.thumbnail_cache import ThumbnailCache
+
 import math
 import os
 import re
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -53,6 +56,9 @@ from PySide6.QtWidgets import (
     QScrollBar,
     QSlider,
     QSizePolicy,
+    QStyle,
+    QStyleOptionButton,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
@@ -80,6 +86,7 @@ from ..core.models import (
 )
 from .batch_entry_presenter import batch_entry_render_signature
 from .dialogs import apply_dialog_theme, build_message_box, exec_dialog
+from .footer_icons import build_footer_icon
 from .layout_metrics import (
     normalize_scale_factor as _normalize_scale_factor,
     single_url_baseline_metrics as _single_url_baseline_metrics,
@@ -104,6 +111,16 @@ _RETRY_PROFILE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Aggressive", RetryProfile.AGGRESSIVE.value),
 )
 _STALE_PART_CLEANUP_HOURS_OPTIONS: tuple[int, ...] = (0, 6, 12, 24, 48, 72, 168, 336, 720)
+
+
+class _FooterButton(QPushButton):
+    def paintEvent(self, event) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        if not self.property("keyboardFocus"):
+            option.state &= ~QStyle.State_HasFocus
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.CE_PushButton, option)
 
 
 def _build_speed_limit_steps_kbps() -> list[int]:
@@ -169,6 +186,7 @@ class MainWindow(QMainWindow):
     singlePauseResumeRequested = Signal()
     openDownloadsRequested = Signal()
     officialPageRequested = Signal()
+    donatePageRequested = Signal()
     checkUpdatesRequested = Signal()
     themeModeChanged = Signal(str)
     uiScaleChanged = Signal(int)
@@ -205,6 +223,7 @@ class MainWindow(QMainWindow):
     multiStartEntryRequested = Signal(str)
     multiPauseEntryRequested = Signal(str)
     multiResumeEntryRequested = Signal(str)
+    batchThumbnailNeeded = Signal(str)
     multiEntryFormatChanged = Signal(str, str)
     multiEntryQualityChanged = Signal(str, str)
     multiRemoveEntryRequested = Signal(str)
@@ -248,7 +267,8 @@ class MainWindow(QMainWindow):
         self._render_scale = 1.0
         self._batch_entry_widgets: dict[str, BatchEntryRowWidget] = {}
         self._batch_entry_thumbnail_urls: dict[str, str] = {}
-        self._batch_thumbnail_payload_by_url: dict[str, bytes] = {}
+        self._thumbnail_cache = ThumbnailCache(max_entries=350, max_bytes=24 * 1024 * 1024)
+        self._batch_thumbnail_requested_urls: dict[str, str] = {}
         self._batch_row_render_signatures: dict[str, tuple[object, ...]] = {}
         self._displayed_batch_entry_ids: list[str] = []
         self._displayed_batch_entry_id_set: set[str] = set()
@@ -291,10 +311,12 @@ class MainWindow(QMainWindow):
         self._batch_chunk_timer.timeout.connect(self._on_batch_chunk_timer)
         self._batch_chunk_generation = 0
         self._batch_chunk_in_progress = False
+        self._batch_chunk_focus: QWidget | None = None
         self._batch_chunk_entries: list[BatchEntry] = []
         self._batch_chunk_ordered_ids: list[str] = []
         self._batch_chunk_cursor = 0
-        self._batch_chunk_size = 48
+        self._batch_chunk_size = 12
+        self._batch_chunk_index_by_id: dict[str, int] = {}
         self._batch_chunk_threshold = 320
         self._batch_refresh_after_chunk = False
         self._batch_filter_refresh_timer = QTimer(self)
@@ -892,6 +914,7 @@ class MainWindow(QMainWindow):
         icon_px = self._scaled(18, scale, 16)
         self.theme_toggle_button.setIconSize(QSize(icon_px, icon_px))
         self.pin_toggle_button.setIconSize(QSize(icon_px, icon_px))
+        self._refresh_footer_action_icons(icon_px)
         self.batch_preflight_label.setFixedHeight(self._scaled(18, scale, 12))
         self._batch_inline_target_height = self._compute_batch_inline_target_height()
 
@@ -947,6 +970,8 @@ class MainWindow(QMainWindow):
             self._set_batch_inline_section_height(desired_batch_height)
 
             width, height = self._compute_dimensions(self._render_scale)
+            self._input_layout.activate()
+            height = max(height, self.minimumSizeHint().height())
             if geometry is not None:
                 width = min(width, max(1, int(geometry.width() * 0.92)))
                 height = min(height, max(1, int(geometry.height() * 0.92)))
@@ -1040,6 +1065,7 @@ class MainWindow(QMainWindow):
         self._main_input_card = input_card
         input_card.setObjectName("card")
         input_layout = QVBoxLayout(input_card)
+        input_layout.setVerticalSizeConstraint(QLayout.SetMinimumSize)
         input_layout.setContentsMargins(10, 8, 10, 8)
         input_layout.setSpacing(6)
         self._input_layout = input_layout
@@ -1052,6 +1078,10 @@ class MainWindow(QMainWindow):
         self._main_layout.addWidget(input_card)
 
     def _rebuild_input_layout_for_mode(self, *, batch_mode_enabled: bool) -> None:
+        self._main_input_card.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred if batch_mode_enabled else QSizePolicy.Fixed,
+        )
+        self._input_layout.setAlignment(Qt.Alignment() if batch_mode_enabled else Qt.AlignTop)
         ordered_widgets = (
             self.batch_inline_section,
             self._single_url_row,
@@ -1698,6 +1728,16 @@ class MainWindow(QMainWindow):
             settings_content,
         )
         self.settings_updates_card = updates_card
+        header = self._settings_card_headers['Updates']
+        updates_layout.removeWidget(header)
+        header_row = QHBoxLayout()
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        self.version_label = QLabel(f"v{APP_VERSION}", updates_card)
+        self.version_label.setObjectName("settingsCardTitle")
+        self.version_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header_row.addWidget(self.version_label)
+        updates_layout.insertLayout(0, header_row)
         self._build_updates_controls(updates_card, updates_layout)
         settings_layout.addWidget(updates_card)
 
@@ -1799,36 +1839,54 @@ class MainWindow(QMainWindow):
 
     def _build_footer_section(self, root: QWidget, outer: QVBoxLayout) -> None:
         footer = QFrame(root)
+        footer.setObjectName("appFooter")
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(2, 0, 2, 1)
         footer_layout.setSpacing(8)
         self._footer_layout = footer_layout
 
-        self.theme_toggle_button = QPushButton("", footer)
+        self.theme_toggle_button = _FooterButton("", footer)
         self.theme_toggle_button.setObjectName("footerIcon")
         self.theme_toggle_button.setFlat(True)
         self.theme_toggle_button.setIconSize(QSize(18, 18))
-        self.pin_toggle_button = QPushButton("", footer)
+        self.pin_toggle_button = _FooterButton("", footer)
         self.pin_toggle_button.setObjectName("footerIcon")
         self.pin_toggle_button.setFlat(True)
         self.pin_toggle_button.setCheckable(True)
         self.pin_toggle_button.setChecked(False)
         self.pin_toggle_button.setIconSize(QSize(18, 18))
         self._set_widget_cursor(self.pin_toggle_button)
-        self.settings_toggle_button = QPushButton('Show settings', footer)
-        self.settings_toggle_button.setObjectName("footerLink")
+        self.settings_toggle_button = _FooterButton('', footer)
+        self.settings_toggle_button.setObjectName("footerIcon")
         self.settings_toggle_button.setFlat(True)
-        self.tutorial_button = QPushButton('Tutorial', footer)
+        self.settings_toggle_button.setCheckable(True)
+        self.tutorial_button = _FooterButton('Tutorial', footer)
         self.tutorial_button.setObjectName("footerLink")
         self.tutorial_button.setFlat(True)
-        self.downloads_button = QPushButton('Open downloads folder', footer)
-        self.downloads_button.setObjectName("footerLink")
+        self.downloads_button = _FooterButton('', footer)
+        self.downloads_button.setObjectName("footerIcon")
         self.downloads_button.setFlat(True)
-        self.official_button = QPushButton('Official website', footer)
-        self.official_button.setObjectName("footerLink")
+        self.official_button = _FooterButton('', footer)
+        self.official_button.setObjectName("footerIcon")
         self.official_button.setFlat(True)
-        self.version_label = QLabel(f"v{APP_VERSION}", footer)
-        self.version_label.setObjectName("footerVersion")
+        self.donate_button = _FooterButton('Donate', footer)
+        self.donate_button.setObjectName("footerDonate")
+        self.donate_button.setFlat(True)
+        for button, name, description in (
+            (self.theme_toggle_button, "Color theme", "Switch between light and dark mode"),
+            (self.pin_toggle_button, "Keep window on top", "Pin or unpin this window"),
+            (self.settings_toggle_button, "Settings", "Show or hide settings"),
+            (self.downloads_button, "Open downloads folder", "Open your downloads folder"),
+            (self.official_button, "Official website", "Open the MediaCrate website in your browser"),
+            (self.tutorial_button, "Tutorial", "Start the guided tutorial"),
+            (self.donate_button, "Donate", "Support Justagwas with an optional donation in your browser"),
+        ):
+            button.setAccessibleName(name)
+            button.setAccessibleDescription(description)
+            button.setToolTip(description)
+            button.setFocusPolicy(Qt.StrongFocus)
+            button.setProperty("keyboardFocus", False)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
         footer_layout.addWidget(self.theme_toggle_button, 0, Qt.AlignLeft)
         footer_layout.addWidget(self.pin_toggle_button, 0, Qt.AlignLeft)
@@ -1837,7 +1895,7 @@ class MainWindow(QMainWindow):
         footer_layout.addWidget(self.downloads_button, 0, Qt.AlignRight)
         footer_layout.addWidget(self.official_button, 0, Qt.AlignRight)
         footer_layout.addWidget(self.tutorial_button, 0, Qt.AlignRight)
-        footer_layout.addWidget(self.version_label, 0, Qt.AlignRight)
+        footer_layout.addWidget(self.donate_button, 0, Qt.AlignRight)
         outer.addWidget(footer)
 
     def _build_tutorial_overlay(self, parent: QWidget) -> None:
@@ -1875,6 +1933,7 @@ class MainWindow(QMainWindow):
         return card, layout
 
     def _connect_signals(self) -> None:
+        QApplication.instance().focusChanged.connect(self._on_batch_chunk_focus_changed)
         self._connect_primary_action_signals()
         self._connect_settings_signals()
         self._connect_batch_signals()
@@ -1886,6 +1945,7 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stopRequested.emit)
         self.downloads_button.clicked.connect(self.openDownloadsRequested.emit)
         self.official_button.clicked.connect(self.officialPageRequested.emit)
+        self.donate_button.clicked.connect(self.donatePageRequested.emit)
         self.settings_toggle_button.clicked.connect(self._on_toggle_settings)
         self.tutorial_button.clicked.connect(self.tutorialRequested.emit)
         self.theme_toggle_button.clicked.connect(self._on_toggle_theme)
@@ -2039,11 +2099,9 @@ class MainWindow(QMainWindow):
         self.stale_part_cleanup_combo.blockSignals(False)
 
     def _update_settings_toggle_text(self) -> None:
-        self.settings_toggle_button.setText(
-            'Hide settings'
-            if self._settings_visible
-            else 'Show settings'
-        )
+        self.settings_toggle_button.setText('')
+        self.settings_toggle_button.setChecked(self._settings_visible)
+        self.settings_toggle_button.setToolTip('Hide settings' if self._settings_visible else 'Show settings')
 
     def _retranslate_ui_texts(self) -> None:
         if hasattr(self, "subtitle_label"):
@@ -2174,9 +2232,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "tutorial_button"):
             self.tutorial_button.setText('Tutorial')
         if hasattr(self, "downloads_button"):
-            self.downloads_button.setText('Open downloads folder')
+            self.downloads_button.setText('')
         if hasattr(self, "official_button"):
-            self.official_button.setText('Official website')
+            self.official_button.setText('')
         if hasattr(self, "settings_toggle_button"):
             self._update_settings_toggle_text()
         if hasattr(self, "_tutorial_overlay"):
@@ -2362,8 +2420,9 @@ class MainWindow(QMainWindow):
         self.urlTextChanged.emit(self.single_url_input.text())
 
     def _install_control_styles(self) -> None:
-        self._slider_styles.clear()
-        self._checkbox_styles.clear()
+        previous_styles = self._slider_styles + self._checkbox_styles
+        self._slider_styles = []
+        self._checkbox_styles = []
 
         slider_style = RoundHandleSliderStyle(
             handle_color=self.theme.text_primary,
@@ -2432,6 +2491,10 @@ class MainWindow(QMainWindow):
             )
             checkbox.setStyle(style)
             self._checkbox_styles.append(style)
+        for style in previous_styles:
+            from shiboken6 import isValid
+            if isValid(style):
+                style.deleteLater()
 
     def _apply_combo_arrow_palette(self) -> None:
         hover = QColor(self.theme.border)
@@ -2601,6 +2664,17 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched, event):
         try:
             self._handle_cursor_refresh_event(watched, event.type())
+            if isinstance(watched, QPushButton) and watched.objectName() in {
+                "footerIcon", "footerLink", "footerDonate",
+            } and event.type() in {QEvent.FocusIn, QEvent.FocusOut, QEvent.MouseButtonPress}:
+                keyboard_focus = event.type() == QEvent.FocusIn and event.reason() in {
+                    Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.ShortcutFocusReason,
+                }
+                if watched.property("keyboardFocus") != keyboard_focus:
+                    watched.setProperty("keyboardFocus", keyboard_focus)
+                    watched.style().unpolish(watched)
+                    watched.style().polish(watched)
+                    watched.update()
             if self._tutorial_mode and not self._is_tutorial_descendant(watched):
                 if event.type() in {
                     QEvent.MouseButtonPress,
@@ -2735,6 +2809,18 @@ class MainWindow(QMainWindow):
             self.theme_toggle_button.setIcon(self._build_theme_icon("sun"))
             self.theme_toggle_button.setToolTip('Switch to dark mode')
 
+    def _refresh_footer_action_icons(self, size: int) -> None:
+        accent = self.theme.accent_hover if self._theme_mode == "dark" else self.theme.accent
+        for button, name in (
+            (self.settings_toggle_button, "settings"),
+            (self.downloads_button, "folder"),
+            (self.official_button, "website"),
+        ):
+            button.setIconSize(QSize(size, size))
+            button.setIcon(build_footer_icon(name, self.theme.text_primary, size, checked_color=accent))
+        self.donate_button.setIconSize(QSize(size, size))
+        self.donate_button.setIcon(build_footer_icon("heart", accent, size))
+
     def _refresh_pin_toggle_icon(self) -> None:
         self.pin_toggle_button.setIcon(self._build_pin_icon(self._window_pinned))
         self._update_pin_tooltip(self._window_pinned)
@@ -2769,8 +2855,8 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         if not self._post_show_layout_synced:
             self._post_show_layout_synced = True
-            QTimer.singleShot(0, self._run_post_show_layout_sync)
-        QTimer.singleShot(0, self.apply_windows_titlebar_theme)
+            QTimer.singleShot(0, self, self._run_post_show_layout_sync)
+        QTimer.singleShot(0, self, self.apply_windows_titlebar_theme)
 
     def resizeEvent(self, event) -> None:
         try:
@@ -3086,8 +3172,13 @@ class MainWindow(QMainWindow):
             batch_expansion=1.0,
         )
         self._set_batch_inline_section_height(target_inline_height, force_visible=enabled)
+        self._input_layout.activate()
+        self._main_layout.invalidate()
+        self._main_layout.activate()
+        self._content_row_layout.invalidate()
+        self._content_row_layout.activate()
         min_width = max(1, target_width)
-        min_height = max(1, target_window_height)
+        min_height = max(1, target_window_height, self.minimumSizeHint().height())
         self._programmatic_resize_depth += 1
         try:
             self.setMinimumSize(min_width, min_height)
@@ -3126,10 +3217,6 @@ class MainWindow(QMainWindow):
             self._set_settings_container_width(self._settings_target_width)
         else:
             self._set_settings_container_width(0)
-        self._main_layout.invalidate()
-        self._main_layout.activate()
-        self._content_row_layout.invalidate()
-        self._content_row_layout.activate()
         self._apply_format_quality_width_policy()
         self._refresh_settings_scroll_metrics()
         if not enabled:
@@ -3222,7 +3309,10 @@ class MainWindow(QMainWindow):
         self._refresh_batch_entries_display()
 
     def _schedule_batch_entries_refresh(self, *, delay_ms: int = 24) -> None:
-        self._batch_entries_refresh_timer.start(max(0, int(delay_ms)))
+        delay = max(0, int(delay_ms))
+        timer = self._batch_entries_refresh_timer
+        if not timer.isActive() or delay < timer.remainingTime():
+            timer.start(delay)
 
     def _on_batch_entries_refresh_timer(self) -> None:
         self._refresh_batch_entries_display()
@@ -3240,19 +3330,17 @@ class MainWindow(QMainWindow):
             self._batch_chunk_timer.stop()
         self._batch_chunk_generation += 1
         self._batch_chunk_in_progress = False
+        self._batch_chunk_focus = None
         self._batch_chunk_entries = []
+        self._batch_chunk_index_by_id = {}
         self._batch_chunk_ordered_ids = []
         self._batch_chunk_cursor = 0
         self._batch_refresh_after_chunk = False
 
     def _replace_batch_chunk_entry(self, entry: BatchEntry) -> None:
-        key = str(entry.entry_id or "").strip()
-        if not key or not self._batch_chunk_entries:
-            return
-        for index, current in enumerate(self._batch_chunk_entries):
-            if str(current.entry_id or "").strip() == key:
-                self._batch_chunk_entries[index] = entry
-                return
+        index = self._batch_chunk_index_by_id.get(str(entry.entry_id or "").strip())
+        if index is not None:
+            self._batch_chunk_entries[index] = entry
 
     def _should_chunk_batch_refresh(self, entry_count: int, *, previous_count: int | None = None) -> bool:
         if previous_count is not None:
@@ -3260,8 +3348,6 @@ class MainWindow(QMainWindow):
             if prior > 0 and abs(int(entry_count) - prior) <= 4:
                 return False
         if entry_count < max(1, int(self._batch_chunk_threshold)):
-            return False
-        if not self.isVisible():
             return False
         if not self._is_batch_mode_enabled():
             return False
@@ -3271,10 +3357,23 @@ class MainWindow(QMainWindow):
         self._batch_chunk_generation += 1
         self._batch_chunk_in_progress = True
         self._batch_chunk_entries = list(ordered_entries)
+        self._batch_chunk_index_by_id = {entry.entry_id: index for index, entry in enumerate(ordered_entries)}
         self._batch_chunk_ordered_ids = list(ordered_ids)
         self._batch_chunk_cursor = 0
         self._batch_refresh_after_chunk = False
+        self._batch_chunk_scroll_state = self._capture_batch_scroll_state()
+        self._batch_chunk_focus = QApplication.focusWidget()
+        previous_suspend = self._suspend_event_filter_processing
+        self._suspend_event_filter_processing = True
+        try:
+            self._force_incremental_batch_layout_update(ordered_ids=[])
+        finally:
+            self._suspend_event_filter_processing = previous_suspend
         self._process_batch_chunk(self._batch_chunk_generation)
+
+    def _on_batch_chunk_focus_changed(self, _previous: QWidget | None, _current: QWidget | None) -> None:
+        if self._batch_chunk_in_progress and not self._suspend_event_filter_processing:
+            self._batch_chunk_focus = None
 
     def _on_batch_chunk_timer(self) -> None:
         self._process_batch_chunk(self._batch_chunk_generation)
@@ -3284,7 +3383,9 @@ class MainWindow(QMainWindow):
             return
         refresh_after_chunk = bool(self._batch_refresh_after_chunk)
         self._batch_chunk_in_progress = False
+        self._batch_chunk_focus = None
         self._batch_chunk_entries = []
+        self._batch_chunk_index_by_id = {}
         self._batch_chunk_ordered_ids = []
         self._batch_chunk_cursor = 0
         self._batch_refresh_after_chunk = False
@@ -3294,87 +3395,41 @@ class MainWindow(QMainWindow):
     def _process_batch_chunk(self, generation: int) -> None:
         if generation != self._batch_chunk_generation or not self._batch_chunk_in_progress:
             return
-        trace_enabled = bool(self._batch_perf_debug_enabled)
-        started = perf_counter() if trace_enabled else 0.0
-        rows_applied = 0
-        layout_action = "none"
+        started = perf_counter()
+        cursor = self._batch_chunk_cursor
         total = len(self._batch_chunk_entries)
-        if total <= 0:
-            self._rebuild_batch_entries_layout([])
-            self._set_displayed_batch_entry_ids([])
-            self._update_batch_entry_control_visibility(update_rows=False)
-            self._finish_chunked_batch_refresh(generation)
-            if trace_enabled:
-                self._batch_perf_chunk_seq += 1
-                elapsed_ms = (perf_counter() - started) * 1000.0
-                self._log_batch_perf(
-                    "chunk",
-                    sequence=self._batch_perf_chunk_seq,
-                    message=(
-                        f"generation={generation} range=0:0/0 applied={rows_applied} "
-                        f"layout=rebuild-empty continue=False elapsed_ms={elapsed_ms:.2f}"
-                    ),
-                )
-            return
-        start = max(0, int(self._batch_chunk_cursor))
-        end = min(total, start + max(1, int(self._batch_chunk_size)))
         show_format_quality, show_detail, compact_mode = self._batch_row_visibility_policy()
-        previous_suspend = bool(self._suspend_event_filter_processing)
+        previous_suspend = self._suspend_event_filter_processing
         self._suspend_event_filter_processing = True
-        self.setUpdatesEnabled(False)
         try:
-            for entry in self._batch_chunk_entries[start:end]:
+            processed = 0
+            while cursor < total and processed < min(12, max(1, self._batch_chunk_size)):
+                entry = self._batch_chunk_entries[cursor]
                 row = self._ensure_batch_entry_row_widget(entry)
-                signature = self._batch_entry_render_signature(
-                    entry,
-                    controls_locked=self._controls_locked,
-                    settings_visible=self._settings_visible,
-                )
+                signature = self._batch_entry_render_signature(entry, controls_locked=self._controls_locked, settings_visible=self._settings_visible)
                 if self._batch_row_render_signatures.get(entry.entry_id) != signature:
-                    self._apply_batch_entry_to_row(
-                        row,
-                        entry,
-                        show_format_quality=show_format_quality,
-                        show_detail=show_detail,
-                        compact_mode=compact_mode,
-                    )
+                    self._apply_batch_entry_to_row(row, entry, show_format_quality=show_format_quality,
+                                                   show_detail=show_detail, compact_mode=compact_mode)
                     self._batch_row_render_signatures[entry.entry_id] = signature
-                    rows_applied += 1
-            self._batch_chunk_cursor = end
-            target_ids = self._batch_chunk_ordered_ids[:end]
-            if start <= 0:
-                visible_entries = self._batch_chunk_entries[:end]
-                self._rebuild_batch_entries_layout(visible_entries)
-                self._set_displayed_batch_entry_ids(target_ids)
-                self._update_batch_entry_control_visibility(update_rows=False)
-                layout_action = "rebuild-initial"
-            else:
-                if self._try_incremental_batch_layout_update(ordered_ids=target_ids):
-                    layout_action = "incremental"
-                else:
-                    visible_entries = self._batch_chunk_entries[:end]
-                    self._rebuild_batch_entries_layout(visible_entries)
-                    self._set_displayed_batch_entry_ids(target_ids)
-                    self._update_batch_entry_control_visibility(update_rows=False)
-                    layout_action = "rebuild-fallback"
+                self._append_batch_row(row)
+                self._displayed_batch_entry_ids.append(entry.entry_id)
+                self._displayed_batch_entry_id_set.add(entry.entry_id)
+                cursor += 1; processed += 1
+                if perf_counter() - started >= 0.020:
+                    break
+            self._batch_chunk_cursor = cursor
         finally:
-            self.setUpdatesEnabled(True)
             self._suspend_event_filter_processing = previous_suspend
-        continued = end < total
-        if trace_enabled:
-            self._batch_perf_chunk_seq += 1
-            elapsed_ms = (perf_counter() - started) * 1000.0
-            self._log_batch_perf(
-                "chunk",
-                sequence=self._batch_perf_chunk_seq,
-                message=(
-                    f"generation={generation} range={start}:{end}/{total} applied={rows_applied} "
-                    f"layout={layout_action} continue={continued} elapsed_ms={elapsed_ms:.2f}"
-                ),
-            )
-        if end < total:
-            self._batch_chunk_timer.start(0)
+        if cursor < total:
+            self._batch_chunk_timer.start(1)
             return
+        self._update_batch_entry_control_visibility(update_rows=False)
+        prev_v, prev_v_max, prev_h, prev_h_max = self._batch_chunk_scroll_state
+        self._restore_batch_scroll_state(prev_v=prev_v, prev_v_max=prev_v_max, prev_h=prev_h, prev_h_max=prev_h_max)
+        focus = self._batch_chunk_focus
+        from shiboken6 import isValid
+        if focus is not None and isValid(focus) and focus.isVisible():
+            focus.setFocus(Qt.OtherFocusReason)
         self._finish_chunked_batch_refresh(generation)
 
     def set_batch_entries(self, entries: list[BatchEntry]) -> None:
@@ -3419,25 +3474,29 @@ class MainWindow(QMainWindow):
                     self._set_displayed_batch_entry_ids(ordered_ids)
                     layout_rebuilt = True
 
+    def set_thumbnail_cache(self, cache: ThumbnailCache) -> None:
+        self._thumbnail_cache = cache
+
     def set_batch_entry_thumbnail(self, entry_id: str, image_data: bytes | None, source_url: str = "") -> None:
         key = str(entry_id or "").strip()
-        if not key:
+        if key not in self._all_batch_entry_index_by_id:
+            self._batch_entry_thumbnail_urls.pop(key, None)
+            self._batch_thumbnail_requested_urls.pop(key, None)
             return
-        previous_url = self._batch_entry_thumbnail_urls.get(key, "")
         normalized_url = str(source_url or "").strip()
+        entry = self._all_batch_entries[self._all_batch_entry_index_by_id[key]]
+        if normalized_url and normalized_url != str(entry.thumbnail_url or "").strip():
+            return
         if normalized_url:
             self._batch_entry_thumbnail_urls[key] = normalized_url
             if image_data:
-                self._batch_thumbnail_payload_by_url[normalized_url] = bytes(image_data)
+                self._thumbnail_cache.set(normalized_url, bytes(image_data))
         else:
             self._batch_entry_thumbnail_urls.pop(key, None)
-        if previous_url and previous_url != normalized_url and previous_url not in self._batch_entry_thumbnail_urls.values():
-            self._batch_thumbnail_payload_by_url.pop(previous_url, None)
+        self._batch_thumbnail_requested_urls.pop(key, None)
         row = self._batch_entry_widgets.get(key)
-        if row is None:
-            return
-        payload = self._batch_thumbnail_payload_by_url.get(normalized_url, b"") if normalized_url else b""
-        row.set_thumbnail_bytes(payload if payload else None, normalized_url)
+        if row is not None:
+            row.set_thumbnail_bytes(image_data, normalized_url)
 
     def _batch_filter_state(self) -> tuple[str, str]:
         query = self.multi_search_input.text().strip().lower()
@@ -3536,24 +3595,19 @@ class MainWindow(QMainWindow):
             vbar.setValue(max(0, min(new_v_max, target_v)))
             hbar.setValue(max(0, min(new_h_max, target_h)))
 
-        QTimer.singleShot(0, _restore_scroll_positions)
+        QTimer.singleShot(0, self, _restore_scroll_positions)
 
     def _remove_stale_batch_entry_widgets(self, entry_ids: set[str]) -> None:
-        referenced_urls_before = set(self._batch_entry_thumbnail_urls.values())
-        for stale_id in list(self._batch_entry_widgets.keys()):
+        stale_ids = set(self._batch_entry_widgets) - entry_ids
+        self._detach_batch_rows_by_ids(stale_ids)
+        for stale_id in stale_ids:
             if stale_id in entry_ids:
                 continue
             stale_widget = self._batch_entry_widgets.pop(stale_id)
             self._hide_batch_row_combo_popups(stale_widget)
-            self._detach_widget_from_multi_entries_layout(stale_widget)
             stale_widget.deleteLater()
             self._batch_entry_thumbnail_urls.pop(stale_id, None)
             self._batch_row_render_signatures.pop(stale_id, None)
-        if referenced_urls_before:
-            referenced_urls_after = set(self._batch_entry_thumbnail_urls.values())
-            for source_url in referenced_urls_before:
-                if source_url and source_url not in referenced_urls_after:
-                    self._batch_thumbnail_payload_by_url.pop(source_url, None)
         if self._displayed_batch_entry_ids:
             self._set_displayed_batch_entry_ids(
                 [entry_id for entry_id in self._displayed_batch_entry_ids if entry_id in entry_ids]
@@ -3564,6 +3618,9 @@ class MainWindow(QMainWindow):
                 for index, entry_id in enumerate(str(entry.entry_id or "").strip() for entry in self._all_batch_entries)
                 if entry_id
             }
+        self._batch_entry_thumbnail_urls = {entry.entry_id: str(entry.thumbnail_url).strip() for entry in self._all_batch_entries if entry.thumbnail_url}
+        self._batch_thumbnail_requested_urls = {key: url for key, url in self._batch_thumbnail_requested_urls.items() if key in entry_ids}
+
 
     def _set_displayed_batch_entry_ids(self, entry_ids: list[str]) -> None:
         normalized = [str(entry_id or "").strip() for entry_id in entry_ids if str(entry_id or "").strip()]
@@ -3650,11 +3707,15 @@ class MainWindow(QMainWindow):
         compact_mode: bool | None = None,
     ) -> None:
         row.set_entry(entry)
-        source_url = self._batch_entry_thumbnail_urls.get(entry.entry_id, "")
+        source_url = str(entry.thumbnail_url or "").strip()
         if source_url:
-            if row.thumbnail_source_url() != source_url:
-                payload = self._batch_thumbnail_payload_by_url.get(source_url, b"")
-                row.set_thumbnail_bytes(payload if payload else None, source_url)
+            self._batch_entry_thumbnail_urls[entry.entry_id] = source_url
+            payload = self._thumbnail_cache.get(source_url)
+            if payload is not None:
+                row.set_thumbnail_bytes(payload, source_url)
+            elif row._thumbnail_original is None and self._batch_thumbnail_requested_urls.get(entry.entry_id) != source_url:
+                self._batch_thumbnail_requested_urls[entry.entry_id] = source_url
+                self.batchThumbnailNeeded.emit(entry.entry_id)
         elif row.thumbnail_source_url():
             row.set_thumbnail_bytes(None, "")
         if show_format_quality is None or show_detail is None or compact_mode is None:
@@ -3813,102 +3874,72 @@ class MainWindow(QMainWindow):
             return None
         return removals
 
-    def _insert_batch_row_at_order_index(self, target_index: int, row: BatchEntryRowWidget) -> None:
+    def _append_batch_row(self, row: BatchEntryRowWidget) -> None:
+        if self._multi_entries_layout.count() and self._multi_entries_layout.itemAt(0).widget() is self.multi_empty_label:
+            self._multi_entries_layout.takeAt(0)
         self.multi_empty_label.hide()
-        self._remove_widget_item_from_multi_entries_layout(row)
         if row.parentWidget() is not self.multi_entries_container:
             row.setParent(self.multi_entries_container)
-        if self._multi_entries_layout.count() <= 0:
-            self._multi_entries_layout.addWidget(row)
-            self._multi_entries_layout.addStretch(1)
-            return
-
-        insertion_layout_index = max(0, self._multi_entries_layout.count() - 1)
-        row_index = 0
-        for layout_index in range(self._multi_entries_layout.count()):
-            item = self._multi_entries_layout.itemAt(layout_index)
-            widget = item.widget() if item is not None else None
-            if not isinstance(widget, BatchEntryRowWidget):
-                continue
-            if row_index >= target_index:
-                insertion_layout_index = layout_index
-                break
-            row_index += 1
-        self._multi_entries_layout.insertWidget(insertion_layout_index, row)
-        if not row.isVisible():
+        self._multi_entries_layout.insertWidget(max(0, self._multi_entries_layout.count() - 1), row)
+        if row.isHidden():
             row.show()
 
-    def _try_incremental_batch_layout_update(
-        self,
-        *,
-        ordered_ids: list[str],
-    ) -> bool:
-        if (not ordered_ids) or (not self._displayed_batch_entry_ids):
-            return False
-        layout_ids = self._current_batch_layout_entry_ids()
-        if layout_ids != self._displayed_batch_entry_ids:
-            return False
-        current_ids = list(self._displayed_batch_entry_ids)
-        if ordered_ids == current_ids:
-            return True
+    def _insert_batch_row_at_order_index(self, target_index: int, row: BatchEntryRowWidget) -> None:
+        ids = list(self._displayed_batch_entry_ids)
+        key = row.entry_id()
+        if key in ids:
+            ids.remove(key)
+        ids.insert(max(0, min(target_index, len(ids))), key)
+        self._force_incremental_batch_layout_update(ordered_ids=ids)
 
-        if len(ordered_ids) > len(current_ids):
-            inserts = self._plan_batch_layout_inserts(current_ids, ordered_ids)
-            if inserts is None:
-                return False
-            for position, entry_id in inserts:
-                row = self._batch_entry_widgets.get(entry_id)
-                if row is None:
-                    return False
-                self._insert_batch_row_at_order_index(position, row)
-            self._set_displayed_batch_entry_ids(ordered_ids)
-            self._update_batch_entry_control_visibility(update_rows=False)
+    def _try_incremental_batch_layout_update(self, *, ordered_ids: list[str]) -> bool:
+        current = self._displayed_batch_entry_ids
+        if ordered_ids == current:
             return True
-
-        removals = self._plan_batch_layout_removals(current_ids, ordered_ids)
-        if removals is None:
+        if ordered_ids[:len(current)] != current:
             return False
-        if removals:
-            self._detach_batch_rows_by_ids(set(removals))
+        suffix = ordered_ids[len(current):]
+        if any(key not in self._batch_entry_widgets for key in suffix):
+            return False
+        for key in suffix:
+            self._append_batch_row(self._batch_entry_widgets[key])
         self._set_displayed_batch_entry_ids(ordered_ids)
         self._update_batch_entry_control_visibility(update_rows=False)
         return True
 
     def _force_incremental_batch_layout_update(self, *, ordered_ids: list[str]) -> bool:
-        target_ids = [str(item or "").strip() for item in ordered_ids if str(item or "").strip()]
-        for entry_id in target_ids:
-            if self._batch_entry_widgets.get(entry_id) is None:
-                return False
-        current_ids = self._current_batch_layout_entry_ids()
-        target_set = set(target_ids)
-        removals = {entry_id for entry_id in current_ids if entry_id not in target_set}
-        if removals:
-            self._detach_batch_rows_by_ids(removals)
-
-        if not target_ids:
-            self._show_multi_empty_label()
-            self._set_displayed_batch_entry_ids([])
-            self._update_batch_entry_control_visibility(update_rows=False)
-            return True
-
-        self.multi_empty_label.hide()
-
-        for index, entry_id in enumerate(target_ids):
-            layout_ids = self._current_batch_layout_entry_ids()
-            if index < len(layout_ids) and layout_ids[index] == entry_id:
-                continue
-            row = self._batch_entry_widgets.get(entry_id)
-            if not isinstance(row, BatchEntryRowWidget):
-                return False
-            self._insert_batch_row_at_order_index(index, row)
-
-        residual_ids = self._current_batch_layout_entry_ids()
-        residual_removals = {entry_id for entry_id in residual_ids if entry_id not in target_set}
-        if residual_removals:
-            self._detach_batch_rows_by_ids(residual_removals)
-
-        self._set_displayed_batch_entry_ids(target_ids)
+        if any(key not in self._batch_entry_widgets for key in ordered_ids):
+            return False
+        scroll = self._capture_batch_scroll_state()
+        focus = QApplication.focusWidget()
+        target_set = set(ordered_ids)
+        self.setUpdatesEnabled(False)
+        try:
+            for index in range(self._multi_entries_layout.count() - 1, -1, -1):
+                item = self._multi_entries_layout.takeAt(index)
+                widget = item.widget() if item is not None else None
+                if widget is not None and (not isinstance(widget, BatchEntryRowWidget) or widget.entry_id() not in target_set):
+                    widget.hide()
+            self.multi_empty_label.hide()
+            for key in ordered_ids:
+                row = self._batch_entry_widgets[key]
+                if row.parentWidget() is not self.multi_entries_container:
+                    row.setParent(self.multi_entries_container)
+                self._multi_entries_layout.addWidget(row)
+                row.show()
+            if not ordered_ids:
+                self._multi_entries_layout.addWidget(self.multi_empty_label)
+                self.multi_empty_label.show()
+            self._multi_entries_layout.addStretch(1)
+            self._set_displayed_batch_entry_ids(ordered_ids)
+        finally:
+            self.setUpdatesEnabled(True)
         self._update_batch_entry_control_visibility(update_rows=False)
+        prev_v, prev_v_max, prev_h, prev_h_max = scroll
+        self._restore_batch_scroll_state(prev_v=prev_v, prev_v_max=prev_v_max, prev_h=prev_h, prev_h_max=prev_h_max)
+        from shiboken6 import isValid
+        if focus is not None and isValid(focus) and focus.isVisible():
+            focus.setFocus(Qt.OtherFocusReason)
         return True
 
     def _refresh_batch_entries_display(self) -> bool:
@@ -3934,6 +3965,10 @@ class MainWindow(QMainWindow):
         show_format_quality, show_detail, compact_mode = self._batch_row_visibility_policy()
 
         ordered_ids = [str(entry.entry_id or "").strip() for entry in ordered_entries]
+        missing = sum(entry.entry_id not in self._batch_entry_widgets for entry in ordered_entries)
+        if missing >= self._batch_chunk_threshold and self._is_batch_mode_enabled():
+            self._start_chunked_batch_refresh(ordered_entries, ordered_ids)
+            return True
         for entry in ordered_entries:
             row = self._ensure_batch_entry_row_widget(entry)
             signature = self._batch_entry_render_signature(
@@ -4386,7 +4421,7 @@ class MainWindow(QMainWindow):
         if self._single_meta_refresh_pending:
             return
         self._single_meta_refresh_pending = True
-        QTimer.singleShot(0, self._flush_single_meta_refresh)
+        QTimer.singleShot(0, self, self._flush_single_meta_refresh)
 
     @staticmethod
     def _sanitize_meta_message(message: str) -> str:
@@ -4498,7 +4533,7 @@ class MainWindow(QMainWindow):
             self._schedule_single_meta_refresh()
 
     def _schedule_single_meta_visibility_sync(self) -> None:
-        QTimer.singleShot(0, self._sync_single_meta_visibility)
+        QTimer.singleShot(0, self, self._sync_single_meta_visibility)
 
     def set_single_url_analysis_state(
         self,

@@ -221,6 +221,15 @@ def _is_supported_node_binary(path: str) -> bool:
 
 
 def resolve_ffmpeg_binaries() -> tuple[str | None, str | None]:
+    from .dependency_transaction import dependency_resolution_lock
+    try:
+        with dependency_resolution_lock(runtime_storage_dir(), "ffmpeg"):
+            return _resolve_ffmpeg_binaries()
+    except (OSError, RuntimeError):
+        return _resolve_ffmpeg_binaries()
+
+
+def _resolve_ffmpeg_binaries() -> tuple[str | None, str | None]:
     ffmpeg = resolve_binary("ffmpeg")
     if not ffmpeg:
         return None, None
@@ -445,15 +454,14 @@ class DependencyService:
                 if binary_name not in located_binaries:
                     raise FileNotFoundError(f"{binary_name} was not found in downloaded archive")
 
-            installed_paths: list[Path] = []
-            for binary_name in package.binaries:
-                _ensure_not_cancelled(cancel_token, name)
-                found = located_binaries[binary_name]
-                target_binary = target_dir / binary_name
-                shutil.copy2(found, target_binary)
-                installed_paths.append(target_binary)
+            from .dependency_transaction import promote_dependency
+            installed_paths = promote_dependency(
+                target_dir, name, located_binaries,
+                lambda: _ensure_not_cancelled(cancel_token, name),
+            )
+            for target_binary in installed_paths:
                 if log_cb:
-                    log_cb(f"Installed {binary_name} to {target_binary}")
+                    log_cb(f"Installed {target_binary.name} to {target_binary}")
             if progress_cb:
                 progress_cb(99, f"Finalizing {name} (99%)")
 

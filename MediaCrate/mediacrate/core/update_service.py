@@ -131,10 +131,12 @@ class UpdateService:
         prepared: PreparedUpdateInstall,
         *,
         restart_after_update: bool,
+        commit_guard: Callable[[], bool] | None = None,
     ) -> None:
         self._updater.launch_prepared_update(
             prepared,
             restart_after_update=bool(restart_after_update),
+            commit_guard=commit_guard,
         )
 
     def discard_prepared_update(self, prepared: PreparedUpdateInstall) -> None:

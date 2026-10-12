@@ -26,6 +26,7 @@ from ..ui.dialogs import apply_dialog_theme
 from ..ui.widgets.controls import SquareCheckBoxStyle
 from ..workers.update_install_worker import UpdateInstallWorker
 from ..workers.update_worker import UpdateWorker
+from .request_context import connect_request
 
 
 def _apply_update_dialog_chrome(dialog: QDialog, parent: QWidget | None) -> None:
@@ -164,9 +165,10 @@ class UpdateFlowCoordinator(QObject):
         self._active_install_result: UpdateCheckResult | None = None
         self._pending_install_result: UpdateCheckResult | None = None
         self._install_progress_dialog: _UpdateInstallProgressDialog | None = None
-        # True once installer handoff succeeds and the app should close.
         self._close_after_install_handoff = False
         self._manual_request = False
+        self._generation = 0
+        self._stopped = False
 
     def _dialog_parent(self) -> QWidget | None:
         owner_window = getattr(self._owner, "window", None)
@@ -193,17 +195,25 @@ class UpdateFlowCoordinator(QObject):
         return bool(check_running or install_running)
 
     def stop(self) -> None:
+        self._generation += 1
+        self._stopped = True
+        self._pending_install_result = None
+        self._close_after_install_handoff = False
         if self._worker:
             self._worker.stop()
         if self._install_worker:
             self._install_worker.stop()
 
     def start_check(self, *, manual: bool) -> bool:
+        if getattr(self._owner, "_closing", False):
+            return False
         if self.is_running():
             if manual:
                 self._show_info("Update check", "An update check is already in progress.")
             return False
 
+        self._stopped = False
+        self._generation += 1
         self._set_update_busy(True)
         self._manual_request = bool(manual)
         self._active_install_result = None
@@ -211,12 +221,13 @@ class UpdateFlowCoordinator(QObject):
         self._close_after_install_handoff = False
         thread = QThread(self._owner)
         worker = UpdateWorker(self._service, self._current_version)
+        generation = self._generation
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.errorRaised.connect(self._on_update_error, Qt.ConnectionType.QueuedConnection)
-        worker.finishedSummary.connect(self._on_update_summary, Qt.ConnectionType.QueuedConnection)
+        connect_request(worker.errorRaised, self, thread, self._on_update_error, lambda: self._worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
+        connect_request(worker.finishedSummary, self, thread, self._on_update_summary, lambda: self._worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         worker.finished.connect(thread.quit)
-        worker.finished.connect(self._on_update_finished, Qt.ConnectionType.QueuedConnection)
+        connect_request(worker.finished, self, thread, self._on_update_finished, lambda: self._worker is worker)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self._thread = thread
@@ -262,12 +273,13 @@ class UpdateFlowCoordinator(QObject):
                 "\n\nYour current version is below the minimum supported "
                 f"auto-update baseline ({minimum_supported})."
             )
+        generation = self._generation
         proceed, auto_install = self._ask_update_install_preference(
             latest_version=str(result.latest_version or ""),
             details_text=details_text,
             install_supported=can_install,
         )
-        if not proceed:
+        if not proceed or generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
             return
         if can_install and auto_install:
             self._queue_or_start_install_after_check(result)
@@ -446,22 +458,26 @@ class UpdateFlowCoordinator(QObject):
         if pending_install is not None:
             self._start_install(pending_install)
             return
-        self._set_busy_done()
+        if not getattr(self._owner, "_closing", False):
+            self._set_busy_done()
 
     def _start_install(self, result: UpdateCheckResult) -> None:
+        if self._stopped or getattr(self._owner, "_closing", False):
+            return
         self._set_update_busy(True)
         self._active_install_result = result
         self._show_install_progress_dialog()
         thread = QThread(self._owner)
         worker = UpdateInstallWorker(self._service, result)
+        generation = self._generation
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.errorRaised.connect(self._on_install_error, Qt.ConnectionType.QueuedConnection)
-        worker.finishedSummary.connect(self._on_install_summary, Qt.ConnectionType.QueuedConnection)
-        worker.handoffRequested.connect(self._on_install_handoff_requested, Qt.ConnectionType.QueuedConnection)
-        worker.progressChanged.connect(self._on_install_progress, Qt.ConnectionType.QueuedConnection)
+        connect_request(worker.errorRaised, self, thread, self._on_install_error, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
+        connect_request(worker.finishedSummary, self, thread, self._on_install_summary, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
+        connect_request(worker.handoffRequested, self, thread, self._on_install_handoff_requested, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
+        connect_request(worker.progressChanged, self, thread, self._on_install_progress, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         worker.finished.connect(thread.quit)
-        worker.finished.connect(self._on_install_finished, Qt.ConnectionType.QueuedConnection)
+        connect_request(worker.finished, self, thread, self._on_install_finished, lambda: self._install_worker is worker)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self._install_thread = thread
@@ -520,13 +536,14 @@ class UpdateFlowCoordinator(QObject):
         dialog = self._install_progress_dialog
         if dialog is not None:
             dialog.set_cancel_enabled(False)
+        worker = self._install_worker
+        generation = self._generation
         continue_update, restart_after = self._ask_update_handoff(
             version=version,
             default_restart=True,
             requires_elevation=requires_elevation,
         )
-        worker = self._install_worker
-        if worker is None:
+        if worker is None or worker is not self._install_worker or generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
             return
         worker.set_handoff_decision(
             continue_update=bool(continue_update),
@@ -543,8 +560,11 @@ class UpdateFlowCoordinator(QObject):
         worker.stop()
 
     def _on_install_error(self, _job_id: str, error: str) -> None:
+        generation = self._generation
         self._close_install_progress_dialog()
         self._show_warning("Update install", f"Unable to install update.\n{error}")
+        if generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
+            return
         fallback_url = str(DEFAULT_DOWNLOAD_URL or "").strip()
         if self._active_install_result is not None:
             fallback_url = str(self._active_install_result.download_url or "").strip() or fallback_url
@@ -555,7 +575,7 @@ class UpdateFlowCoordinator(QObject):
             "Would you like to open the download page instead?",
             default_button=QMessageBox.Yes,
         )
-        if answer != QMessageBox.Yes:
+        if answer != QMessageBox.Yes or generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
             return
         try:
             self._open_url_checked(fallback_url)
@@ -590,8 +610,9 @@ class UpdateFlowCoordinator(QObject):
         self._active_install_result = None
         self._install_worker = None
         self._install_thread = None
-        self._set_busy_done()
-        if not close_after_handoff:
+        if not getattr(self._owner, "_closing", False):
+            self._set_busy_done()
+        if not close_after_handoff or self._stopped or getattr(self._owner, "_closing", False):
             return
         try:
             self._request_restart()

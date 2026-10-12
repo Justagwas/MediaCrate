@@ -121,7 +121,8 @@ class DownloadFlow:
             getattr(controller, "_overall_progress_dirty", False) or overall_progress
         )
         controller._pause_resume_dirty = bool(getattr(controller, "_pause_resume_dirty", False) or pause_resume)
-        timer.start()
+        if not timer.isActive():
+            timer.start()
 
     @staticmethod
     def flush_deferred_ui_refresh(controller: DownloadFlowController) -> None:

@@ -60,7 +60,6 @@ class ThumbnailCache:
         if existing is not None:
             self._total_bytes -= len(existing.data)
 
-        # If a single thumbnail cannot fit, keep cache healthy and skip storing it.
         if payload_size > self._max_bytes:
             self._prune_limits()
             return False

@@ -20,15 +20,31 @@ class UpdateInstallWorker(BaseWorker):
         self._handoff_event = threading.Event()
         self._handoff_continue = False
         self._handoff_restart = True
+        self._decision_lock = threading.Lock()
+        self._state = "preparing"
 
     def stop(self) -> None:
-        super().stop()
-        self._handoff_event.set()
+        with self._decision_lock:
+            if self._state in {"committing", "handed off"}:
+                return
+            self._state = "canceled"
+            super().stop()
+            self._handoff_event.set()
 
     def set_handoff_decision(self, *, continue_update: bool, restart_after_update: bool) -> None:
-        self._handoff_continue = bool(continue_update)
-        self._handoff_restart = bool(restart_after_update)
-        self._handoff_event.set()
+        with self._decision_lock:
+            if self._state != "awaiting decision":
+                return
+            self._handoff_continue = bool(continue_update)
+            self._handoff_restart = bool(restart_after_update)
+            self._handoff_event.set()
+
+    def _claim_commit(self) -> bool:
+        with self._decision_lock:
+            if self._state != "awaiting decision" or self._stop_event.is_set() or not self._handoff_continue:
+                return False
+            self._state = "committing"
+            return True
 
     def run(self) -> None:
         def execute():
@@ -50,9 +66,10 @@ class UpdateInstallWorker(BaseWorker):
                     99.0,
                     "Ready to hand off to installer. Waiting for your confirmation...",
                 )
-                self._handoff_continue = False
-                self._handoff_restart = True
-                self._handoff_event.clear()
+                with self._decision_lock:
+                    if self._stop_event.is_set() or self._state == "canceled":
+                        raise InterruptedError("Update operation stopped.")
+                    self._state = "awaiting decision"
                 self.handoffRequested.emit(
                     {
                         "version": str(getattr(prepared, "latest_version", "") or self._check_result.latest_version or ""),
@@ -63,6 +80,8 @@ class UpdateInstallWorker(BaseWorker):
                     if self._stop_event.is_set():
                         raise InterruptedError("Update operation stopped.")
                     time.sleep(0.05)
+                if self._stop_event.is_set():
+                    raise InterruptedError("Update operation stopped.")
                 if not self._handoff_continue:
                     self._service.discard_prepared_update(prepared)
                     return {
@@ -72,7 +91,10 @@ class UpdateInstallWorker(BaseWorker):
                 self._service.launch_prepared_update(
                     prepared,
                     restart_after_update=bool(self._handoff_restart),
+                    commit_guard=self._claim_commit,
                 )
+                with self._decision_lock:
+                    self._state = "handed off"
                 return {
                     "status": "ready",
                     "version": str(getattr(prepared, "latest_version", "") or self._check_result.latest_version or ""),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
@@ -159,6 +161,7 @@ class BatchEntryRowWidget(QFrame):
         self._update_compact_layout()
 
     def _set_thumbnail_placeholder(self) -> None:
+        self._thumbnail_rendered_identity = None
         self.thumbnail_label.clear()
         self.thumbnail_label.setText('THUMB\nNAIL')
         self.thumbnail_label.setToolTip(self._thumbnail_source_url)
@@ -184,8 +187,8 @@ class BatchEntryRowWidget(QFrame):
         if url and url != self._thumbnail_source_url:
             self._thumbnail_source_url = url
             self._set_thumbnail_placeholder()
-        elif url and self._thumbnail_original is not None and image_data:
-            # Avoid re-decoding unchanged thumbnail payload for hot row updates.
+        identity = (url, hashlib.sha256(bytes(image_data)).digest()) if image_data else None
+        if identity is not None and identity == getattr(self, "_thumbnail_rendered_identity", None) and self._thumbnail_original is not None:
             return
         if not image_data:
             self._set_thumbnail_placeholder()
@@ -205,6 +208,7 @@ class BatchEntryRowWidget(QFrame):
                 Qt.SmoothTransformation,
             )
         self._thumbnail_original = pixmap
+        self._thumbnail_rendered_identity = identity
         self._apply_thumbnail_pixmap()
 
     def set_busy(self, busy: bool) -> None:

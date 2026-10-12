@@ -85,6 +85,8 @@ def _build_stylesheet_metrics(theme: ThemePalette, ui_scale: float) -> dict[str,
         "button_font": _scaled_pt(9.1, scale, 7.2),
         "cta_button_font": _scaled_pt(10.4, scale, 8.4),
         "footer_font": _scaled_pt(9.4, scale, 7.4),
+        "footer_icon_box": _scaled(30, scale, 22),
+        "footer_accent": theme.accent_hover if theme.mode == "dark" else theme.accent,
         "settings_button_font": _scaled_pt(9.4, scale, 7.4),
         "card_title_font": _scaled_pt(9.2, scale, 7.2),
         "url_input_font": _scaled_pt(10.6, scale, 8.5),
@@ -163,10 +165,6 @@ QLabel#subtitle, QLabel#muted {{
     color: {theme.text_secondary};
     font: 600 {m['subtitle_font']:.1f}pt "Segoe UI";
 }}
-QLabel#footerVersion {{
-    color: {theme.text_secondary};
-    font: 650 {m['footer_font']:.1f}pt "Segoe UI";
-}}
 QLabel#settingsSubtext {{
     color: {theme.text_secondary};
     font: 650 {m['button_font']:.1f}pt "Segoe UI";
@@ -218,31 +216,53 @@ QFrame#settingsPanel QPushButton#settingsActionButton {{
 QFrame#settingsPanel QPushButton#modeButton {{
     min-height: {m['mode_button_min_height']}px;
 }}
+QFrame#appFooter {{
+    background: {theme.app_bg};
+    border: none;
+}}
 QPushButton#footerLink {{
     background: transparent;
-    color: {theme.accent};
-    border: none;
-    padding: 2px;
-    font: 700 {m['footer_font']:.1f}pt "Segoe UI";
-    text-align: left;
-}}
-QPushButton#footerLink:hover {{
     color: {theme.text_primary};
-    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {m['button_radius']}px;
+    min-height: {m['footer_icon_box']}px;
+    padding: 0 {_scaled(8, float(m['scale']), 6)}px;
+    font: 600 {m['footer_font']:.1f}pt "Segoe UI";
 }}
 QPushButton#footerIcon {{
     background: transparent;
     color: {theme.text_primary};
-    border: none;
-    min-width: {m['icon_box']}px;
-    min-height: {m['icon_box']}px;
-    max-width: {m['icon_box']}px;
-    max-height: {m['icon_box']}px;
+    border: 1px solid transparent;
+    border-radius: {m['button_radius']}px;
+    min-width: {m['footer_icon_box']}px;
+    min-height: {m['footer_icon_box']}px;
+    max-width: {m['footer_icon_box']}px;
+    max-height: {m['footer_icon_box']}px;
     padding: 0;
     margin: 0;
 }}
-QPushButton#footerIcon:hover {{
+QPushButton#footerDonate {{
     background: transparent;
+    color: {m['footer_accent']};
+    border: 1px solid transparent;
+    border-radius: {m['button_radius']}px;
+    min-height: {m['footer_icon_box']}px;
+    padding: 0 {_scaled(10, float(m['scale']), 7)}px;
+    font: 650 {m['footer_font']:.1f}pt "Segoe UI";
+}}
+QPushButton#footerIcon:hover, QPushButton#footerLink:hover, QPushButton#footerDonate:hover {{
+    background: {theme.panel_bg};
+}}
+QPushButton#footerIcon[keyboardFocus="true"]:focus,
+QPushButton#footerLink[keyboardFocus="true"]:focus,
+QPushButton#footerDonate[keyboardFocus="true"]:focus {{
+    border-color: {theme.text_secondary};
+}}
+QPushButton#footerIcon:pressed, QPushButton#footerLink:pressed, QPushButton#footerDonate:pressed {{
+    background: {theme.disabled_bg};
+}}
+QPushButton#footerIcon:disabled, QPushButton#footerLink:disabled, QPushButton#footerDonate:disabled {{
+    color: {theme.disabled_fg};
 }}
 QPushButton#modeButton {{
     background: transparent;

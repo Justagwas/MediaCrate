@@ -108,8 +108,6 @@ def _response_uses_proxy(response: requests.Response) -> bool:
 
 
 def _response_peer_is_public(response: requests.Response) -> bool:
-    # With an HTTPS proxy the socket peer is the configured proxy, while TLS
-    # still authenticates the requested origin through the CONNECT tunnel.
     return _response_uses_proxy(response) or _is_public_ip_address(_response_peer_address(response))
 
 

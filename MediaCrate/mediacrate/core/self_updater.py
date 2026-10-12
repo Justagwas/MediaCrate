@@ -7,7 +7,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,10 +15,12 @@ from threading import Event
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from .update_staging import StagingCoordinator, StagingLease
+
 try:
-    import winreg  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - non-Windows
-    winreg = None  # type: ignore[assignment]
+    import winreg
+except Exception:
+    winreg = None
 
 _SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -195,6 +196,9 @@ class PreparedUpdateInstall:
     setup_path: Path
     staging_root: Path
     requires_elevation: bool = False
+    setup_sha256: str = ""
+    setup_size: int = 0
+    _ownership: StagingLease | None = field(default=None, repr=False, compare=False)
 
 
 class SelfUpdater:
@@ -228,6 +232,8 @@ class SelfUpdater:
             default="stable",
         )
         self._legacy_updates_root = self._runtime_storage_dir / "updates"
+        self._staging = StagingCoordinator(self._runtime_storage_dir)
+        self._created_staging: dict[Path, StagingLease] = {}
 
     def recover_pending_update(self) -> None:
         try:
@@ -276,7 +282,8 @@ class SelfUpdater:
             stop_event=stop_event,
             progress_cb=progress_cb,
         )
-        self.launch_prepared_update(prepared, restart_after_update=True)
+        self.launch_prepared_update(prepared, restart_after_update=True,
+                                    commit_guard=lambda: stop_event is None or not stop_event.is_set())
         return str(check_data.latest_version or "")
 
     def prepare_update(
@@ -302,6 +309,7 @@ class SelfUpdater:
 
         _emit_install_progress(progress_cb, percent=0, message="Preparing update...")
         target_root = self._create_staging_root()
+        lease = self._created_staging.pop(target_root, None) or self._staging.adopt(target_root)
         try:
             setup_name = self._setup_filename_from_url(check_data.setup_url, check_data.latest_version)
             setup_path = target_root / setup_name
@@ -317,14 +325,30 @@ class SelfUpdater:
             _ensure_not_stopped(stop_event)
             _emit_install_progress(progress_cb, percent=96, message="Verifying update package...")
             _emit_install_progress(progress_cb, percent=98, message="Ready to install update.")
+            lease.state("prepared")
         except Exception:
-            self._remove_path_tree(target_root, allowed_root=self._runtime_storage_dir)
+            try:
+                try:
+                    lease.state("discarded")
+                except OSError:
+                    pass
+                self._remove_path_tree(target_root, allowed_root=self._runtime_storage_dir)
+            finally:
+                lease.close()
+            if not target_root.exists():
+                try:
+                    self._staging.forget(target_root)
+                except OSError:
+                    pass
             raise
         return PreparedUpdateInstall(
             latest_version=str(check_data.latest_version or ""),
             setup_path=setup_path,
             staging_root=target_root,
             requires_elevation=(mode_arg == "/ALLUSERS"),
+            setup_sha256=check_data.setup_sha256,
+            setup_size=check_data.setup_size,
+            _ownership=lease,
         )
 
     def launch_prepared_update(
@@ -332,30 +356,82 @@ class SelfUpdater:
         prepared: PreparedUpdateInstall,
         *,
         restart_after_update: bool,
+        commit_guard: Callable[[], bool] | None = None,
     ) -> None:
+        lease = prepared._ownership or self._staging.adopt(Path(prepared.staging_root))
+        prepared._ownership = lease
         try:
-            self._launch_installer(
-                prepared.setup_path,
-                restart_after_update=bool(restart_after_update),
-            )
+            with lease.operation():
+                self._verify_prepared_update(prepared)
+                lease.state("handoff_pending")
+                self._launch_installer(
+                    prepared.setup_path,
+                    restart_after_update=bool(restart_after_update),
+                    commit_guard=commit_guard,
+                )
+                try:
+                    lease.state("handed_off")
+                except OSError:
+                    pass
         except Exception:
+            try:
+                with lease.operation():
+                    lease.state("discarded")
+            except (OSError, RuntimeError):
+                pass
             self.discard_prepared_update(prepared)
             raise
+        else:
+            lease.close()
+            prepared._ownership = None
+
+    def _verify_prepared_update(self, prepared: PreparedUpdateInstall) -> None:
+        import stat
+        staging = Path(prepared.staging_root)
+        payload = Path(prepared.setup_path)
+        runtime = self._runtime_storage_dir.resolve()
+        if (not staging.name.startswith(_UPDATE_STAGING_PREFIX) or staging.parent.resolve() != runtime
+                or payload.parent.resolve() != staging.resolve()):
+            raise RuntimeError("Update package is outside its owned staging directory.")
+        for path in (staging, payload):
+            info = path.lstat()
+            if path.is_symlink() or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+                raise RuntimeError("Update staging contains a reparse point.")
+        if not stat.S_ISREG(payload.lstat().st_mode):
+            raise RuntimeError("Update package is not a regular file.")
+        expected_hash = _sanitize_sha256(prepared.setup_sha256)
+        if not expected_hash or prepared.setup_size <= 0:
+            raise RuntimeError("Prepared update has no trusted integrity metadata.")
+        if payload.stat().st_size != prepared.setup_size or self._sha256_file(payload).lower() != expected_hash.lower():
+            raise RuntimeError("Prepared update failed its final integrity check.")
 
     def discard_prepared_update(self, prepared: PreparedUpdateInstall) -> None:
+        lease = prepared._ownership
         try:
-            self._remove_path_tree(Path(prepared.staging_root), allowed_root=self._runtime_storage_dir)
-        except Exception:
+            if lease is None:
+                lease = self._staging.adopt(Path(prepared.staging_root))
+            with lease.operation():
+                phase = self._staging._phase(self._staging.directory / f"{lease.path.name}.json")
+                if phase in {"handoff_pending", "handed_off"}:
+                    return
+                lease.state("discarded")
+                self._remove_path_tree(Path(prepared.staging_root), allowed_root=self._runtime_storage_dir)
+        except (OSError, RuntimeError):
             return
+        finally:
+            if lease is not None:
+                lease.close()
+            prepared._ownership = None
+        if not Path(prepared.staging_root).exists():
+            try:
+                self._staging.forget(Path(prepared.staging_root))
+            except OSError:
+                pass
 
     def _create_staging_root(self) -> Path:
-        self._runtime_storage_dir.mkdir(parents=True, exist_ok=True)
-        return Path(
-            tempfile.mkdtemp(
-                prefix=_UPDATE_STAGING_PREFIX,
-                dir=str(self._runtime_storage_dir),
-            )
-        )
+        lease = self._staging.create()
+        self._created_staging[lease.path] = lease
+        return lease.path
 
     def _fetch_manifest(self, *, stop_event: Event | None = None) -> UpdateManifest:
         if not _url_allowed(self._manifest_url, allowed_hosts=_MANIFEST_ALLOWED_HOSTS):
@@ -587,7 +663,7 @@ class SelfUpdater:
                 raise last_error
             raise RuntimeError("Update download failed.")
 
-    def _launch_installer(self, setup_path: Path, *, restart_after_update: bool) -> None:
+    def _launch_installer(self, setup_path: Path, *, restart_after_update: bool, commit_guard: Callable[[], bool] | None = None) -> None:
         if not setup_path.exists():
             raise RuntimeError("Downloaded setup installer was not found.")
         mode_arg = self._installer_mode_arg()
@@ -603,6 +679,8 @@ class SelfUpdater:
         ]
         if not restart_after_update:
             installer_args.append("/SKIPLAUNCH")
+        if commit_guard is not None and not commit_guard():
+            raise InterruptedError("Update canceled before installer handoff.")
         if mode_arg == "/ALLUSERS":
             self._launch_installer_elevated(setup_path, installer_args)
             return
@@ -617,7 +695,7 @@ class SelfUpdater:
 
     def _launch_installer_elevated(self, setup_path: Path, installer_args: list[str]) -> None:
         try:
-            import ctypes  # type: ignore[import-not-found]
+            import ctypes
         except Exception as exc:
             raise RuntimeError(
                 "Unable to request administrator privileges for all-users update."
@@ -627,7 +705,7 @@ class SelfUpdater:
         show_normal = 1
         try:
             result = int(
-                ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
+                ctypes.windll.shell32.ShellExecuteW(
                     None,
                     operation,
                     str(setup_path),
@@ -761,7 +839,17 @@ class SelfUpdater:
         for child in self._runtime_storage_dir.iterdir():
             if (not child.is_dir()) or (not child.name.startswith(_UPDATE_STAGING_PREFIX)):
                 continue
-            self._remove_path_tree(child, allowed_root=self._runtime_storage_dir)
+            lease = self._staging.cleanup_claim(child)
+            if lease is None:
+                continue
+            try:
+                with lease.operation():
+                    lease.state("discarded")
+                    self._remove_path_tree(child, allowed_root=self._runtime_storage_dir)
+            finally:
+                lease.close()
+            if not child.exists():
+                self._staging.forget(child)
 
     def _cleanup_legacy_updates_root(self) -> None:
         if not self._legacy_updates_root.exists() or (not self._legacy_updates_root.is_dir()):
@@ -866,7 +954,7 @@ class SelfUpdater:
         access: int,
     ) -> dict[str, str] | None:
         try:
-            with winreg.OpenKey(hive, key_path, 0, access) as key:  # type: ignore[arg-type,union-attr]
+            with winreg.OpenKey(hive, key_path, 0, access) as key:
                 return {
                     "InstallLocation": self._read_registry_string(key, "InstallLocation"),
                     "AppPath": self._read_registry_string(key, "Inno Setup: App Path"),
@@ -879,7 +967,7 @@ class SelfUpdater:
     @staticmethod
     def _read_registry_string(key: object, name: str) -> str:
         try:
-            value, _ = winreg.QueryValueEx(key, name)  # type: ignore[union-attr]
+            value, _ = winreg.QueryValueEx(key, name)
         except OSError:
             return ""
         return str(value or "").strip()

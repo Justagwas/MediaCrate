@@ -4,7 +4,6 @@ from . import config as _config
 from .models import AppConfig
 from .paths import app_dir, appdata_dir, default_download_dir, runtime_storage_dir
 
-# Backward-compatible re-exports for callers still importing config_service.
 APP_NAME = _config.APP_NAME
 APP_VERSION = _config.APP_VERSION
 INNO_SETUP_APP_ID = _config.INNO_SETUP_APP_ID

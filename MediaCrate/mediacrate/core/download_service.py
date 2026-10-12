@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
@@ -142,25 +142,18 @@ def _extract_expected_size_bytes(info: dict[str, object]) -> int | None:
         return None
     for key in ("filesize", "filesize_approx"):
         value = info.get(key)
-        if isinstance(value, (int, float)) and int(value) > 0:
+        if isinstance(value, (int, float)) and math.isfinite(value) and int(value) > 0:
             return int(value)
-    requested_downloads = info.get("requested_downloads")
-    if isinstance(requested_downloads, list):
-        total = 0
-        for item in requested_downloads:
-            if not isinstance(item, dict):
-                continue
-            size = item.get("filesize") or item.get("filesize_approx")
-            if isinstance(size, (int, float)) and int(size) > 0:
-                total += int(size)
-        if total > 0:
-            return total
+    for key in ("requested_downloads", "requested_formats"):
+        selected = info.get(key)
+        if isinstance(selected, list) and selected:
+            return _sum_size_from_format_items(selected, duration_seconds=_extract_duration_seconds(info))
     best_size = None
     for fmt in info.get("formats", []) if isinstance(info.get("formats"), list) else []:
         if not isinstance(fmt, dict):
             continue
         size = fmt.get("filesize") or fmt.get("filesize_approx")
-        if isinstance(size, (int, float)) and int(size) > 0:
+        if isinstance(size, (int, float)) and math.isfinite(size) and int(size) > 0:
             candidate = int(size)
             if best_size is None or candidate > best_size:
                 best_size = candidate
@@ -178,14 +171,14 @@ def _selection_size_key(format_choice: str, quality_choice: str) -> str:
 
 def _size_from_format_item(fmt: dict[str, object], *, duration_seconds: int | None) -> int | None:
     direct = fmt.get("filesize") or fmt.get("filesize_approx")
-    if isinstance(direct, (int, float)) and int(direct) > 0:
+    if isinstance(direct, (int, float)) and math.isfinite(direct) and int(direct) > 0:
         return int(direct)
     if not isinstance(duration_seconds, int) or duration_seconds <= 0:
         return None
     bitrate_kbps = None
     for key in ("tbr", "vbr", "abr"):
         raw = fmt.get(key)
-        if isinstance(raw, (int, float)) and float(raw) > 0:
+        if isinstance(raw, (int, float)) and math.isfinite(raw) and float(raw) > 0:
             candidate = float(raw)
             if bitrate_kbps is None or candidate > bitrate_kbps:
                 bitrate_kbps = candidate
@@ -210,20 +203,15 @@ def _sum_size_from_format_items(
     duration_seconds: int | None,
 ) -> int | None:
     total = 0
-    found = False
     for item in formats:
         if not isinstance(item, dict):
-            continue
-        direct = item.get("filesize") or item.get("filesize_approx")
-        if isinstance(direct, (int, float)) and int(direct) > 0:
-            total += int(direct)
-            found = True
-            continue
+            return None
         estimate = _size_from_format_item(item, duration_seconds=duration_seconds)
         if isinstance(estimate, int) and estimate > 0:
             total += int(estimate)
-            found = True
-    return total if found else None
+        else:
+            return None
+    return total if formats else None
 
 
 def _requested_format_items(info_dict: dict[str, object]) -> list[dict[str, object]]:
@@ -258,7 +246,7 @@ def _estimate_mp3_size(
     *,
     duration_seconds: int | None,
 ) -> int | None:
-    target_bitrate_kbps = 245.0  # Approximate V0 average used by --audio-quality 0
+    target_bitrate_kbps = 245.0
     target_estimate = _estimate_size_from_bitrate(duration_seconds, target_bitrate_kbps)
     if target_estimate is None:
         return _best_audio_size(formats)
@@ -683,6 +671,8 @@ def _metadata_extract_options(timeout_seconds: float | None = None) -> dict[str,
     if isinstance(timeout_seconds, (int, float)):
         clamped_timeout = max(1.0, float(timeout_seconds))
         opts["socket_timeout"] = clamped_timeout
+    opts["js_runtimes"] = _yt_dlp_js_runtime_api_options()
+    opts["remote_components"] = set()
     return opts
 
 
@@ -775,11 +765,11 @@ def _format_selector(format_choice: str, quality_choice: str) -> tuple[str, list
         return "bestaudio", post_args
     if choice == FormatChoice.MP3.value:
         post_args.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
-        return "bestaudio", post_args
+        return "bestaudio/best", post_args
     if is_audio_format_choice(choice):
         audio_codec = "vorbis" if choice == "OGG" else raw_choice.lower()
         post_args.extend(["--extract-audio", "--audio-format", audio_codec])
-        return "bestaudio", post_args
+        return "bestaudio/best", post_args
 
     if height is None:
         height_selector = ""
@@ -836,8 +826,6 @@ def _with_dynamic_extension(output_template: str) -> str:
     template = str(output_template or "").strip()
     if not template or "%(ext)s" in template:
         return template
-    # yt-dlp must see the source extension while downloading so post-processors
-    # can reliably replace it with the requested output extension.
     known_extensions = {
         "aac", "aif", "aiff", "alac", "amr", "avi", "flac", "flv",
         "m4a", "mkv", "mov", "mp2", "mp3", "mp4", "oga", "ogg",
@@ -870,9 +858,8 @@ def sanitize_filename_template(value: str) -> str:
     if not text:
         return _DEFAULT_OUTPUT_TEMPLATE
     normalized = text.replace("\\", "/")
-    if normalized.startswith("/"):
-        return _DEFAULT_OUTPUT_TEMPLATE
-    if re.match(r"^[A-Za-z]:/", normalized):
+    windows_path = PureWindowsPath(text)
+    if windows_path.drive or windows_path.root or normalized.startswith("/"):
         return _DEFAULT_OUTPUT_TEMPLATE
     segments = [segment for segment in normalized.split("/") if segment not in {"", "."}]
     if any(segment == ".." for segment in segments):
@@ -1158,16 +1145,18 @@ def _resolved_node_js_runtime_path() -> str:
 
 
 def _yt_dlp_js_runtime_cli_args() -> list[str]:
-    node_path = _resolved_node_js_runtime_path()
-    if not node_path:
-        return []
-    return ["--js-runtimes", f"node:{node_path}"]
+    runtimes = _yt_dlp_js_runtime_api_options()
+    arguments = ["--no-js-runtimes", "--no-remote-components"]
+    for name, options in runtimes.items():
+        path = options.get("path")
+        arguments.extend(["--js-runtimes", f"{name}:{path}" if path else name])
+    return arguments
 
 
 def _yt_dlp_js_runtime_api_options() -> dict[str, dict[str, str]]:
     node_path = _resolved_node_js_runtime_path()
     if not node_path:
-        return {}
+        return {"deno": {}}
     return {"node": {"path": node_path}}
 
 
@@ -1244,6 +1233,9 @@ class _InProcessPaused(RuntimeError):
     pass
 
 
+from .batch_scheduler import BatchScheduler
+
+
 class DownloadService:
     def __init__(self) -> None:
         self._active_processes: set[subprocess.Popen[str]] = set()
@@ -1259,27 +1251,27 @@ class DownloadService:
         self._active_batch_pending_jobs = 0
         self._active_batch_status_cb: StatusCallback | None = None
         self._active_batch_accepting = False
+        self._batch_scheduler: BatchScheduler | None = None
 
     def enqueue_batch_job(self, job: DownloadJob) -> bool:
         job_id = str(job.job_id or "").strip()
         if not job_id:
             return False
         with self._batch_lock:
-            jobs_queue = self._active_batch_queue
-            if (jobs_queue is None) or (not self._active_batch_accepting):
-                return False
-            self._active_batch_pending_jobs += 1
-            jobs_queue.put(job)
+            scheduler = self._batch_scheduler
             status_cb = self._active_batch_status_cb
+        if scheduler is None or not scheduler.reserve(job):
+            return False
         with self._active_lock:
             self._stopped_job_ids.discard(job_id)
             self._paused_job_ids.discard(job_id)
-        if status_cb:
-            try:
+        try:
+            if status_cb:
                 status_cb(job_id, DownloadState.QUEUED.value)
-            except Exception:
-                pass
-        self._notify_control_changed()
+        except Exception:
+            pass
+        finally:
+            scheduler.publish(job)
         return True
 
     def _notify_control_changed(self) -> None:
@@ -1764,6 +1756,8 @@ class DownloadService:
                 return _estimate_mp3_size(enriched, duration_seconds=duration_seconds)
             if selection_size is not None:
                 return int(selection_size)
+            if requested_items:
+                return None
             return _best_audio_size(enriched)
 
         if selection_size is not None:
@@ -2411,8 +2405,8 @@ class DownloadService:
         if ffmpeg_path:
             ydl_opts["ffmpeg_location"] = ffmpeg_path
         js_runtimes = _yt_dlp_js_runtime_api_options()
-        if js_runtimes:
-            ydl_opts["js_runtimes"] = js_runtimes
+        ydl_opts["js_runtimes"] = js_runtimes
+        ydl_opts["remote_components"] = set()
 
         if normalized_conflict_policy == "overwrite":
             ydl_opts["overwrites"] = True
@@ -2802,9 +2796,8 @@ class DownloadService:
 
     def _batch_wait_for_control_change(self, *, cancel_token: threading.Event) -> None:
         with self._control_condition:
-            last_seen = self._control_change_counter
-            while not cancel_token.is_set() and self._control_change_counter == last_seen:
-                self._control_condition.wait(timeout=5.0)
+            if not cancel_token.is_set():
+                self._control_condition.wait(timeout=0.1)
 
     def run_batch(
         self,
@@ -2826,6 +2819,20 @@ class DownloadService:
         if not jobs:
             return DownloadSummary(total=0, completed=0, failed=0, skipped=0, cancelled=0, retried=0, results=[])
 
+        def safe_callback(callback):
+            if callback is None:
+                return None
+            def deliver(*args):
+                try:
+                    callback(*args)
+                except Exception:
+                    pass
+            return deliver
+
+        progress_cb = safe_callback(progress_cb)
+        status_cb = safe_callback(status_cb)
+        log_cb = safe_callback(log_cb)
+
         job_ids = {str(job.job_id or "").strip() for job in jobs if str(job.job_id or "").strip()}
         with self._active_lock:
             self._stopped_job_ids.difference_update(job_ids)
@@ -2841,26 +2848,24 @@ class DownloadService:
         ordered_results_lock = threading.Lock()
         retried_attempts_counter = [0]
         retried_attempts_lock = threading.Lock()
-        stop_sentinel = object()
-        jobs_queue: queue.Queue[object] = queue.Queue()
+        scheduler = BatchScheduler(self._control_condition, cancel_token, self._resolve_interrupt_state)
+        jobs_queue = scheduler
         for job in jobs:
-            jobs_queue.put(job)
-            if status_cb:
-                status_cb(job.job_id, DownloadState.QUEUED.value)
-
+            if scheduler.reserve(job):
+                try:
+                    if status_cb:
+                        status_cb(job.job_id, DownloadState.QUEUED.value)
+                finally:
+                    scheduler.publish(job)
         with self._batch_lock:
-            self._active_batch_queue = jobs_queue
-            self._active_batch_pending_jobs = len(jobs)
+            self._batch_scheduler = scheduler
             self._active_batch_status_cb = status_cb
-            self._active_batch_accepting = True
 
         def worker_loop() -> None:
             while True:
-                current, should_stop = self._batch_take_next_item(jobs_queue, stop_sentinel=stop_sentinel)
-                if should_stop:
-                    return
+                current = scheduler.take()
                 if current is None:
-                    continue
+                    return
                 result = DownloadResult(job_id="", url="", state=DownloadState.ERROR.value)
                 count_as_complete = True
                 try:
@@ -2895,18 +2900,8 @@ class DownloadService:
                     if log_cb:
                         prefix = f"[{safe_job_id}] " if safe_job_id else ""
                         log_cb(f"{prefix}ERROR: {safe_error}")
-                finally:
-                    jobs_queue.task_done()
-                    self._batch_complete_job(
-                        count_as_complete=count_as_complete,
-                        jobs_queue=jobs_queue,
-                        stop_sentinel=stop_sentinel,
-                        max_workers=max_workers,
-                    )
-
                 if not count_as_complete:
-                    if self._resolve_interrupt_state(current.job_id, cancel_token) == DownloadState.PAUSED.value:
-                        self._batch_wait_for_control_change(cancel_token=cancel_token)
+                    scheduler.release(current, complete=False)
                     continue
 
                 self._batch_store_result(
@@ -2915,8 +2910,11 @@ class DownloadService:
                     job_id=current.job_id,
                     result=result,
                 )
-                if status_cb:
-                    status_cb(current.job_id, normalize_download_state(result.state))
+                try:
+                    if status_cb:
+                        status_cb(current.job_id, normalize_download_state(result.state))
+                finally:
+                    scheduler.release(current, complete=True)
 
         workers: list[concurrent.futures.Future[None]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2925,12 +2923,14 @@ class DownloadService:
             concurrent.futures.wait(workers)
 
         with self._batch_lock:
+            self._batch_scheduler = None
             self._active_batch_accepting = False
             self._active_batch_queue = None
             self._active_batch_pending_jobs = 0
             self._active_batch_status_cb = None
 
         with self._active_lock:
+            job_ids.update(scheduler.jobs)
             self._stopped_job_ids.difference_update(job_ids)
             self._paused_job_ids.difference_update(job_ids)
 

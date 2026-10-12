@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, QThread, Qt
 from ..core.models import BatchEntry
 from ..workers.thumbnail_worker import ThumbnailWorker
 from .thumbnail_cache import ThumbnailCache
+from .request_context import connect_request
 
 
 class ThumbnailFlowCoordinator(QObject):
@@ -43,6 +44,9 @@ class ThumbnailFlowCoordinator(QObject):
         self._single_worker: ThumbnailWorker | None = None
         self._single_pending_url = ""
         self._single_active_url = ""
+        self._generation = 0
+        self._single_generation = 0
+        self._stopped = False
 
     def set_max_workers(self, value: int) -> None:
         normalized = max(1, int(value))
@@ -59,14 +63,17 @@ class ThumbnailFlowCoordinator(QObject):
         return threads
 
     def stop_all(self, *, clear_pending: bool = True) -> None:
+        self._generation += 1
+        self._stopped = True
+        if clear_pending:
+            self._single_pending_url = ""
+            self._queue_urls.clear()
+            self._queued_urls.clear()
+            self._waiters_by_url.clear()
         for worker in list(self._workers_by_url.values()):
             worker.stop()
         if self._single_worker is not None:
             self._single_worker.stop()
-        if clear_pending:
-            self._queue_urls.clear()
-            self._queued_urls.clear()
-            self._waiters_by_url.clear()
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -93,6 +100,9 @@ class ThumbnailFlowCoordinator(QObject):
             self.schedule_entry_thumbnail(entry.entry_id)
 
     def schedule_entry_thumbnail(self, entry_id: str) -> None:
+        if getattr(self._owner, "_closing", False):
+            return
+        self._stopped = False
         key = str(entry_id or "").strip()
         if not key:
             return
@@ -115,6 +125,8 @@ class ThumbnailFlowCoordinator(QObject):
         self._pump_batch_queue()
 
     def _pump_batch_queue(self) -> None:
+        if self._stopped or getattr(self._owner, "_closing", False):
+            return
         while len(self._threads_by_url) < self._max_workers and self._queue_urls:
             url = str(self._queue_urls.popleft() or "").strip()
             self._queued_urls.discard(url)
@@ -125,11 +137,14 @@ class ThumbnailFlowCoordinator(QObject):
             worker.moveToThread(thread)
             thread.setProperty("source_url", url)
             thread.started.connect(worker.run)
-            worker.finishedSummary.connect(self._on_batch_summary, Qt.ConnectionType.QueuedConnection)
+            generation = self._generation
+            connect_request(worker.finishedSummary, self, thread, self._on_batch_summary,
+                            lambda url=url, worker=worker, generation=generation: self._workers_by_url.get(url) is worker and generation == self._generation)
             worker.finished.connect(thread.quit)
             worker.finished.connect(worker.deleteLater)
             thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(self._on_batch_thread_finished, Qt.ConnectionType.QueuedConnection)
+            connect_request(thread.finished, self, thread, lambda url=url: self._on_batch_finished(url),
+                            lambda url=url, worker=worker: self._workers_by_url.get(url) is worker)
             self._threads_by_url[url] = thread
             self._workers_by_url[url] = worker
             thread.start()
@@ -142,6 +157,8 @@ class ThumbnailFlowCoordinator(QObject):
         self._on_batch_finished(source_url)
 
     def _on_batch_summary(self, payload: object) -> None:
+        if self._stopped or getattr(self._owner, "_closing", False):
+            return
         if (not isinstance(payload, tuple)) or len(payload) != 2:
             return
         source_url = str(payload[0] or "").strip()
@@ -164,21 +181,32 @@ class ThumbnailFlowCoordinator(QObject):
         key = str(source_url or "").strip()
         self._threads_by_url.pop(key, None)
         self._workers_by_url.pop(key, None)
+        if self._waiters_by_url.get(key) and key not in self._queued_urls:
+            self._queue_urls.append(key)
+            self._queued_urls.add(key)
         self._pump_batch_queue()
 
     def schedule_single_thumbnail(self, thumbnail_url: str) -> None:
+        if getattr(self._owner, "_closing", False):
+            return
+        self._stopped = False
         target_url = str(thumbnail_url or "").strip()
+        if target_url != self._single_pending_url:
+            self._single_generation += 1
         self._single_pending_url = target_url
         if not target_url:
             self._set_single_thumbnail(None, "")
             return
         cached = self._cache.get(target_url)
         if cached is not None:
+            self._single_pending_url = ""
             self._set_single_thumbnail(cached, target_url)
             return
         self._pump_single_queue()
 
     def _pump_single_queue(self) -> None:
+        if self._stopped or getattr(self._owner, "_closing", False):
+            return
         if self._single_thread and self._single_thread.isRunning():
             return
         source_url = str(self._single_pending_url or "").strip()
@@ -188,17 +216,23 @@ class ThumbnailFlowCoordinator(QObject):
         worker = ThumbnailWorker(source_url)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_single_summary, Qt.ConnectionType.QueuedConnection)
+        generation = (self._generation, self._single_generation)
+        connect_request(worker.finishedSummary, self, thread, self._on_single_summary,
+                        lambda: self._single_worker is worker and generation == (self._generation, self._single_generation))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_single_finished, Qt.ConnectionType.QueuedConnection)
+        connect_request(thread.finished, self, thread, self._on_single_finished,
+                        lambda: self._single_worker is worker)
         self._single_active_url = source_url
+        self._single_active_generation = generation
         self._single_thread = thread
         self._single_worker = worker
         thread.start()
 
     def _on_single_summary(self, payload: object) -> None:
+        if self._stopped or getattr(self._owner, "_closing", False):
+            return
         if not isinstance(payload, tuple) or len(payload) != 2:
             return
         source_url, data = payload
@@ -215,5 +249,5 @@ class ThumbnailFlowCoordinator(QObject):
         self._single_active_url = ""
         self._single_thread = None
         self._single_worker = None
-        if self._single_pending_url and self._single_pending_url != previous:
+        if self._single_pending_url and (self._single_pending_url != previous or getattr(self, "_single_active_generation", (self._generation, self._single_generation)) != (self._generation, self._single_generation)):
             self._pump_single_queue()

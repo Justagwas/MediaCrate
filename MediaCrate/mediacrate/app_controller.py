@@ -18,6 +18,7 @@ from .core.config import (
     BACKGROUND_WORKER_THREADS_MAX,
     BACKGROUND_WORKER_THREADS_MIN,
     DEFAULT_FILENAME_TEMPLATE,
+    DONATE_PAGE_URL,
     OFFICIAL_PAGE_URL,
     config_to_dict,
     default_config,
@@ -38,6 +39,7 @@ from .controller.batch_logic import (
 )
 from .controller.download_runtime import DownloadRuntimeState
 from .controller.download_flow import DownloadFlow
+from .controller.request_context import connect_request
 from .controller.error_policy import classify_download_error, failure_hint, format_classified_error
 from .controller.history_flow import HistoryFlow
 from .controller.pause_resume_logic import (
@@ -223,6 +225,7 @@ class AppController(QObject):
             max_entries=THUMBNAIL_CACHE_MAX_ENTRIES,
             max_bytes=THUMBNAIL_CACHE_MAX_BYTES,
         )
+        self.window.set_thumbnail_cache(self._thumbnail_cache)
         self._thumbnail_flow = ThumbnailFlowCoordinator(
             owner=self,
             cache=self._thumbnail_cache,
@@ -257,6 +260,8 @@ class AppController(QObject):
         self._metadata_slow_warning_timer.setSingleShot(True)
         self._metadata_slow_warning_timer.timeout.connect(self._on_metadata_validation_slow_timeout)
         self._metadata_slow_warning_shown = False
+        self._closing = False
+        self._request_generation = 0
         self._close_shutdown_pending = False
         self._close_wait_notice_shown = False
         self._allow_close_after_shutdown = False
@@ -324,6 +329,8 @@ class AppController(QObject):
         return stages
 
     def _run_next_startup_stage(self) -> None:
+        if self._closing:
+            return
         self._startup_stage_index += 1
         if self._startup_stage_index >= len(self._startup_stage_sequence):
             self._startup_stage_sequence = []
@@ -364,6 +371,7 @@ class AppController(QObject):
         self.window.stopRequested.connect(self.stop_downloads)
         self.window.openDownloadsRequested.connect(self.open_downloads_folder)
         self.window.officialPageRequested.connect(self._open_official_page)
+        self.window.donatePageRequested.connect(self._open_donate_page)
         self.window.checkUpdatesRequested.connect(self._on_manual_update_check)
         self.window.resetSettingsRequested.connect(self._on_reset_settings_requested)
         self.window.installDependencyRequested.connect(self.install_dependency)
@@ -408,6 +416,7 @@ class AppController(QObject):
         self.window.multiStartEntryRequested.connect(self._on_multi_start_entry)
         self.window.multiPauseEntryRequested.connect(self._on_multi_pause_entry)
         self.window.multiResumeEntryRequested.connect(self._on_multi_resume_entry)
+        self.window.batchThumbnailNeeded.connect(self._thumbnail_flow.schedule_entry_thumbnail)
         self.window.multiEntryFormatChanged.connect(self._on_multi_entry_format_changed)
         self.window.multiEntryQualityChanged.connect(self._on_multi_entry_quality_changed)
         self.window.multiRemoveEntryRequested.connect(self._on_multi_remove_entry)
@@ -547,8 +556,10 @@ class AppController(QObject):
         return failure_hint(category)
 
     def _clear_batch_queue_snapshot(self) -> None:
-        state_persistence.clear_path(state_persistence.queue_snapshot_path())
-        self._batch_queue_snapshot_saved_revision = self._batch_queue_snapshot_revision
+        if state_persistence.clear_path_checked(state_persistence.queue_snapshot_path()):
+            self._batch_queue_snapshot_saved_revision = self._batch_queue_snapshot_revision
+        else:
+            self.window.append_log("Could not clear the saved queue. It will be retried on the next save.")
 
     def _mark_batch_queue_dirty(self) -> None:
         if self._batch_queue_snapshot_suspended:
@@ -590,12 +601,20 @@ class AppController(QObject):
 
     def _deserialize_restored_batch_entries(self, entries_payload: list[object]) -> list[BatchEntry]:
         restored: list[BatchEntry] = []
+        seen_ids: set[str] = set()
         for item in entries_payload:
-            entry = state_persistence.deserialize_batch_entry(
-                item,
-                dedupe_preserve=self._dedupe_preserve,
-            )
+            try:
+                entry = state_persistence.deserialize_batch_entry(
+                    item,
+                    dedupe_preserve=self._dedupe_preserve,
+                )
+            except Exception:
+                self.window.append_log("Skipped an unreadable saved queue row.")
+                continue
             if entry is not None:
+                while not entry.entry_id or entry.entry_id in seen_ids:
+                    entry.entry_id = uuid.uuid4().hex[:10]
+                seen_ids.add(entry.entry_id)
                 restored.append(entry)
         return restored
 
@@ -740,6 +759,8 @@ class AppController(QObject):
         return bool(self._stale_cleanup_thread and self._stale_cleanup_thread.isRunning())
 
     def _request_stale_part_cleanup(self, *, reason: str) -> None:
+        if getattr(self, "_closing", False):
+            return
         if self._is_download_running():
             return
         if self._stale_cleanup_hours() <= 0:
@@ -757,11 +778,11 @@ class AppController(QObject):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_stale_cleanup_summary, Qt.ConnectionType.QueuedConnection)
-        worker.errorRaised.connect(self._on_stale_cleanup_error, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.finishedSummary, self._on_stale_cleanup_summary, thread, worker, "_stale_cleanup_worker")
+        self._bind_request(worker.errorRaised, self._on_stale_cleanup_error, thread, worker, "_stale_cleanup_worker")
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_stale_cleanup_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_stale_cleanup_finished, thread, worker, "_stale_cleanup_worker", finished=True)
         thread.finished.connect(thread.deleteLater)
         self._stale_cleanup_thread = thread
         self._stale_cleanup_worker = worker
@@ -955,10 +976,10 @@ class AppController(QObject):
             worker.stop()
 
     def _stop_batch_analysis_workers(self) -> None:
-        for worker in list(self._batch_analysis_workers.values()):
-            worker.stop()
         self._batch_analysis_queue.clear()
         self._batch_analysis_queued_entry_ids.clear()
+        for worker in list(self._batch_analysis_workers.values()):
+            worker.stop()
         self._stop_metadata_slow_warning_watch_if_idle()
 
     def _stop_thumbnail_workers(self) -> None:
@@ -966,6 +987,9 @@ class AppController(QObject):
             self._thumbnail_flow.stop_all(clear_pending=True)
 
     def _stop_optional_workers(self) -> None:
+        self._stale_cleanup_pending_reason = ""
+        self._single_analysis_pending_url = ""
+        self._stop_single_selection_size_worker()
         if hasattr(self, "_update_flow"):
             self._update_flow.stop()
         if self._probe_worker:
@@ -1062,6 +1086,8 @@ class AppController(QObject):
         self._metadata_slow_warning_shown = False
 
     def _on_metadata_validation_slow_timeout(self) -> None:
+        if self._closing:
+            return
         if self._metadata_slow_warning_shown:
             return
         if not self._has_active_metadata_validation():
@@ -1112,9 +1138,6 @@ class AppController(QObject):
                 return True
         except RuntimeError:
             return True
-        # QThread.terminate() can interrupt Python while it holds locks or is
-        # updating application state. Workers use cancellation tokens and
-        # bounded subprocesses, so keep waiting for cooperative shutdown.
         return False
 
     def _force_stop_running_worker_threads(self) -> bool:
@@ -1137,7 +1160,35 @@ class AppController(QObject):
                 return False
         return True
 
+    def _bind_request(self, signal, callback, thread, worker, attribute, *, key=None, valid=None, finished=False) -> None:
+        def owned() -> bool:
+            value = getattr(self, attribute, None)
+            return (value.get(key) if key is not None and isinstance(value, dict) else value) is worker
+
+        def deliver(*args) -> None:
+            if finished and getattr(self, "_closing", False):
+                if key is None:
+                    setattr(self, attribute, None)
+                    setattr(self, attribute.replace("worker", "thread"), None)
+                else:
+                    getattr(self, attribute).pop(key, None)
+                    getattr(self, attribute.replace("workers", "threads")).pop(key, None)
+                return
+            callback(*args)
+
+        connect_request(signal, self, thread, deliver,
+                        lambda: owned() and (finished or (not getattr(self, "_closing", False)
+                                                        and (valid is None or valid()))))
+
+    def _metadata_request_policy(self) -> tuple:
+        return (getattr(self, "_metadata_policy_generation", 0), bool(self.config.disable_metadata_fetch), bool(self.config.fallback_download_on_metadata_error),
+                bool(self.config.accurate_size_enabled))
+
     def _begin_shutdown_sequence(self) -> None:
+        self._closing = True
+        self._request_generation += 1
+        self._single_analysis_pending_url = ""
+        self._pending_retry_entry_ids = []
         self._close_shutdown_started_at = monotonic()
         if bool(getattr(self, "_tutorial_active", False)):
             self._end_tutorial(completed=False)
@@ -1146,6 +1197,7 @@ class AppController(QObject):
         self._single_analysis_timer.stop()
         self._startup_stage_timer.stop()
         self._metadata_slow_warning_timer.stop()
+        self._download_ui_refresh_timer.stop()
         if hasattr(self, "_thumbnail_cache_maintenance_timer"):
             self._thumbnail_cache_maintenance_timer.stop()
         self._save_batch_queue_snapshot(force=True)
@@ -1176,7 +1228,7 @@ class AppController(QObject):
         if self._running_worker_threads() and not self._force_stop_running_worker_threads():
             return
         self._finalize_shutdown_sequence()
-        QTimer.singleShot(0, self.window.close)
+        QTimer.singleShot(0, self.window, self.window.close)
 
     def _shutdown_deadline_elapsed(self) -> bool:
         started = float(getattr(self, "_close_shutdown_started_at", 0.0) or 0.0)
@@ -1458,6 +1510,8 @@ class AppController(QObject):
         self._save_config(deferred=True)
 
     def _on_fallback_metadata_changed(self, value: bool) -> None:
+        self._metadata_policy_generation = getattr(self, "_metadata_policy_generation", 0) + 1
+        self._request_generation = getattr(self, "_request_generation", 0) + 1
         self.config.fallback_download_on_metadata_error = bool(value)
         self._save_config()
         if self._is_metadata_fallback_enabled():
@@ -1466,6 +1520,8 @@ class AppController(QObject):
         self._reconcile_disabled_metadata_fallback_entries()
 
     def _on_accurate_size_changed(self, value: bool) -> None:
+        self._metadata_policy_generation = getattr(self, "_metadata_policy_generation", 0) + 1
+        self._request_generation = getattr(self, "_request_generation", 0) + 1
         self.config.accurate_size_enabled = bool(value)
         self._save_config(deferred=True)
         if not self._is_accurate_size_enabled():
@@ -1521,6 +1577,8 @@ class AppController(QObject):
         self._save_config()
 
     def _on_metadata_fetch_disabled_changed(self, value: bool) -> None:
+        self._metadata_policy_generation = getattr(self, "_metadata_policy_generation", 0) + 1
+        self._request_generation = getattr(self, "_request_generation", 0) + 1
         self.config.disable_metadata_fetch = bool(value)
         self._save_config()
         self._apply_metadata_fetch_policy()
@@ -1649,6 +1707,12 @@ class AppController(QObject):
             BatchEntryStatus.SKIPPED.value,
             BatchEntryStatus.CANCELLED.value,
         }
+
+    def _is_metadata_result_protected(self, entry: BatchEntry) -> bool:
+        return self._is_metadata_status_protected(entry) or (
+            str(entry.status or "").strip().lower() == BatchEntryStatus.FAILED.value
+            and entry.attempts > 0
+        )
 
     def _entry_has_enriched_metadata(self, entry: BatchEntry | None) -> bool:
         if entry is None:
@@ -1836,6 +1900,8 @@ class AppController(QObject):
         self._schedule_thumbnails_for_entries(entries)
 
     def _run_thumbnail_cache_maintenance(self) -> None:
+        if self._closing:
+            return
         self._thumbnail_flow.maintenance_tick(ttl_seconds=THUMBNAIL_CACHE_ENTRY_TTL_SECONDS)
 
     def _get_batch_entry_for_thumbnail(self, entry_id: str) -> BatchEntry | None:
@@ -1882,12 +1948,12 @@ class AppController(QObject):
         return normalized_format, normalized_quality
 
     def _stop_single_selection_size_worker(self) -> None:
-        if self._single_selection_size_worker is not None:
-            self._single_selection_size_worker.stop()
         self._single_selection_size_pending = None
         self._single_selection_size_queued = None
         self._batch_selection_size_queue.clear()
         self._batch_selection_size_queued.clear()
+        if self._single_selection_size_worker is not None:
+            self._single_selection_size_worker.stop()
 
     def _cached_single_selection_size_value(
         self,
@@ -1919,6 +1985,10 @@ class AppController(QObject):
         format_choice: str,
         quality_choice: str,
     ) -> None:
+        if getattr(self, "_closing", False):
+            return
+        generation = getattr(self, "_request_generation", 0)
+        policy = self._metadata_request_policy()
         thread = QThread(self)
         worker = SelectionSizeWorker(
             self.download_service,
@@ -1929,10 +1999,10 @@ class AppController(QObject):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_single_selection_size_summary, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.finishedSummary, self._on_single_selection_size_summary, thread, worker, "_single_selection_size_worker", valid=lambda: generation == getattr(self, "_request_generation", 0) and policy == self._metadata_request_policy())
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_single_selection_size_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_single_selection_size_finished, thread, worker, "_single_selection_size_worker", finished=True)
         thread.finished.connect(thread.deleteLater)
         self._single_selection_size_thread = thread
         self._single_selection_size_worker = worker
@@ -2685,6 +2755,8 @@ class AppController(QObject):
         return waiting
 
     def _start_batch_entry_analysis(self, entry_id: str, url: str) -> None:
+        if getattr(self, "_closing", False):
+            return
         key = str(entry_id or "").strip()
         target_url = str(url or "").strip()
         if (not key) or (not target_url):
@@ -2703,6 +2775,8 @@ class AppController(QObject):
         self._pump_batch_analysis_queue()
 
     def _pump_batch_analysis_queue(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         if self._is_metadata_fetch_disabled():
             self._batch_analysis_queue.clear()
             self._batch_analysis_queued_entry_ids.clear()
@@ -2723,15 +2797,21 @@ class AppController(QObject):
                 url,
                 timeout_seconds=self._metadata_fetch_timeout_seconds(),
             )
+            entry_context = self._batch_entries_by_id[entry_id]
+            policy = self._metadata_request_policy()
             worker.moveToThread(thread)
             thread.setProperty("entry_id", entry_id)
             thread.started.connect(worker.run)
-            worker.finishedSummary.connect(self._on_batch_analysis_summary, Qt.ConnectionType.QueuedConnection)
-            worker.errorRaised.connect(self._on_batch_analysis_error, Qt.ConnectionType.QueuedConnection)
+            self._bind_request(worker.finishedSummary, self._on_batch_analysis_summary, thread, worker, "_batch_analysis_workers", key=entry_id, valid=lambda entry_id=entry_id, entry_context=entry_context, url=url, policy=policy: self._batch_entries_by_id.get(entry_id) is entry_context and normalize_batch_url(entry_context.url_raw) == normalize_batch_url(url) and policy == self._metadata_request_policy())
+            self._bind_request(worker.errorRaised, self._on_batch_analysis_error, thread, worker, "_batch_analysis_workers", key=entry_id, valid=lambda entry_id=entry_id, entry_context=entry_context, url=url, policy=policy: self._batch_entries_by_id.get(entry_id) is entry_context and normalize_batch_url(entry_context.url_raw) == normalize_batch_url(url) and policy == self._metadata_request_policy())
             worker.finished.connect(thread.quit)
             worker.finished.connect(worker.deleteLater)
             thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(self._on_batch_analysis_thread_finished, Qt.ConnectionType.QueuedConnection)
+            self._bind_request(
+                thread.finished,
+                lambda entry_id=entry_id, policy=policy: self._on_batch_analysis_finished(entry_id, request_policy=policy),
+                thread, worker, "_batch_analysis_workers", key=entry_id, finished=True,
+            )
             self._batch_analysis_threads[entry_id] = thread
             self._batch_analysis_workers[entry_id] = worker
             thread.start()
@@ -2744,7 +2824,9 @@ class AppController(QObject):
         entry.url_normalized = str(result.url_normalized or entry.url_normalized)
         entry.title = str(result.title or "")
         entry.thumbnail_url = str(result.thumbnail_url or "")
-        entry.expected_size_bytes = result.expected_size_bytes
+        protected = self._is_metadata_result_protected(entry)
+        if not protected:
+            entry.expected_size_bytes = result.expected_size_bytes
         entry.available_formats = self._dedupe_preserve(
             result.formats or entry.available_formats or list(_DEFAULT_FORMAT_CHOICES)
         )
@@ -2752,6 +2834,8 @@ class AppController(QObject):
         if "BEST QUALITY" not in entry.available_qualities:
             entry.available_qualities.insert(0, "BEST QUALITY")
 
+        if protected:
+            return
         if result.is_valid and not result.error:
             entry.status = BatchEntryStatus.VALID.value
             entry.error = ""
@@ -2764,6 +2848,8 @@ class AppController(QObject):
                 entry.error = reason
 
     def _sync_entry_choices_after_analysis(self, entry: BatchEntry) -> None:
+        if self._is_metadata_result_protected(entry):
+            return
         if entry.format_choice not in entry.available_formats:
             entry.format_choice = "VIDEO" if "VIDEO" in entry.available_formats else entry.available_formats[0]
         if is_audio_format_choice(entry.format_choice):
@@ -2818,6 +2904,8 @@ class AppController(QObject):
         entry = self._batch_entries_by_id.get(key)
         if entry is None:
             return
+        if self._is_metadata_result_protected(entry):
+            return
         reason = str(error or "Analysis failed").strip()
         if entry.syntax_valid and self._is_metadata_fallback_enabled():
             self._apply_metadata_failure_fallback_to_entry(entry, reason=reason)
@@ -2843,11 +2931,22 @@ class AppController(QObject):
             self._update_batch_stats_header()
         self._mark_batch_queue_dirty()
 
-    def _on_batch_analysis_finished(self, entry_id: str) -> None:
+    def _on_batch_analysis_finished(self, entry_id: str, *, request_policy: tuple | None = None) -> None:
         key = str(entry_id or "").strip()
         self._batch_analysis_threads.pop(key, None)
         self._batch_analysis_workers.pop(key, None)
         self._stop_metadata_slow_warning_watch_if_idle()
+        if request_policy is not None and request_policy != self._metadata_request_policy():
+            entry = self._batch_entries_by_id.get(key)
+            if (
+                not getattr(self, "_closing", False)
+                and not self._is_metadata_fetch_disabled()
+                and entry is not None
+                and entry.syntax_valid
+                and entry.status == BatchEntryStatus.VALIDATING.value
+            ):
+                self._start_batch_entry_analysis(key, entry.url_raw)
+                return
         self._pump_batch_analysis_queue()
 
     def _on_batch_analysis_thread_finished(self) -> None:
@@ -3414,16 +3513,18 @@ class AppController(QObject):
         )
 
     def _connect_download_worker(self, *, thread: QThread, worker: DownloadWorker) -> None:
+        if getattr(self, "_closing", False):
+            return
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progressChanged.connect(self._on_download_progress, Qt.ConnectionType.QueuedConnection)
-        worker.statusChanged.connect(self._on_download_status, Qt.ConnectionType.QueuedConnection)
-        worker.logChanged.connect(self._on_download_log, Qt.ConnectionType.QueuedConnection)
-        worker.errorRaised.connect(self._on_worker_error, Qt.ConnectionType.QueuedConnection)
-        worker.finishedSummary.connect(self._on_download_summary, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.progressChanged, self._on_download_progress, thread, worker, "_download_worker")
+        self._bind_request(worker.statusChanged, self._on_download_status, thread, worker, "_download_worker")
+        self._bind_request(worker.logChanged, self._on_download_log, thread, worker, "_download_worker")
+        self._bind_request(worker.errorRaised, self._on_worker_error, thread, worker, "_download_worker")
+        self._bind_request(worker.finishedSummary, self._on_download_summary, thread, worker, "_download_worker")
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_download_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_download_finished, thread, worker, "_download_worker", finished=True)
         thread.finished.connect(thread.deleteLater)
 
     def _start_download_worker(
@@ -3433,8 +3534,9 @@ class AppController(QObject):
         payload: dict[str, object],
         job_to_entry: dict[str, str] | None = None,
     ) -> None:
-        if not jobs:
+        if getattr(self, "_closing", False) or not jobs:
             return
+        self._download_stop_requested = False
         self._initialize_download_runtime(jobs=jobs, payload=payload, job_to_entry=job_to_entry)
         effective_concurrency, speed_limit_kbps = self._resolve_download_worker_runtime_settings(
             payload=payload,
@@ -3455,6 +3557,9 @@ class AppController(QObject):
 
     def _open_official_page(self) -> None:
         webbrowser.open(OFFICIAL_PAGE_URL)
+
+    def _open_donate_page(self) -> None:
+        self._open_external_url(DONATE_PAGE_URL)
 
     def _on_manual_update_check(self) -> None:
         self.start_update_check(manual=True)
@@ -3590,6 +3695,8 @@ class AppController(QObject):
         self._apply_single_ready_state_from_result(first_url, cached)
 
     def _apply_single_analysis_result(self, url: str, result: UrlAnalysisResult) -> None:
+        if self._is_download_running():
+            return
         current_url = self._first_url_from_input()
         if current_url != url:
             return
@@ -3670,6 +3777,10 @@ class AppController(QObject):
         )
 
     def _start_single_analysis_worker(self, url: str) -> None:
+        if getattr(self, "_closing", False):
+            return
+        generation = getattr(self, "_request_generation", 0)
+        policy = self._metadata_request_policy()
         thread = QThread(self)
         worker = SingleAnalyzeWorker(
             self.download_service,
@@ -3678,13 +3789,14 @@ class AppController(QObject):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_single_analysis_summary, Qt.ConnectionType.QueuedConnection)
-        worker.errorRaised.connect(self._on_single_analysis_error, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.finishedSummary, self._on_single_analysis_summary, thread, worker, "_single_analysis_worker", valid=lambda: generation == getattr(self, "_request_generation", 0) and policy == self._metadata_request_policy() and normalize_batch_url(url) == normalize_batch_url(self._first_url_from_input()))
+        self._bind_request(worker.errorRaised, self._on_single_analysis_error, thread, worker, "_single_analysis_worker", valid=lambda: generation == getattr(self, "_request_generation", 0) and policy == self._metadata_request_policy() and normalize_batch_url(url) == normalize_batch_url(self._first_url_from_input()))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_single_analysis_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_single_analysis_finished, thread, worker, "_single_analysis_worker", finished=True)
         self._single_analysis_active_url = url
+        self._single_analysis_active_generation = generation
         self._single_analysis_thread = thread
         self._single_analysis_worker = worker
         thread.start()
@@ -3716,6 +3828,8 @@ class AppController(QObject):
             self._single_analysis_cache.pop(oldest_key, None)
 
     def _kick_single_url_analysis(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         if self._is_download_running():
             return
         if bool(self.window.download_payload().get("batch_enabled")):
@@ -3770,7 +3884,7 @@ class AppController(QObject):
         self._single_analysis_worker = None
         self._stop_metadata_slow_warning_watch_if_idle()
         pending = str(self._single_analysis_pending_url or "").strip()
-        if pending and pending != finished_url:
+        if pending and (pending != finished_url or getattr(self, "_single_analysis_active_generation", 0) != getattr(self, "_request_generation", 0)):
             self._single_analysis_timer.stop()
             self._single_analysis_timer.start()
             return
@@ -3828,6 +3942,7 @@ class AppController(QObject):
         self._set_single_analysis_idle_state()
 
     def _on_url_text_changed(self, _text: str) -> None:
+        self._request_generation = getattr(self, "_request_generation", 0) + 1
         if bool(self.window.download_payload().get("batch_enabled")):
             return
         self._reset_single_visuals_for_new_completed_url()
@@ -3914,6 +4029,8 @@ class AppController(QObject):
         return min(clamped, max(1, int(job_count)))
 
     def start_downloads(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         if self._is_download_running():
             return
         payload = self.window.download_payload()
@@ -3940,6 +4057,8 @@ class AppController(QObject):
         self._start_download_worker(jobs, payload=payload, job_to_entry={})
 
     def stop_downloads(self) -> None:
+        self._download_stop_requested = True
+        self._pending_retry_entry_ids = []
         if self._download_worker:
             self._download_worker.stop()
         self.download_service.cancel_all()
@@ -4053,6 +4172,8 @@ class AppController(QObject):
 
     def _collect_retry_entries(self) -> list[BatchEntry]:
         retry_entries: list[BatchEntry] = []
+        if getattr(self, "_download_stop_requested", False):
+            return retry_entries
         if not self._pending_retry_entry_ids:
             return retry_entries
         for entry_id in self._pending_retry_entry_ids:
@@ -4123,6 +4244,10 @@ class AppController(QObject):
         url: str,
         show_errors: bool,
     ) -> None:
+        if getattr(self, "_closing", False):
+            return
+        generation = getattr(self, "_request_generation", 0)
+        policy = self._metadata_request_policy()
         thread = QThread(self)
         worker = ProbeWorker(
             self.download_service,
@@ -4133,10 +4258,10 @@ class AppController(QObject):
         self._probe_pending_show_errors = bool(show_errors)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_probe_summary, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.finishedSummary, self._on_probe_summary, thread, worker, "_probe_worker", valid=lambda: generation == getattr(self, "_request_generation", 0) and policy == self._metadata_request_policy() and normalize_batch_url(url) == normalize_batch_url(self._first_url_from_input()))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_probe_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_probe_finished, thread, worker, "_probe_worker", finished=True)
         thread.finished.connect(thread.deleteLater)
         self._probe_thread = thread
         self._probe_worker = worker
@@ -4191,9 +4316,8 @@ class AppController(QObject):
         self._probe_pending_show_errors = False
 
     def _refresh_dependency_status(self) -> None:
-        # Keep the worker owned until its queued thread-finished callback has
-        # cleared it. Replacing a just-finished thread here could let the older
-        # callback erase the references to the newer, still-running check.
+        if getattr(self, "_closing", False):
+            return
         if self._dependency_status_thread is not None:
             return
         self.window.set_dependency_status_checking("ffmpeg", True)
@@ -4202,11 +4326,11 @@ class AppController(QObject):
         worker = DependencyStatusWorker()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finishedSummary.connect(self._on_dependency_status_summary, Qt.ConnectionType.QueuedConnection)
-        worker.errorRaised.connect(self._on_dependency_status_error, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.finishedSummary, self._on_dependency_status_summary, thread, worker, "_dependency_status_worker")
+        self._bind_request(worker.errorRaised, self._on_dependency_status_error, thread, worker, "_dependency_status_worker")
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_dependency_status_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, self._on_dependency_status_finished, thread, worker, "_dependency_status_worker", finished=True)
         thread.finished.connect(thread.deleteLater)
         self._dependency_status_thread = thread
         self._dependency_status_worker = worker
@@ -4226,8 +4350,6 @@ class AppController(QObject):
         detail = str(error or "").strip()
         if detail:
             self.window.append_log(f"Dependency status check failed: {detail}")
-        # The check could not confirm either runtime. Present installation as a
-        # recovery option instead of leaving the settings controls disabled.
         self.window.set_dependency_state("ffmpeg", False, "")
         self.window.set_dependency_state("node", False, "")
 
@@ -4248,20 +4370,22 @@ class AppController(QObject):
         self.window.append_log(f"Installing {dependency_name}...")
 
     def _start_dependency_install_worker(self, dependency_name: str) -> tuple[QThread, DependencyWorker]:
+        if getattr(self, "_closing", False):
+            return
         thread = QThread(self)
         worker = DependencyWorker(self.dependency_service, dependency_name)
         thread.setProperty("dependency_name", dependency_name)
         worker.setProperty("dependency_name", dependency_name)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progressChanged.connect(self._on_dependency_progress, Qt.ConnectionType.QueuedConnection)
-        worker.statusChanged.connect(self._on_dependency_status, Qt.ConnectionType.QueuedConnection)
-        worker.logChanged.connect(self._on_dependency_worker_log, Qt.ConnectionType.QueuedConnection)
-        worker.errorRaised.connect(self._on_dependency_error, Qt.ConnectionType.QueuedConnection)
-        worker.finishedSummary.connect(self._on_dependency_install_summary, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(worker.progressChanged, self._on_dependency_progress, thread, worker, "_dependency_workers", key=dependency_name)
+        self._bind_request(worker.statusChanged, self._on_dependency_status, thread, worker, "_dependency_workers", key=dependency_name)
+        self._bind_request(worker.logChanged, lambda message, dependency_name=dependency_name: self._on_dependency_log(dependency_name, message), thread, worker, "_dependency_workers", key=dependency_name)
+        self._bind_request(worker.errorRaised, self._on_dependency_error, thread, worker, "_dependency_workers", key=dependency_name)
+        self._bind_request(worker.finishedSummary, self._on_dependency_install_summary, thread, worker, "_dependency_workers", key=dependency_name)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_dependency_thread_finished, Qt.ConnectionType.QueuedConnection)
+        self._bind_request(thread.finished, lambda dependency_name=dependency_name: self._on_dependency_finished(dependency_name), thread, worker, "_dependency_workers", key=dependency_name, finished=True)
         thread.finished.connect(thread.deleteLater)
         self._dependency_threads[dependency_name] = thread
         self._dependency_workers[dependency_name] = worker
@@ -4269,6 +4393,8 @@ class AppController(QObject):
         return thread, worker
 
     def install_dependency(self, name: str) -> None:
+        if getattr(self, "_closing", False):
+            return
         normalized = str(name or "").strip().lower()
         if normalized not in {"ffmpeg", "node"}:
             return
@@ -4322,11 +4448,58 @@ class AppController(QObject):
         if installed:
             path = str(payload.get("path") or "").strip()
             self.window.set_dependency_state(dependency_name, True, path)
+            if dependency_name == "node":
+                self._invalidate_metadata_runtime()
             return
-        # Installation is transactional, so a failure may have restored a
-        # previously valid runtime. Re-detect it rather than trusting a generic
-        # failure payload that cannot describe the rollback result.
         self._refresh_dependency_status()
+
+    def _invalidate_metadata_runtime(self) -> None:
+        from .core.node_runtime import clear_node_version_cache
+
+        clear_node_version_cache()
+        self._metadata_policy_generation = getattr(self, "_metadata_policy_generation", 0) + 1
+        self._request_generation = getattr(self, "_request_generation", 0) + 1
+        for name in ("_single_analysis_cache", "_single_selection_size_cache",
+                     "_single_selection_size_failed", "_single_selection_size_failed_at",
+                     "_single_selection_size_url_order"):
+            cache = getattr(self, name, None)
+            if cache is not None:
+                cache.clear()
+        if getattr(self, "_closing", False):
+            return
+        self._stop_single_selection_size_worker()
+        if self._probe_worker is not None:
+            self._probe_worker.stop()
+        self._last_probe_url = ""
+        if self._is_metadata_fetch_disabled():
+            return
+        pending = []
+        for entry in self._ordered_batch_entries():
+            if not entry.syntax_valid or self._is_metadata_result_protected(entry):
+                continue
+            self._batch_analysis_result_by_entry_id.pop(entry.entry_id, None)
+            entry.status = BatchEntryStatus.VALIDATING.value
+            entry.error = ""
+            entry.expected_size_bytes = None
+            pending.append(entry)
+        primary_urls = {normalize_batch_url(entry.url_normalized or entry.url_raw)
+                        for entry in pending if not entry.is_duplicate}
+        duplicate_urls = set()
+        for entry in pending:
+            normalized = normalize_batch_url(entry.url_normalized or entry.url_raw)
+            if entry.is_duplicate:
+                if normalized in primary_urls or normalized in duplicate_urls:
+                    continue
+                duplicate_urls.add(normalized)
+            self._start_batch_entry_analysis(entry.entry_id, entry.url_raw)
+        if pending:
+            self._refresh_batch_entries_view()
+            self._update_batch_stats_header()
+            self._mark_batch_queue_dirty()
+        if self._download_thread is None:
+            self._single_analysis_pending_url = self._first_url_from_input()
+            if self._single_analysis_pending_url:
+                self._single_analysis_timer.start()
 
     def _on_dependency_finished(self, dependency_name: str) -> None:
         normalized = str(dependency_name or "").strip().lower()
@@ -4356,7 +4529,7 @@ class AppController(QObject):
 
     def _request_restart_after_update(self) -> None:
         self.window.append_log("Installer started. MediaCrate will now close and complete the update...")
-        QTimer.singleShot(150, self.window.close)
+        QTimer.singleShot(150, self.window, self.window.close)
 
     @staticmethod
     def _open_external_url(url: str) -> bool:

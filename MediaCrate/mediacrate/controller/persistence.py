@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import uuid
 from pathlib import Path
@@ -27,10 +28,15 @@ def history_path() -> Path:
 
 
 def clear_path(path: Path) -> None:
+    clear_path_checked(path)
+
+
+def clear_path_checked(path: Path) -> bool:
     try:
         path.unlink(missing_ok=True)
+        return True
     except OSError:
-        return
+        return False
 
 
 def read_json(path: Path) -> object | None:
@@ -105,26 +111,31 @@ def deserialize_batch_entry(
     try:
         expected_size = payload.get("expected_size_bytes")
         expected_size_int = int(expected_size) if expected_size is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        expected_size_int = None
+    if expected_size_int is not None and expected_size_int <= 0:
         expected_size_int = None
 
     try:
         attempts = max(0, int(payload.get("attempts", 0)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         attempts = 0
     try:
-        progress = max(0.0, min(100.0, float(payload.get("progress_percent", 0.0))))
-    except (TypeError, ValueError):
+        progress = float(payload.get("progress_percent", 0.0))
+        progress = max(0.0, min(100.0, progress)) if math.isfinite(progress) else 0.0
+    except (TypeError, ValueError, OverflowError):
         progress = 0.0
 
+    raw_formats = payload.get("available_formats")
+    raw_qualities = payload.get("available_qualities")
     available_formats = dedupe_preserve(
-        [str(item or "").strip().upper() for item in payload.get("available_formats", []) if str(item or "").strip()]
-    )
+        [item.strip().upper() for item in raw_formats if isinstance(item, str) and item.strip()]
+    ) if isinstance(raw_formats, list) else []
     if not available_formats:
         available_formats = list(DEFAULT_FORMAT_CHOICES)
     available_qualities = dedupe_preserve(
-        [str(item or "").strip().upper() for item in payload.get("available_qualities", []) if str(item or "").strip()]
-    )
+        [item.strip().upper() for item in raw_qualities if isinstance(item, str) and item.strip()]
+    ) if isinstance(raw_qualities, list) else []
     if not available_qualities:
         available_qualities = list(DEFAULT_QUALITY_CHOICES)
     if "BEST QUALITY" not in available_qualities:

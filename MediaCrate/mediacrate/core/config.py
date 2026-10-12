@@ -7,10 +7,11 @@ from pathlib import Path
 from .models import AppConfig, RetryProfile
 
 APP_NAME = "MediaCrate"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 INNO_SETUP_APP_ID = "MediaCrateJustagwas"
 PROJECT_BASE_URL = "https://www.justagwas.com/projects/mediacrate"
 OFFICIAL_PAGE_URL = PROJECT_BASE_URL
+DONATE_PAGE_URL = "https://www.justagwas.com/donate"
 UPDATE_MANIFEST_URL = f"{PROJECT_BASE_URL}/latest.json"
 DEFAULT_DOWNLOAD_URL = f"{PROJECT_BASE_URL}/download"
 DEFAULT_SETUP_UPDATE_URL = "https://downloads.justagwas.com/mediacrate/MediaCrateSetup.exe"
@@ -52,7 +53,7 @@ def _paths():
 def _coerce_int(value: object, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         parsed = default
     return max(minimum, min(maximum, parsed))
 

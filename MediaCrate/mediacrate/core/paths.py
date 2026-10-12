@@ -94,9 +94,14 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
 
 
 def resolve_binary(binary_name: str) -> str | None:
+    from .dependency_transaction import managed_binary_available
     names = _binary_name_candidates(binary_name)
-    search_dirs = _unique_paths([runtime_storage_dir(), app_dir(), appdata_dir()])
+    managed_root = runtime_storage_dir().resolve()
+    managed_available = managed_binary_available(managed_root, binary_name)
+    search_dirs = _unique_paths([managed_root, app_dir(), appdata_dir()])
     for base in search_dirs:
+        if base == managed_root and not managed_available:
+            continue
         for name in names:
             candidate = base / name
             if candidate.is_file():
@@ -105,5 +110,8 @@ def resolve_binary(binary_name: str) -> str | None:
     for name in names:
         candidate = shutil.which(name)
         if candidate:
-            return str(Path(candidate).resolve())
+            resolved = Path(candidate).resolve()
+            if resolved.parent == managed_root and not managed_available:
+                continue
+            return str(resolved)
     return None

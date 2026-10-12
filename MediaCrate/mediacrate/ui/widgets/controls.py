@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QProxyStyle,
     QSizePolicy,
     QStyle,
+    QStyleFactory,
     QStyleOptionButton,
     QStyleOptionComboBox,
     QStyleOptionSlider,
@@ -17,6 +18,12 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QWidget,
 )
+
+def _independent_base_style():
+    app = QApplication.instance()
+    key = app.style().objectName() if app is not None else "Fusion"
+    return QStyleFactory.create(key) or QStyleFactory.create("Fusion")
+
 
 class ComboPopupDelegate(QStyledItemDelegate):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -120,7 +127,7 @@ class ChevronComboBox(QComboBox):
         self._arrow_idle = QColor(palette.color(QPalette.Mid))
         self._arrow_active = QColor(palette.color(QPalette.Text))
         self._popup_delegate = ComboPopupDelegate(self)
-        popup_view = QListView(self)
+        popup_view = self.view()
         popup_view.setUniformItemSizes(True)
         popup_view.setAutoScroll(False)
         popup_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -129,7 +136,6 @@ class ChevronComboBox(QComboBox):
         popup_view.setTextElideMode(Qt.TextElideMode.ElideRight)
         popup_view.setItemDelegate(self._popup_delegate)
         popup_view.viewport().setAutoFillBackground(True)
-        self.setView(popup_view)
         self._popup_horizontal_scroll_enabled = False
 
     def is_popup_visible(self) -> bool:
@@ -234,7 +240,7 @@ class ChevronComboBox(QComboBox):
         super().showPopup()
         if popup_view is not None and self._popup_horizontal_scroll_enabled:
             self._enforce_popup_width_lock(popup_view)
-            QTimer.singleShot(0, lambda view=popup_view: self._enforce_popup_width_lock(view))
+            QTimer.singleShot(0, self, lambda view=popup_view: self._enforce_popup_width_lock(view))
 
     def _enforce_popup_width_lock(self, popup_view: QListView) -> None:
         target_width = max(1, int(self.width()))
@@ -273,7 +279,8 @@ class RoundHandleSliderStyle(QProxyStyle):
         groove_height: int = 6,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent.style() if parent is not None else None)
+        super().__init__(_independent_base_style())
+        self.setParent(parent)
         self._handle_color = QColor(handle_color)
         self._border_color = QColor(border_color)
         self._groove_color = QColor(groove_color)
@@ -399,7 +406,8 @@ class SquareCheckBoxStyle(QProxyStyle):
         radius: int = 4,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent.style() if parent is not None else None)
+        super().__init__(_independent_base_style())
+        self.setParent(parent)
         self._border_color = QColor(border_color)
         self._fill_color = QColor(fill_color)
         self._check_color = QColor(check_color)
