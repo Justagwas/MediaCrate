@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Code: GitHub](https://img.shields.io/badge/Code-GitHub-111827.svg?style=flat&logo=github&logoColor=white)](https://github.com/Justagwas/MediaCrate)
-[![Website](https://img.shields.io/badge/Website-MediaCrate-0ea5e9.svg?style=flat&logo=google-chrome&logoColor=white)](https://Justagwas.com/projects/mediacrate)
+[![Website](https://img.shields.io/badge/Website-MediaCrate-0ea5e9.svg?style=flat&logo=google-chrome&logoColor=white)](https://www.justagwas.com/projects/mediacrate/)
 [![Mirror: SourceForge](https://img.shields.io/badge/Mirror-SourceForge-ff6600.svg?style=flat&logo=sourceforge&logoColor=white)](https://sourceforge.net/projects/mediacrate/)
 
 </div>
@@ -23,9 +23,9 @@
 
 </div>
 
-<p align="center"><b>The all-in-one multimedia downloader application</b></p>
+<p align="center"><b>Video and Audio Downloader for Windows</b></p>
 
-<p align="center">Paste a link, select your preferred format and quality, queue 100+ downloads with pause/resume/retry support, and manage it all in one place</p>
+<p align="center">Save video or audio from a link, or manage several downloads in a queue.</p>
 
 <div align="center">
 
@@ -40,65 +40,68 @@
 
 ## Overview
 
-MediaCrate is a Windows application for saving video or audio from supported websites. Paste one link for a quick download or prepare an organized queue when you have several items to collect.
+Paste a link from a [supported website](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md) and choose video or audio in the format you need. MediaCrate shows the title, thumbnail, available quality choices and estimated file size when the source provides them, so you can review the result before downloading.
 
-Helpful previews show the title, thumbnail, available formats, quality choices, and estimated size when the website provides them. Each download keeps its own progress and controls, so it is always clear what is happening and where the finished file will go.
-
-MediaCrate's performance:  
-~0% CPU usage while idle  
-~1% CPU usage during active use  
-~60 MB memory usage      
-  
-Download speed depends on the internet connection and the website providing the media.  
-
-[View the current supported site list](https://github.com/Justagwas/MediaCrate/blob/main/MediaCrate/supportedsites.md).
-
-## Basic usage
-
-1. Download and install from the [latest release](https://github.com/Justagwas/MediaCrate/releases/latest/download/MediaCrateSetup.exe).
-2. Launch MediaCrate.
-3. Paste a media link into the input field.
-4. Choose video or audio, then select the preferred format and quality.
-5. Select **Download** for one link, or switch to **Multi URL** to prepare a queue.
-6. Follow the progress, pause or retry when needed, and let MediaCrate finish the file.
-7. Open completed files or their folders from **History**.
-
-Default output folder: `%USERPROFILE%\Downloads\MediaCrate`.
+Have several links to save? Add them to a queue, choose settings for each item, and control how many downloads run at once. Pause or retry individual items, then open the finished files from History.
 
 ## Features
 
-- A focused mode for one link and a managed queue for many.
-- Helpful previews with titles, thumbnails, formats, quality choices, and size estimates.
-- Video downloads and a range of audio only formats.
-- Bulk paste, text file import and export, search, and status filters.
-- Pause, resume, stop, retry, remove, and start all controls.
-- Adjustable download speed and control over how many items run together.
-- Clear choices when a file with the same name already exists.
-- Local queue restoration and download history.
-- A guided tutorial available inside the application.
+- **Output choices:** MP4 video and audio formats such as MP3, WAV and FLAC, with video quality limits.
+- **Size and media previews:** Titles, thumbnails, available formats and estimated sizes before downloading.
+- **Batch downloads:** Bulk paste, URL-list import and export, queue search and status filters.
+- **Download controls:** Pause, resume, stop and retry, with per-download speed limits and adjustable simultaneous downloads.
+- **Saved-file choices:** Naming templates, output folders, existing-file options and optional metadata in supported media files.
+- **History and queue recovery:** Access to completed files and a prompt to restore a saved queue.
+- **Standalone option:** An executable that runs without installation, alongside the regular Windows installer.
+- **Built-in tutorial:** A guided introduction to the application's controls.
+
+## Basic usage
+
+1. Get the [Windows installer or standalone app](https://www.justagwas.com/projects/mediacrate/). Choose the installer for a normal setup, or standalone to run without installing.
+2. Launch MediaCrate and paste a public media link.
+3. Review the preview and size estimate when available. Choose the output format and, for video, a quality limit.
+4. Select **Download**. If a required component is missing, install it from **Settings > Dependencies**, then retry.
+5. Wait for the download and any final processing to finish.
+6. Open the finished file or its folder from **Settings > History**.
+
+For several links, select **Multi-URL** under **Settings > Input mode**, add your links using **Bulk paste** or **Import**, and choose **Download all**.
+
+Default output folder: `%USERPROFILE%\Downloads\MediaCrate`.
 
 ## Using MediaCrate
 
 ### One link or a complete queue
 
-Use **Single URL** when you want one item with as little setup as possible. Use **Multi URL** to paste or import several links, give each item its own format and quality, and manage the collection from one screen.
+Use **Single-URL** for one item. Use **Multi-URL** to paste or import several links, give each item its own format and quality, and manage the queue from one screen. Each link requests one media item; adding a playlist link does not automatically import its tracks.
 
-MediaCrate remembers the queue between sessions. An interrupted item is not restarted without your knowledge, so you can review it before continuing.
+MediaCrate saves the queue locally and asks whether to restore it on the next launch. Restoring the queue does not restore a running transfer. If **Automatically start analyzed batch rows** is enabled, restored rows that need fresh analysis can start downloading when they become ready. Turn this option off before closing MediaCrate if you want to review them first.
 
 ### Clear choices before downloading
 
-When a preview is available, MediaCrate shows the useful details before the transfer begins. Choose the result you want, decide what should happen if the file already exists, and set speed or queue limits when necessary.
+Choose a format to suit how you will use the file: MP4 for video, for example, or MP3, WAV or FLAC for audio. You can also choose the filename and save folder, and decide whether to skip, number or overwrite an existing file.
 
-If a selected format needs an additional media component, MediaCrate can guide you through installing it from **Settings**.
+The format determines the file type; video quality sets a maximum resolution, not a promise to improve the source. **Best quality** removes that limit. Size estimates depend on the information supplied by the website. **Prefer accurate file sizes** performs additional analysis when possible; the final file size can still differ after conversion.
+
+FFmpeg is required for merging or converting media, including MP4 and MP3 outputs. Some websites also need Node.js. Install missing components from **Settings > Dependencies**. The Windows app includes its Python runtime, so you do not need to install Python to use an official release.
+
+### Metadata and download controls
+
+Metadata means details such as a title or artist stored with the media. In v2.5.0, the setting labelled **Save metadata as .info.json** embeds available metadata in supported media files using FFmpeg; it does not create a separate JSON file. It is off by default.
+
+**Batch concurrency** controls how many downloads run together. **Preview workers** separately controls how many links can be analyzed at once. Adjust these and the per-download speed limit to suit your connection and computer. More simultaneous downloads do not guarantee faster results; the source website and your connection still affect transfer speed.
 
 ### A finished file you can find
 
-MediaCrate brings video and audio together or converts the result when required, then saves it under a clear name. The local history can open the file, reveal its folder, or return the original link to the current workflow.
+The transfer can finish before the file is ready: MediaCrate may still be joining video and audio or converting the output. Wait for completion, then use History to open the file, reveal its folder, or retry the original link.
+
+### Installer, standalone and local data
+
+The standalone executable runs without installation. Both editions include Python and can install missing FFmpeg or Node.js components through **Settings > Dependencies**. Settings, saved queues, history and managed components normally use `%LOCALAPPDATA%\MediaCrate`, rather than travelling beside the standalone executable.
 
 ## Project resources
 
-- Project page: <https://www.justagwas.com/projects/mediacrate>
-- Download page: <https://www.justagwas.com/projects/mediacrate/download>
+- Project page: <https://www.justagwas.com/projects/mediacrate/>
+- Download page: <https://www.justagwas.com/projects/mediacrate/download/>
 - Documentation: <https://github.com/Justagwas/MediaCrate/wiki>
 - Releases: <https://github.com/Justagwas/MediaCrate/releases>
 
@@ -131,7 +134,7 @@ py MediaCrate.py
 - Windows SmartScreen may display a warning for a new or unsigned release.
 - Obtain MediaCrate only from the official distribution locations:
   - <https://github.com/Justagwas/MediaCrate/releases>
-  - <https://www.justagwas.com/projects/mediacrate/download>
+  - <https://www.justagwas.com/projects/mediacrate/download/>
   - <https://sourceforge.net/projects/mediacrate/>
 - Refer to the repository [Security Policy](https://github.com/Justagwas/MediaCrate/security/policy) for private vulnerability reporting.
 
@@ -147,7 +150,7 @@ Contributions are welcome.
 ## Contact
 
 - Email: [email@justagwas.com](mailto:email@justagwas.com)
-- Website: <https://www.justagwas.com/projects/mediacrate>
+- Website: <https://www.justagwas.com/projects/mediacrate/>
 
 ## License
 
