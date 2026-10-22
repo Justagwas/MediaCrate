@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-import tempfile
+import uuid
 import threading
 import time
 from contextlib import contextmanager
@@ -123,7 +123,8 @@ class StagingCoordinator:
 
     def create(self) -> StagingLease:
         with self.coordinate():
-            path = Path(tempfile.mkdtemp(prefix=PREFIX, dir=self.root))
+            path = self.root / (PREFIX + uuid.uuid4().hex)
+            path.mkdir(exist_ok=False)
             lease = None
             try:
                 lease = self._lease(path)
@@ -161,6 +162,28 @@ class StagingCoordinator:
         except (OSError, ValueError):
             return None
 
+    def _handoff_finished(self, path: Path) -> bool:
+        directory = self.root / "update-state"
+        finished = False
+        try:
+            if not directory.is_dir() or not _plain(directory):
+                return False
+            for record in directory.glob("*.json"):
+                try:
+                    if not _plain(record) or record.stat().st_size > 1024 * 1024:
+                        continue
+                    data = json.loads(record.read_text(encoding="utf-8"))
+                    if (isinstance(data, dict) and data.get("product") == "MediaCrate"
+                            and data.get("staging") == str(path)):
+                        if data.get("state") not in {"success", "consumed", "failed", "aborted"}:
+                            return False
+                        finished = True
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            return False
+        return finished
+
     def cleanup_claim(self, path: Path) -> StagingLease | None:
         try:
             with self.coordinate():
@@ -169,6 +192,8 @@ class StagingCoordinator:
                 try:
                     phase = self._phase(self.directory / f"{path.name}.json")
                     eligible = phase in {"preparing", "prepared", "discarded"}
+                    if phase in {"handoff_pending", "handed_off"}:
+                        eligible = self._handoff_finished(path)
                     return lease if eligible else None
                 finally:
                     if not eligible:

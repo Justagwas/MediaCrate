@@ -157,6 +157,8 @@ def main() -> int:
         QMessageBox.information(None, APP_NAME, message)
         return 0
 
+    controller = None
+    event_loop_exited = False
     try:
         splash.showMessage(
             f"{APP_NAME} is loading...",
@@ -184,11 +186,21 @@ def main() -> int:
             )
             return 1
         controller.run()
+        from PySide6.QtCore import QTimer
+        from mediacrate.ui.update_dialog import show_update_completion
+        QTimer.singleShot(0, controller.window, lambda: show_update_completion(controller.window))
         splash.finish(controller.window)
-        return app.exec()
+        exit_code = app.exec()
+        event_loop_exited = True
+        return exit_code
     finally:
         splash.close()
         instance_guard.release()
+        from mediacrate.update_handoff import abort_pending_update, commit_pending_update
+        if event_loop_exited and controller is not None and controller._update_shutdown and controller._allow_close_after_shutdown:
+            commit_pending_update()
+        else:
+            abort_pending_update()
 
 
 if __name__ == "__main__":

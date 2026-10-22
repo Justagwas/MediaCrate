@@ -61,11 +61,6 @@ class UpdateInstallWorker(BaseWorker):
                         str(message or ""),
                     ),
                 )
-                self.progressChanged.emit(
-                    "update",
-                    99.0,
-                    "Ready to hand off to installer. Waiting for your confirmation...",
-                )
                 with self._decision_lock:
                     if self._stop_event.is_set() or self._state == "canceled":
                         raise InterruptedError("Update operation stopped.")

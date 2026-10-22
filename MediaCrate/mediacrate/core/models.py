@@ -214,6 +214,7 @@ class DownloadSummary:
     cancelled: int
     retried: int
     results: list[DownloadResult] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass(slots=True)

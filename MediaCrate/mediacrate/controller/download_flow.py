@@ -6,7 +6,7 @@ from typing import Protocol
 from PySide6.QtCore import QTimer
 
 from ..core.download_service import normalize_download_state
-from ..core.models import BatchEntry, BatchEntryStatus, DownloadResult, DownloadState, TERMINAL_DOWNLOAD_STATES
+from ..core.models import BatchEntry, BatchEntryStatus, DownloadResult, DownloadState, DownloadSummary, TERMINAL_DOWNLOAD_STATES
 
 _ETA_RE = re.compile(r"\bETA\s+(?P<eta>[^\s|]+)", re.IGNORECASE)
 _SPEED_RE = re.compile(r"(?P<speed>[0-9][0-9.,]*\s*[KMGTPE]?i?B/s|[0-9][0-9.,]*\s*[KMGTPE]?B/s)", re.IGNORECASE)
@@ -42,6 +42,7 @@ class DownloadFlowController(Protocol):
     _batch_stats_dirty: bool
     _overall_progress_dirty: bool
     _pause_resume_dirty: bool
+    _download_dirty_entry_ids: set[str]
 
     def _format_classified_error(self, message: str) -> str: ...
 
@@ -97,6 +98,7 @@ class DownloadFlow:
         controller._batch_stats_dirty = False
         controller._overall_progress_dirty = False
         controller._pause_resume_dirty = False
+        controller._download_dirty_entry_ids = set()
         controller._download_completed_jobs = 0
 
     @staticmethod
@@ -106,9 +108,14 @@ class DownloadFlow:
         batch_stats: bool = False,
         overall_progress: bool = False,
         pause_resume: bool = False,
+        entry_id: str = "",
     ) -> None:
         timer = getattr(controller, "_download_ui_refresh_timer", None)
         if timer is None:
+            if entry_id:
+                entry = controller._batch_entries_by_id.get(entry_id)
+                if entry is not None:
+                    controller.window.update_batch_entry(entry)
             if batch_stats and hasattr(controller, "_update_batch_stats_header"):
                 controller._update_batch_stats_header()
             if overall_progress and hasattr(controller, "_refresh_overall_download_progress"):
@@ -116,6 +123,8 @@ class DownloadFlow:
             if pause_resume and hasattr(controller, "_refresh_single_pause_resume_ui"):
                 controller._refresh_single_pause_resume_ui()
             return
+        if entry_id:
+            controller._download_dirty_entry_ids.add(entry_id)
         controller._batch_stats_dirty = bool(getattr(controller, "_batch_stats_dirty", False) or batch_stats)
         controller._overall_progress_dirty = bool(
             getattr(controller, "_overall_progress_dirty", False) or overall_progress
@@ -126,12 +135,23 @@ class DownloadFlow:
 
     @staticmethod
     def flush_deferred_ui_refresh(controller: DownloadFlowController) -> None:
+        timer = getattr(controller, "_download_ui_refresh_timer", None)
+        if timer is not None:
+            timer.stop()
+        dirty_entry_ids = getattr(controller, "_download_dirty_entry_ids", set())
+        controller._download_dirty_entry_ids = set()
         batch_stats_dirty = bool(getattr(controller, "_batch_stats_dirty", False))
         overall_progress_dirty = bool(getattr(controller, "_overall_progress_dirty", False))
         pause_resume_dirty = bool(getattr(controller, "_pause_resume_dirty", False))
         controller._batch_stats_dirty = False
         controller._overall_progress_dirty = False
         controller._pause_resume_dirty = False
+        if getattr(controller, "_closing", False):
+            return
+        for entry_id in dirty_entry_ids:
+            entry = controller._batch_entries_by_id.get(entry_id)
+            if entry is not None:
+                controller.window.update_batch_entry(entry)
         if batch_stats_dirty:
             controller._update_batch_stats_header()
         if overall_progress_dirty:
@@ -155,6 +175,7 @@ class DownloadFlow:
         entry.error = f"{classified} | {hint}"
         if not controller._is_terminal_batch_state(entry.status):
             entry.status = BatchEntryStatus.FAILED.value
+        getattr(controller, "_download_dirty_entry_ids", set()).discard(mapped_entry_id)
         controller.window.update_batch_entry(entry)
         controller._mark_batch_queue_dirty()
 
@@ -214,6 +235,8 @@ class DownloadFlow:
         identifier = str(job_id or "").strip()
         if not identifier or identifier not in controller._download_progress_by_job:
             return
+        if getattr(controller, "_download_state_by_job", {}).get(identifier) in TERMINAL_DOWNLOAD_STATES:
+            return
         clamped = max(0.0, min(100.0, float(percent)))
         previous = float(controller._download_progress_by_job.get(identifier, 0.0))
         if clamped < previous:
@@ -242,9 +265,11 @@ class DownloadFlow:
             entry.progress_percent = clamped
             if entry.status == BatchEntryStatus.DOWNLOAD_QUEUED.value:
                 entry.status = BatchEntryStatus.DOWNLOADING.value
-            controller.window.update_batch_entry(entry)
-        if progress_changed or ((not bool(getattr(controller, "_active_download_is_multi", False))) and transfer_changed):
-            DownloadFlow.mark_ui_refresh_dirty(controller, overall_progress=True)
+        DownloadFlow.mark_ui_refresh_dirty(
+            controller,
+            entry_id=str(entry.entry_id) if entry is not None else "",
+            overall_progress=progress_changed or (not controller._active_download_is_multi and transfer_changed),
+        )
 
     @staticmethod
     def should_skip_download_status_update(
@@ -309,7 +334,8 @@ class DownloadFlow:
             entry.status = BatchEntryStatus.PAUSED.value
             entry.transfer_eta = ""
             entry.transfer_speed = ""
-        controller.window.update_batch_entry(entry)
+        if normalized not in TERMINAL_DOWNLOAD_STATES:
+            controller.window.update_batch_entry(entry)
 
     @staticmethod
     def apply_download_terminal_entry_state(
@@ -381,6 +407,7 @@ class DownloadFlow:
         DownloadFlow.append_download_status_log(controller, job_url=job_url, normalized=normalized)
         mapped_entry_id = controller._job_to_batch_entry_id.get(identifier, identifier)
         entry = controller._batch_entries_by_id.get(mapped_entry_id)
+        getattr(controller, "_download_dirty_entry_ids", set()).discard(mapped_entry_id)
         DownloadFlow.clear_active_entry_mapping_for_terminal(
             controller,
             mapped_entry_id=mapped_entry_id,
@@ -480,6 +507,34 @@ class DownloadFlow:
             details=detail,
         )
         return updated_entries
+
+    @staticmethod
+    def recover_failed_summary(controller: DownloadFlowController, summary: DownloadSummary) -> DownloadSummary:
+        counts = {state: 0 for state in TERMINAL_DOWNLOAD_STATES}
+        results: list[DownloadResult] = []
+        stopped = bool(getattr(controller, "_download_stop_requested", False))
+        for job_id, state in list(controller._download_state_by_job.items()):
+            normalized = normalize_download_state(state)
+            if normalized not in TERMINAL_DOWNLOAD_STATES:
+                normalized = DownloadState.CANCELLED.value if stopped else DownloadState.ERROR.value
+                DownloadFlow.on_download_status(controller, job_id, normalized)
+                results.append(DownloadResult(
+                    job_id=job_id,
+                    url=controller._download_url_by_job.get(job_id, ""),
+                    state=normalized,
+                    error="" if stopped else summary.error,
+                ))
+            counts[normalized] += 1
+        return DownloadSummary(
+            total=sum(counts.values()),
+            completed=counts[DownloadState.DONE.value],
+            failed=counts[DownloadState.ERROR.value],
+            skipped=counts[DownloadState.SKIPPED.value],
+            cancelled=counts[DownloadState.CANCELLED.value],
+            retried=max(summary.retried, sum(max(0, attempts - 1) for attempts in controller._download_attempts_by_job.values())),
+            results=results,
+            error=summary.error,
+        )
 
     @staticmethod
     def on_download_finished(controller: DownloadFlowController) -> None:

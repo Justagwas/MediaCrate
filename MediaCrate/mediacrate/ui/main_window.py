@@ -2318,19 +2318,22 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         self._apply_dialog_theme(dialog)
-        if dialog.exec() != QDialog.Accepted:
+        if self._exec_dialog(dialog) != QDialog.Accepted:
             return
         text = editor.toPlainText().strip()
         if text:
             self.multiBulkAddRequested.emit(text)
 
     def _on_multi_import_file(self) -> None:
-        selected, _ = QFileDialog.getOpenFileName(
-            self,
-            'Import URL list',
-            str(Path.home()),
-            'Text files (*.txt *.csv);;All files (*.*)',
-        )
+        try:
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                'Import URL list',
+                str(Path.home()),
+                'Text files (*.txt *.csv);;All files (*.*)',
+            )
+        finally:
+            self.restore_cursor_state_after_modal()
         if not selected:
             return
         file_path = Path(selected)
@@ -2376,12 +2379,15 @@ class MainWindow(QMainWindow):
 
     def _on_multi_export(self) -> None:
         default_name = str((Path.home() / "Downloads" / "MediaCrate_urls_export.txt").resolve())
-        selected, _ = QFileDialog.getSaveFileName(
-            self,
-            'Export URLs',
-            default_name,
-            'Text files (*.txt);;All files (*.*)',
-        )
+        try:
+            selected, _ = QFileDialog.getSaveFileName(
+                self,
+                'Export URLs',
+                default_name,
+                'Text files (*.txt);;All files (*.*)',
+            )
+        finally:
+            self.restore_cursor_state_after_modal()
         if not selected:
             return
         self.multiExportRequested.emit(str(selected))
@@ -4631,6 +4637,12 @@ class MainWindow(QMainWindow):
             root.setCursor(Qt.ArrowCursor)
         self._set_interaction_cursors()
 
+    def restore_cursor_state_after_modal(self) -> None:
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        self.refresh_cursor_state()
+        QTimer.singleShot(0, self, self.refresh_cursor_state)
+
     def _apply_dialog_theme(self, widget: QWidget) -> None:
         apply_dialog_theme(
             widget,
@@ -4667,7 +4679,7 @@ class MainWindow(QMainWindow):
         )
 
     def _exec_dialog(self, dialog: QWidget) -> int:
-        return exec_dialog(dialog, on_after=self.refresh_cursor_state)
+        return exec_dialog(dialog, on_after=self.restore_cursor_state_after_modal)
 
     def _show_info_dialog(self, title: str, text: str) -> int:
         return self._exec_dialog(
@@ -4675,11 +4687,14 @@ class MainWindow(QMainWindow):
         )
 
     def _browse_download_location(self) -> None:
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Choose download location",
-            self.download_location_edit.text().strip(),
-        )
+        try:
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Choose download location",
+                self.download_location_edit.text().strip(),
+            )
+        finally:
+            self.restore_cursor_state_after_modal()
         if not selected:
             return
         self.download_location_edit.setText(selected)

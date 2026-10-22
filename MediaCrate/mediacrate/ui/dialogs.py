@@ -9,6 +9,14 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
 from .theme import ThemePalette
 
 
+class RestoreCursorOnHide:
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        restore = getattr(self.parentWidget(), "restore_cursor_state_after_modal", None)
+        if callable(restore):
+            restore()
+
+
 def apply_dialog_theme(
     widget: QWidget,
     theme: ThemePalette,

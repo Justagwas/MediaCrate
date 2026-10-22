@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..update_handoff import arm_update
+
 import hashlib
 import json
 import os
@@ -199,6 +201,7 @@ class PreparedUpdateInstall:
     setup_sha256: str = ""
     setup_size: int = 0
     _ownership: StagingLease | None = field(default=None, repr=False, compare=False)
+    notes: tuple[str, ...] = ()
 
 
 class SelfUpdater:
@@ -323,8 +326,8 @@ class SelfUpdater:
                 progress_cb=progress_cb,
             )
             _ensure_not_stopped(stop_event)
-            _emit_install_progress(progress_cb, percent=96, message="Verifying update package...")
-            _emit_install_progress(progress_cb, percent=98, message="Ready to install update.")
+            _emit_install_progress(progress_cb, percent=100, message="Verifying update package...")
+            _emit_install_progress(progress_cb, percent=100, message="Ready to install update.")
             lease.state("prepared")
         except Exception:
             try:
@@ -349,6 +352,7 @@ class SelfUpdater:
             setup_sha256=check_data.setup_sha256,
             setup_size=check_data.setup_size,
             _ownership=lease,
+            notes=tuple(check_data.notes),
         )
 
     def launch_prepared_update(
@@ -364,11 +368,13 @@ class SelfUpdater:
             with lease.operation():
                 self._verify_prepared_update(prepared)
                 lease.state("handoff_pending")
-                self._launch_installer(
-                    prepared.setup_path,
-                    restart_after_update=bool(restart_after_update),
-                    commit_guard=commit_guard,
-                )
+                if commit_guard is not None and not commit_guard():
+                    raise InterruptedError("Update was canceled before installation.")
+                arm_update(setup_path=prepared.setup_path, sha256=prepared.setup_sha256,
+                           size=prepared.setup_size, version=prepared.latest_version,
+                           current_version=self._app_version, notes=prepared.notes,
+                           install_dir=self._install_dir, mode=self._installer_mode_arg(),
+                           restart=restart_after_update, staging_root=prepared.staging_root)
                 try:
                     lease.state("handed_off")
                 except OSError:
@@ -632,11 +638,11 @@ class SelfUpdater:
                                 )
                             if expected_size > 0:
                                 raw = min(1.0, max(0.0, downloaded / float(expected_size)))
-                                mapped = int(round(raw * 92.0))
+                                mapped = int(round(raw * 100.0))
                                 _emit_install_progress(
                                     progress_cb,
-                                    percent=max(1, min(92, mapped)),
-                                    message=f"Downloading update... {int(round(raw * 100.0))}%",
+                                    percent=max(1, min(100, mapped)),
+                                    message="Downloading update...",
                                 )
                 _ensure_not_stopped(stop_event)
                 actual_size = tmp_path.stat().st_size
@@ -646,7 +652,7 @@ class SelfUpdater:
                 if actual_sha256.lower() != sha256.lower():
                     raise RuntimeError("SHA256 verification failed for downloaded setup installer.")
                 os.replace(tmp_path, destination)
-                _emit_install_progress(progress_cb, percent=94, message="Download complete.")
+                _emit_install_progress(progress_cb, percent=100, message="Download complete.")
                 break
             except InterruptedError:
                 raise
@@ -663,69 +669,7 @@ class SelfUpdater:
                 raise last_error
             raise RuntimeError("Update download failed.")
 
-    def _launch_installer(self, setup_path: Path, *, restart_after_update: bool, commit_guard: Callable[[], bool] | None = None) -> None:
-        if not setup_path.exists():
-            raise RuntimeError("Downloaded setup installer was not found.")
-        mode_arg = self._installer_mode_arg()
-        installer_args = [
-            "/VERYSILENT",
-            "/SP-",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/CLOSEAPPLICATIONS",
-            "/FORCECLOSEAPPLICATIONS",
-            mode_arg,
-            f"/DIR={str(self._install_dir)}",
-        ]
-        if not restart_after_update:
-            installer_args.append("/SKIPLAUNCH")
-        if commit_guard is not None and not commit_guard():
-            raise InterruptedError("Update canceled before installer handoff.")
-        if mode_arg == "/ALLUSERS":
-            self._launch_installer_elevated(setup_path, installer_args)
-            return
-        args = [str(setup_path), *installer_args]
-        creationflags = 0
-        creationflags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        creationflags |= int(getattr(subprocess, "DETACHED_PROCESS", 0))
-        try:
-            subprocess.Popen(args, close_fds=True, creationflags=creationflags)
-        except Exception as exc:
-            raise RuntimeError(f"Unable to launch setup installer. {exc}") from exc
 
-    def _launch_installer_elevated(self, setup_path: Path, installer_args: list[str]) -> None:
-        try:
-            import ctypes
-        except Exception as exc:
-            raise RuntimeError(
-                "Unable to request administrator privileges for all-users update."
-            ) from exc
-        arg_line = subprocess.list2cmdline(installer_args)
-        operation = "runas"
-        show_normal = 1
-        try:
-            result = int(
-                ctypes.windll.shell32.ShellExecuteW(
-                    None,
-                    operation,
-                    str(setup_path),
-                    arg_line,
-                    str(setup_path.parent),
-                    show_normal,
-                )
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Unable to request administrator privileges for all-users update."
-            ) from exc
-        if result <= 32:
-            if result in {5, 1223}:
-                raise RuntimeError(
-                    "Administrator permission was denied. Update canceled for all-users installation."
-                )
-            raise RuntimeError(
-                f"Failed to start elevated installer (ShellExecuteW code {result})."
-            )
 
     def _installer_mode_arg(self) -> str:
         registry_mode = self._installer_mode_arg_from_registry()

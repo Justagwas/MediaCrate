@@ -220,6 +220,7 @@ class AppController(QObject):
         self._batch_queue_snapshot_revision = 0
         self._batch_queue_snapshot_saved_revision = -1
         self._pending_retry_entry_ids: list[str] = []
+        self._download_run_generation = 0
         self._download_history: list[DownloadHistoryEntry] = []
         self._thumbnail_cache = ThumbnailCache(
             max_entries=THUMBNAIL_CACHE_MAX_ENTRIES,
@@ -261,6 +262,7 @@ class AppController(QObject):
         self._metadata_slow_warning_timer.timeout.connect(self._on_metadata_validation_slow_timeout)
         self._metadata_slow_warning_shown = False
         self._closing = False
+        self._update_shutdown = False
         self._request_generation = 0
         self._close_shutdown_pending = False
         self._close_wait_notice_shown = False
@@ -1051,8 +1053,8 @@ class AppController(QObject):
                 continue
         return running
 
-    def _confirm_close_with_active_workers(self) -> bool:
-        running = self._running_worker_threads()
+    def _confirm_close_with_active_workers(self, *, exclude_thread: QThread | None = None) -> bool:
+        running = [thread for thread in self._running_worker_threads() if thread is not exclude_thread]
         if not running:
             return True
         answer = self._ask_yes_no(
@@ -1211,13 +1213,13 @@ class AppController(QObject):
     def _finalize_shutdown_sequence(self) -> None:
         self._close_wait_timer.stop()
         self._close_shutdown_pending = False
-        self._allow_close_after_shutdown = True
         self._close_wait_notice_shown = False
         self._apply_pending_format_selection()
         self._flush_config_save()
         self._save_download_history()
         if hasattr(self, "_thumbnail_flow"):
             self._thumbnail_flow.clear_cache()
+        self._allow_close_after_shutdown = True
 
     def _on_close_wait_tick(self) -> None:
         if not self._close_shutdown_pending:
@@ -1231,6 +1233,8 @@ class AppController(QObject):
         QTimer.singleShot(0, self.window, self.window.close)
 
     def _shutdown_deadline_elapsed(self) -> bool:
+        if getattr(self, "_update_shutdown", False):
+            return False
         started = float(getattr(self, "_close_shutdown_started_at", 0.0) or 0.0)
         if started <= 0:
             return False
@@ -1304,11 +1308,12 @@ class AppController(QObject):
                 return False
             AppController._finalize_close_controller(self)
             return True
-        if not self._confirm_close_during_ffmpeg_install():
-            return False
-        if hasattr(self, "_confirm_close_with_active_workers"):
-            if not self._confirm_close_with_active_workers():
+        if not getattr(self, "_update_shutdown", False):
+            if not self._confirm_close_during_ffmpeg_install():
                 return False
+            if hasattr(self, "_confirm_close_with_active_workers"):
+                if not self._confirm_close_with_active_workers():
+                    return False
         if callable(getattr(self, "_begin_shutdown_sequence", None)):
             self._begin_shutdown_sequence()
         else:
@@ -1390,9 +1395,7 @@ class AppController(QObject):
         )
 
     def _restore_cursor_state(self) -> None:
-        while QApplication.overrideCursor() is not None:
-            QApplication.restoreOverrideCursor()
-        self.window.refresh_cursor_state()
+        self.window.restore_cursor_state_after_modal()
 
     def _exec_dialog(self, dialog: QWidget) -> int:
         return exec_dialog(dialog, on_after=self._restore_cursor_state)
@@ -1860,10 +1863,12 @@ class AppController(QObject):
                 continue
             entry.is_duplicate = False
             changed = True
+            if entry.status not in {BatchEntryStatus.INVALID.value, BatchEntryStatus.VALIDATING.value}:
+                continue
             if self._entry_has_analysis_metadata(entry):
                 entry.status = BatchEntryStatus.VALID.value
                 entry.error = ""
-            elif entry.status == BatchEntryStatus.INVALID.value:
+            else:
                 entry.status = (
                     BatchEntryStatus.VALID.value
                     if self._is_metadata_fetch_disabled()
@@ -3411,7 +3416,7 @@ class AppController(QObject):
         return added
 
     def _start_download_for_entries(self, entries: list[BatchEntry], *, source_label: str) -> None:
-        if not entries:
+        if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False) or not entries:
             return
         if self._is_download_running() and self._active_download_is_multi:
             self._enqueue_entries_into_active_download(entries, source_label=source_label)
@@ -3449,6 +3454,8 @@ class AppController(QObject):
         payload: dict[str, object],
         job_to_entry: dict[str, str] | None,
     ) -> None:
+        self._download_run_generation = getattr(self, "_download_run_generation", 0) + 1
+        self._download_dirty_entry_ids = set()
         active_multi = len(jobs) > 1 or bool(job_to_entry)
         self._download_runtime.initialize_jobs(
             [job.job_id for job in jobs],
@@ -3534,7 +3541,7 @@ class AppController(QObject):
         payload: dict[str, object],
         job_to_entry: dict[str, str] | None = None,
     ) -> None:
-        if getattr(self, "_closing", False) or not jobs:
+        if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False) or not jobs:
             return
         self._download_stop_requested = False
         self._initialize_download_runtime(jobs=jobs, payload=payload, job_to_entry=job_to_entry)
@@ -4029,7 +4036,7 @@ class AppController(QObject):
         return min(clamped, max(1, int(job_count)))
 
     def start_downloads(self) -> None:
-        if getattr(self, "_closing", False):
+        if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False):
             return
         if self._is_download_running():
             return
@@ -4139,20 +4146,32 @@ class AppController(QObject):
         )
         self.window.append_log(f"Failure categories: {summary_text}")
 
-    def _maybe_prompt_retryable_failures(self, retryable_failed_entry_ids: list[str]) -> None:
-        if not retryable_failed_entry_ids:
-            return
+    def _maybe_prompt_retryable_failures(self, retryable_failed_entry_ids: list[str]) -> list[str]:
+        if (not retryable_failed_entry_ids or self._closing
+                or getattr(self, "_download_stop_requested", False) or self._is_download_running()):
+            return []
         if not bool(self.window.download_payload().get("batch_enabled")):
-            return
+            return []
+        retryable_failed_entry_ids = [entry.entry_id for entry in self._collect_retry_entries(retryable_failed_entry_ids)]
+        if not retryable_failed_entry_ids:
+            return []
+        generation = getattr(self, "_download_run_generation", 0)
         answer = self._ask_yes_no(
             "Retry failed items",
             f"{len(retryable_failed_entry_ids)} failed item(s) look retryable.\nRetry them now?",
             default_button=QMessageBox.Yes,
         )
-        if answer == QMessageBox.Yes:
-            self._pending_retry_entry_ids = retryable_failed_entry_ids
+        if (answer == QMessageBox.Yes and not self._closing
+                and not getattr(self, "_download_stop_requested", False)
+                and generation == getattr(self, "_download_run_generation", 0)
+                and not self._is_download_running()
+                and bool(self.window.download_payload().get("batch_enabled"))):
+            return list(retryable_failed_entry_ids)
+        return []
 
     def _on_download_summary(self, summary: DownloadSummary) -> None:
+        if summary.error:
+            summary = DownloadFlow.recover_failed_summary(self, summary)
         self._record_single_completion_state(summary)
         updated_entries = False
         retryable_failed_entry_ids: list[str] = []
@@ -4168,15 +4187,14 @@ class AppController(QObject):
         self._append_download_summary_logs(summary=summary, failed_categories=failed_categories)
         if updated_entries:
             self._mark_batch_queue_dirty()
-        self._maybe_prompt_retryable_failures(retryable_failed_entry_ids)
+        self._pending_retry_entry_ids = retryable_failed_entry_ids
 
-    def _collect_retry_entries(self) -> list[BatchEntry]:
+    def _collect_retry_entries(self, entry_ids: list[str] | None = None) -> list[BatchEntry]:
         retry_entries: list[BatchEntry] = []
         if getattr(self, "_download_stop_requested", False):
             return retry_entries
-        if not self._pending_retry_entry_ids:
-            return retry_entries
-        for entry_id in self._pending_retry_entry_ids:
+        candidates = self._pending_retry_entry_ids if entry_ids is None else entry_ids
+        for entry_id in candidates:
             entry = self._batch_entries_by_id.get(entry_id)
             if entry is not None and entry.status == BatchEntryStatus.FAILED.value:
                 retry_entries.append(entry)
@@ -4189,13 +4207,15 @@ class AppController(QObject):
         self._refresh_single_pause_resume_ui()
         if self._job_to_batch_entry_id:
             self._refresh_batch_entries_view()
-        retry_entries = self._collect_retry_entries()
+        retryable_failed_entry_ids = self._pending_retry_entry_ids
         self._pending_retry_entry_ids = []
         self._download_worker = None
         self._download_thread = None
         self._download_runtime.reset()
         self._request_stale_part_cleanup(reason="post-download")
         self._mark_batch_queue_dirty()
+        retry_ids = self._maybe_prompt_retryable_failures(retryable_failed_entry_ids)
+        retry_entries = self._collect_retry_entries(retry_ids)
         if retry_entries and (not self._is_download_running()):
             self._start_download_for_entries(retry_entries, source_label="retry-failed")
 
@@ -4370,7 +4390,7 @@ class AppController(QObject):
         self.window.append_log(f"Installing {dependency_name}...")
 
     def _start_dependency_install_worker(self, dependency_name: str) -> tuple[QThread, DependencyWorker]:
-        if getattr(self, "_closing", False):
+        if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False):
             return
         thread = QThread(self)
         worker = DependencyWorker(self.dependency_service, dependency_name)
@@ -4393,7 +4413,7 @@ class AppController(QObject):
         return thread, worker
 
     def install_dependency(self, name: str) -> None:
-        if getattr(self, "_closing", False):
+        if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False):
             return
         normalized = str(name or "").strip().lower()
         if normalized not in {"ffmpeg", "node"}:
@@ -4527,9 +4547,39 @@ class AppController(QObject):
         self._dependency_progress_bucket[normalized] = clamped_percent
         self.window.set_download_progress(float(clamped_percent))
 
+    def _update_blocked_reason(self) -> str:
+        if self._is_download_running() or any(thread.isRunning() for thread in self._dependency_threads.values()):
+            return "Finish the current download or installation before installing the update."
+        return ""
+
+    def _confirm_update_install(self) -> bool:
+        if self._closing or self._update_blocked_reason():
+            return False
+        if not self._confirm_close_with_active_workers(exclude_thread=self._update_flow.running_thread()):
+            return False
+        if self._closing or self._update_blocked_reason():
+            return False
+        self._update_shutdown = True
+        return True
+
+    def _abort_update_shutdown(self) -> None:
+        from .update_handoff import abort_pending_update
+        try:
+            abort_pending_update()
+        finally:
+            self._update_shutdown = False
+
     def _request_restart_after_update(self) -> None:
-        self.window.append_log("Installer started. MediaCrate will now close and complete the update...")
-        QTimer.singleShot(150, self.window, self.window.close)
+        QTimer.singleShot(0, self.window, self._close_for_update)
+
+    def _close_for_update(self) -> None:
+        try:
+            if self.window.close() or self._close_shutdown_pending:
+                return
+            message = "MediaCrate could not close to install the update. Please try again."
+        except Exception as exc:
+            message = f"MediaCrate could not finish closing. The update was canceled.\n{exc}"
+        self._update_flow.cancel_install_handoff(message)
 
     @staticmethod
     def _open_external_url(url: str) -> bool:

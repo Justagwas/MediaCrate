@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+
 import sys
 import webbrowser
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..ui.update_dialog import get_update_dialog, ask_update_install_preference, ask_update_handoff, show_update_failure, show_update_notice
 from ..core.config import DEFAULT_DOWNLOAD_URL
 from ..core.models import UpdateCheckResult
 from ..core.update_service import UpdateService
@@ -29,109 +31,12 @@ from ..workers.update_worker import UpdateWorker
 from .request_context import connect_request
 
 
-def _apply_update_dialog_chrome(dialog: QDialog, parent: QWidget | None) -> None:
-    apply_titlebar = getattr(parent, "apply_windows_titlebar_theme", None) if parent is not None else None
-    theme = getattr(parent, "theme", None) if parent is not None else None
-    if theme is not None:
-        apply_dialog_theme(
-            dialog,
-            theme,
-            apply_titlebar_theme=apply_titlebar if callable(apply_titlebar) else None,
-            button_setup=lambda button: button.setCursor(
-                Qt.PointingHandCursor if button.isEnabled() else Qt.ArrowCursor
-            ),
-        )
-    elif callable(apply_titlebar):
-        try:
-            apply_titlebar(dialog)
-        except Exception:
-            pass
-    for checkbox in dialog.findChildren(QCheckBox):
-        checkbox.setCursor(Qt.PointingHandCursor if checkbox.isEnabled() else Qt.ArrowCursor)
-    for view in dialog.findChildren(QAbstractItemView):
-        view.setCursor(Qt.PointingHandCursor if view.isEnabled() else Qt.ArrowCursor)
-    dialog.setCursor(Qt.ArrowCursor)
 
 
-def _apply_update_checkbox_styles(dialog: QDialog, parent: QWidget | None) -> None:
-    theme = getattr(parent, "theme", None) if parent is not None else None
-    if theme is None:
-        return
-    styles: list[SquareCheckBoxStyle] = []
-    for checkbox in dialog.findChildren(QCheckBox):
-        style = SquareCheckBoxStyle(
-            border_color=theme.border,
-            fill_color=theme.accent,
-            check_color=theme.text_primary,
-            size=20,
-            radius=4,
-            parent=checkbox,
-        )
-        checkbox.setStyle(style)
-        styles.append(style)
-    dialog._update_checkbox_styles = styles
 
 
-def _exec_modal(dialog: QDialog, parent: QWidget | None) -> int:
-    try:
-        return int(dialog.exec())
-    finally:
-        refreshed = False
-        refresh_cursor = getattr(parent, "refresh_cursor_state", None) if parent is not None else None
-        if callable(refresh_cursor):
-            try:
-                refresh_cursor()
-                refreshed = True
-            except Exception:
-                pass
-        if not refreshed:
-            while QApplication.overrideCursor() is not None:
-                QApplication.restoreOverrideCursor()
 
 
-class _UpdateInstallProgressDialog(QDialog):
-    canceled = Signal()
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Updating MediaCrate")
-        self.setModal(True)
-        self.setMinimumWidth(420)
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setWindowFlag(Qt.WindowCloseButtonHint, False)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
-        self._title = QLabel("Installing update...", self)
-        layout.addWidget(self._title)
-        self._status = QLabel("Preparing update...", self)
-        self._status.setWordWrap(True)
-        layout.addWidget(self._status)
-        self._progress = QProgressBar(self)
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setFormat("%p%")
-        self._progress.setStyleSheet(
-            "QProgressBar { border: 1px solid #2c2c2c; border-radius: 6px; text-align: center; } "
-            "QProgressBar::chunk { background-color: #19b34b; border-radius: 5px; }"
-        )
-        layout.addWidget(self._progress)
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.addStretch(1)
-        self._cancel_btn = QPushButton("Cancel", self)
-        self._cancel_btn.clicked.connect(self.canceled.emit)
-        buttons.addWidget(self._cancel_btn)
-        layout.addLayout(buttons)
-
-    def set_progress(self, percent: int, message: str) -> None:
-        clamped = max(0, min(100, int(percent)))
-        self._progress.setValue(clamped)
-        status = str(message or "").strip() or "Updating..."
-        self._status.setText(status)
-
-    def set_cancel_enabled(self, enabled: bool) -> None:
-        self._cancel_btn.setEnabled(bool(enabled))
 
 
 class UpdateFlowCoordinator(QObject):
@@ -150,6 +55,8 @@ class UpdateFlowCoordinator(QObject):
     ) -> None:
         super().__init__(owner)
         self._owner = owner
+        owner.window._update_install_gate = owner._update_blocked_reason
+        owner.window._update_install_confirm = owner._confirm_update_install
         self._service = service
         self._current_version = str(current_version or "")
         self._set_update_busy = set_update_busy
@@ -164,7 +71,7 @@ class UpdateFlowCoordinator(QObject):
         self._install_worker: UpdateInstallWorker | None = None
         self._active_install_result: UpdateCheckResult | None = None
         self._pending_install_result: UpdateCheckResult | None = None
-        self._install_progress_dialog: _UpdateInstallProgressDialog | None = None
+        self._install_progress_dialog: QDialog | None = None
         self._close_after_install_handoff = False
         self._manual_request = False
         self._generation = 0
@@ -190,9 +97,7 @@ class UpdateFlowCoordinator(QObject):
         return self._thread
 
     def is_running(self) -> bool:
-        check_running = bool(self._thread and self._thread.isRunning())
-        install_running = bool(self._install_thread and self._install_thread.isRunning())
-        return bool(check_running or install_running)
+        return self._thread is not None or self._install_thread is not None
 
     def stop(self) -> None:
         self._generation += 1
@@ -227,9 +132,8 @@ class UpdateFlowCoordinator(QObject):
         connect_request(worker.errorRaised, self, thread, self._on_update_error, lambda: self._worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         connect_request(worker.finishedSummary, self, thread, self._on_update_summary, lambda: self._worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         worker.finished.connect(thread.quit)
-        connect_request(worker.finished, self, thread, self._on_update_finished, lambda: self._worker is worker)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_update_finished, Qt.ConnectionType.QueuedConnection)
         self._thread = thread
         self._worker = worker
         thread.start()
@@ -237,7 +141,7 @@ class UpdateFlowCoordinator(QObject):
 
     def _on_update_error(self, _job_id: str, error: str) -> None:
         if self._manual_request:
-            self._show_warning("Update check", f"Unable to check for updates.\n{error}")
+            self._on_install_error("check", "Could not check for updates.\n" + error)
 
     def _on_update_summary(self, result: UpdateCheckResult | None) -> None:
         try:
@@ -247,7 +151,7 @@ class UpdateFlowCoordinator(QObject):
                 self._handle_available_update(result)
                 return
             if self._manual_request:
-                self._show_info("Up to date", "You are already on the latest version.")
+                show_update_notice(self._dialog_parent(), "You are up to date", "You are using the latest version of MediaCrate.")
         except Exception as exc:
             if self._manual_request:
                 self._show_warning("Update check", f"Unable to process update response.\n{exc}")
@@ -269,10 +173,7 @@ class UpdateFlowCoordinator(QObject):
             can_install = False
         if result.requires_manual_update:
             minimum_supported = str(result.minimum_supported_version or "1.0.0").strip() or "1.0.0"
-            details_text += (
-                "\n\nYour current version is below the minimum supported "
-                f"auto-update baseline ({minimum_supported})."
-            )
+            details_text += "\n\nThis version needs a manual update. Download and run the latest installer."
         generation = self._generation
         proceed, auto_install = self._ask_update_install_preference(
             latest_version=str(result.latest_version or ""),
@@ -294,163 +195,26 @@ class UpdateFlowCoordinator(QObject):
         self._show_warning("Update check", "No trusted update URL was available.")
 
     def _queue_or_start_install_after_check(self, result: UpdateCheckResult) -> None:
-        thread = self._thread
-        if thread is not None:
-            try:
-                if thread.isRunning():
-                    self._pending_install_result = result
-                    return
-            except RuntimeError:
-                pass
+        if self._thread is not None:
+            self._pending_install_result = result
+            return
         self._pending_install_result = None
         self._start_install(result)
 
-    def _ask_update_install_preference(
-        self,
-        *,
-        latest_version: str,
-        details_text: str = "",
-        install_supported: bool = True,
-    ) -> tuple[bool, bool]:
-        parent = self._dialog_parent()
-        dialog = QDialog(parent)
-        dialog.setModal(True)
-        dialog.setWindowTitle("Update available")
-        if parent is not None:
-            icon = parent.windowIcon()
-            if not icon.isNull():
-                dialog.setWindowIcon(icon)
-        _apply_update_dialog_chrome(dialog, parent)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+    def _ask_update_install_preference(self, *, latest_version: str, details_text: str = "", install_supported: bool = True) -> tuple[bool, bool]:
+        return ask_update_install_preference(self._dialog_parent(), latest_version=latest_version, details_text=details_text, install_supported=install_supported)
 
-        title = QLabel(f"Version {str(latest_version or 'latest')} is available.", dialog)
-        title.setStyleSheet("font: 700 9pt 'Segoe UI';")
-        layout.addWidget(title)
+    def _ask_update_handoff(self, *, version: str, default_restart: bool = True, requires_elevation: bool = False) -> tuple[bool, bool]:
+        return ask_update_handoff(self._dialog_parent(), version=version, default_restart=default_restart, requires_elevation=requires_elevation)
 
-        auto_install_checkbox = QCheckBox("Install update automatically", dialog)
-        auto_install_checkbox.setChecked(bool(install_supported))
-        auto_install_checkbox.setEnabled(bool(install_supported))
-        layout.addWidget(auto_install_checkbox)
-
-        mode_hint = QLabel("", dialog)
-        mode_hint.setWordWrap(True)
-        mode_hint.setStyleSheet("font: 600 8pt 'Segoe UI';")
-
-        def _refresh_hint() -> None:
-            if auto_install_checkbox.isEnabled() and auto_install_checkbox.isChecked():
-                mode_hint.setText(
-                    "MediaCrate will download, verify, install the update, and relaunch automatically."
-                )
-            elif auto_install_checkbox.isEnabled():
-                mode_hint.setText(
-                    "MediaCrate will open the download page so you can install the update manually."
-                )
-            else:
-                mode_hint.setText(
-                    "Automatic install is unavailable here. MediaCrate will open the download page."
-                )
-
-        auto_install_checkbox.toggled.connect(lambda _checked=False: _refresh_hint())
-        _refresh_hint()
-        layout.addWidget(mode_hint)
-
-        extra = str(details_text or "").strip()
-        if extra:
-            details = QLabel(extra, dialog)
-            details.setWordWrap(True)
-            details.setStyleSheet("font: 600 8pt 'Segoe UI';")
-            layout.addWidget(details)
-
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.setSpacing(8)
-        buttons.addStretch(1)
-        later_button = QPushButton("Not now", dialog)
-        continue_button = QPushButton("Update", dialog)
-        continue_button.setDefault(True)
-        buttons.addWidget(later_button)
-        buttons.addWidget(continue_button)
-        layout.addLayout(buttons)
-
-        later_button.clicked.connect(dialog.reject)
-        continue_button.clicked.connect(dialog.accept)
-
-        _apply_update_checkbox_styles(dialog, parent)
-        _apply_update_dialog_chrome(dialog, parent)
-        accepted = _exec_modal(dialog, parent) == QDialog.Accepted
-        auto_install = bool(auto_install_checkbox.isEnabled() and auto_install_checkbox.isChecked())
-        return accepted, auto_install
-
-    def _ask_update_handoff(
-        self,
-        *,
-        version: str,
-        default_restart: bool = True,
-        requires_elevation: bool = False,
-    ) -> tuple[bool, bool]:
-        parent = self._dialog_parent()
-        dialog = QDialog(parent)
-        dialog.setModal(True)
-        dialog.setWindowTitle("Install update")
-        if parent is not None:
-            icon = parent.windowIcon()
-            if not icon.isNull():
-                dialog.setWindowIcon(icon)
-        _apply_update_dialog_chrome(dialog, parent)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
-
-        title = QLabel("Update is ready to install", dialog)
-        title.setStyleSheet("font: 700 9pt 'Segoe UI';")
-        body = QLabel(
-            (
-                f"MediaCrate v{str(version or 'latest')} has been downloaded.\n\n"
-                "The installer will now take over.\n\n"
-                "Click Update to close MediaCrate and begin installation."
-            ),
-            dialog,
-        )
-        body.setWordWrap(True)
-        body.setStyleSheet("font: 600 8pt 'Segoe UI';")
-        uac_hint = QLabel(
-            "Windows may ask for administrator permission to continue this update.",
-            dialog,
-        )
-        uac_hint.setWordWrap(True)
-        uac_hint.setStyleSheet("font: 600 8pt 'Segoe UI';")
-        uac_hint.setVisible(bool(requires_elevation))
-        restart_checkbox = QCheckBox("Restart MediaCrate after update", dialog)
-        restart_checkbox.setChecked(bool(default_restart))
-
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(0, 0, 0, 0)
-        buttons.setSpacing(8)
-        buttons.addStretch(1)
-        abort_button = QPushButton("Abort", dialog)
-        continue_button = QPushButton("Update", dialog)
-        continue_button.setDefault(True)
-        buttons.addWidget(abort_button)
-        buttons.addWidget(continue_button)
-
-        layout.addWidget(title)
-        layout.addWidget(body)
-        layout.addWidget(uac_hint)
-        layout.addWidget(restart_checkbox)
-        layout.addLayout(buttons)
-
-        abort_button.clicked.connect(dialog.reject)
-        continue_button.clicked.connect(dialog.accept)
-
-        _apply_update_checkbox_styles(dialog, parent)
-        _apply_update_dialog_chrome(dialog, parent)
-        accepted = _exec_modal(dialog, parent) == QDialog.Accepted
-        restart_after = bool(restart_checkbox.isChecked())
-        return accepted, restart_after
-
+    @Slot()
     def _on_update_finished(self) -> None:
+        thread = self._thread
+        if thread is not None:
+            if not thread.wait(0):
+                QTimer.singleShot(10, self._on_update_finished)
+                return
+            thread.deleteLater()
         self._worker = None
         self._thread = None
         pending_install = self._pending_install_result
@@ -466,6 +230,7 @@ class UpdateFlowCoordinator(QObject):
             return
         self._set_update_busy(True)
         self._active_install_result = result
+        get_update_dialog(self._dialog_parent()).set_progress(0, "Preparing update...")
         self._show_install_progress_dialog()
         thread = QThread(self._owner)
         worker = UpdateInstallWorker(self._service, result)
@@ -477,49 +242,30 @@ class UpdateFlowCoordinator(QObject):
         connect_request(worker.handoffRequested, self, thread, self._on_install_handoff_requested, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         connect_request(worker.progressChanged, self, thread, self._on_install_progress, lambda: self._install_worker is worker and generation == self._generation and not self._stopped and not getattr(self._owner, "_closing", False))
         worker.finished.connect(thread.quit)
-        connect_request(worker.finished, self, thread, self._on_install_finished, lambda: self._install_worker is worker)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_install_finished, Qt.ConnectionType.QueuedConnection)
         self._install_thread = thread
         self._install_worker = worker
         thread.start()
 
     def _show_install_progress_dialog(self) -> None:
-        dialog = self._install_progress_dialog
-        if dialog is None:
-            parent = self._dialog_parent()
-            dialog = _UpdateInstallProgressDialog(parent)
-            dialog.set_progress(0, "Preparing update...")
+        dialog = get_update_dialog(self._dialog_parent())
+        if not getattr(dialog, "_mediacrate_cancel_connected", False):
             dialog.canceled.connect(self._on_install_cancel_requested)
-            _apply_update_dialog_chrome(dialog, parent)
-            theme = getattr(parent, "theme", None) if parent is not None else None
-            if theme is not None:
-                dialog._progress.setStyleSheet(
-                    "QProgressBar { "
-                    f"border: 1px solid {theme.border}; border-radius: 6px; "
-                    "text-align: center; } "
-                    f"QProgressBar::chunk {{ background-color: {theme.accent}; border-radius: 5px; }}"
-                )
-            self._install_progress_dialog = dialog
-        dialog.set_cancel_enabled(True)
+            dialog._mediacrate_cancel_connected = True
+        self._install_progress_dialog = dialog
         dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def _close_install_progress_dialog(self) -> None:
         dialog = self._install_progress_dialog
-        if dialog is None:
-            return
-        try:
-            dialog.close()
-            dialog.deleteLater()
-        except Exception:
-            pass
         self._install_progress_dialog = None
+        if dialog is not None:
+            dialog.hide()
 
     def _on_install_progress(self, _job_id: str, percent: float, message: str) -> None:
-        self._show_install_progress_dialog()
         dialog = self._install_progress_dialog
+        if dialog is not None and dialog.choice == "cancel":
+            return
         if dialog is None:
             return
         dialog.set_progress(int(round(float(percent))), str(message or ""))
@@ -528,12 +274,11 @@ class UpdateFlowCoordinator(QObject):
         info = payload if isinstance(payload, dict) else {}
         version = str(info.get("version") or "")
         requires_elevation = bool(info.get("requires_elevation", False))
-        self._on_install_progress(
-            "update",
-            99.0,
-            "Ready to hand off to installer. Waiting for your confirmation...",
-        )
         dialog = self._install_progress_dialog
+        if dialog is None or dialog.choice == "cancel":
+            if self._install_worker is not None:
+                self._install_worker.stop()
+            return
         if dialog is not None:
             dialog.set_cancel_enabled(False)
         worker = self._install_worker
@@ -560,38 +305,30 @@ class UpdateFlowCoordinator(QObject):
         worker.stop()
 
     def _on_install_error(self, _job_id: str, error: str) -> None:
-        generation = self._generation
-        self._close_install_progress_dialog()
-        self._show_warning("Update install", f"Unable to install update.\n{error}")
-        if generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
-            return
-        fallback_url = str(DEFAULT_DOWNLOAD_URL or "").strip()
-        if self._active_install_result is not None:
-            fallback_url = str(self._active_install_result.download_url or "").strip() or fallback_url
-        if not fallback_url:
-            return
-        answer = self._ask_yes_no(
-            "Update install",
-            "Would you like to open the download page instead?",
-            default_button=QMessageBox.Yes,
-        )
-        if answer != QMessageBox.Yes or generation != self._generation or self._stopped or getattr(self._owner, "_closing", False):
-            return
+        self.cancel_install_handoff(error)
+
+    def cancel_install_handoff(self, error: str) -> None:
+        self._close_after_install_handoff = False
         try:
-            self._open_url_checked(fallback_url)
-        except Exception as exc:
-            self._show_warning("Update install", f"Unable to open update page.\n{exc}")
+            self._owner._abort_update_shutdown()
+        except (OSError, RuntimeError, ValueError) as exc:
+            error += f"\nUnable to clear the update handoff: {exc}"
+        choice = show_update_failure(self._dialog_parent(), error, retry=not getattr(self._owner, "_closing", False))
+        if choice == "manual":
+            self._open_url_checked(DEFAULT_DOWNLOAD_URL)
+        elif choice == "retry":
+            QTimer.singleShot(0, self._retry_failed_update)
 
     def _on_install_summary(self, payload: object) -> None:
         result = payload if isinstance(payload, dict) else {}
         status = str(result.get("status") or "")
         if status == "canceled":
+            self._owner._abort_update_shutdown()
             self._close_install_progress_dialog()
-            self._show_info("Update canceled", "Update was canceled before installation started.")
             return
         if status == "aborted":
+            self._owner._abort_update_shutdown()
             self._close_install_progress_dialog()
-            self._show_info("Update canceled", "Update was aborted. No installer was launched.")
             return
         if status != "ready":
             return
@@ -603,9 +340,17 @@ class UpdateFlowCoordinator(QObject):
         self._on_install_progress("update", 100.0, message)
         self._close_after_install_handoff = True
 
+    @Slot()
     def _on_install_finished(self) -> None:
-        self._close_install_progress_dialog()
+        thread = self._install_thread
+        if thread is not None:
+            if not thread.wait(0):
+                QTimer.singleShot(10, self._on_install_finished)
+                return
+            thread.deleteLater()
         close_after_handoff = bool(self._close_after_install_handoff)
+        if not close_after_handoff and (self._install_progress_dialog is None or self._install_progress_dialog.state != "failed"):
+            self._close_install_progress_dialog()
         self._close_after_install_handoff = False
         self._active_install_result = None
         self._install_worker = None
@@ -617,7 +362,7 @@ class UpdateFlowCoordinator(QObject):
         try:
             self._request_restart()
         except Exception as exc:
-            self._show_warning("Update install", f"Unable to restart automatically.\n{exc}")
+            self.cancel_install_handoff(f"Unable to close for the update.\n{exc}")
 
     def _set_busy_done(self) -> None:
         try:
@@ -625,3 +370,9 @@ class UpdateFlowCoordinator(QObject):
         except Exception:
             pass
         self._manual_request = False
+
+    def _retry_failed_update(self) -> None:
+        if self._install_worker is not None or self._worker is not None:
+            QTimer.singleShot(100, self._retry_failed_update)
+        elif not self._stopped:
+            self.start_check(manual=True)

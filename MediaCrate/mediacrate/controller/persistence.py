@@ -104,6 +104,7 @@ def deserialize_batch_entry(
     if status in {
         BatchEntryStatus.DOWNLOAD_QUEUED.value,
         BatchEntryStatus.DOWNLOADING.value,
+        BatchEntryStatus.PAUSED.value,
         BatchEntryStatus.VALIDATING.value,
     }:
         status = BatchEntryStatus.VALID.value if syntax_valid else BatchEntryStatus.INVALID.value
@@ -155,6 +156,7 @@ def deserialize_batch_entry(
     if status == BatchEntryStatus.VALID.value and not error and original_status in {
         BatchEntryStatus.DOWNLOADING.value,
         BatchEntryStatus.DOWNLOAD_QUEUED.value,
+        BatchEntryStatus.PAUSED.value,
         BatchEntryStatus.VALIDATING.value,
     }:
         error = "Recovered from previous session."

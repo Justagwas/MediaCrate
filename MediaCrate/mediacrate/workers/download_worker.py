@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .base_worker import BaseWorker
-from ..core.download_service import DownloadService
+from ..core.download_service import DownloadService, sanitize_error_text
 from ..core.models import DownloadJob, DownloadSummary
 
 
@@ -54,7 +54,9 @@ class DownloadWorker(BaseWorker):
             self.finishedSummary.emit(summary)
 
         def on_error(exc: Exception) -> None:
-            self.errorRaised.emit("global", str(exc))
+            message = sanitize_error_text(exc) or "The download worker stopped unexpectedly."
+            if not self._stop_event.is_set():
+                self.errorRaised.emit("global", message)
             self.finishedSummary.emit(
                 DownloadSummary(
                     total=len(self._jobs),
@@ -64,6 +66,7 @@ class DownloadWorker(BaseWorker):
                     cancelled=0,
                     retried=0,
                     results=[],
+                    error=message,
                 )
             )
 
@@ -71,6 +74,7 @@ class DownloadWorker(BaseWorker):
             execute=execute,
             on_result=on_result,
             on_error=on_error,
+            on_interrupted=on_error,
         )
 
     def pause_job(self, job_id: str) -> None:
