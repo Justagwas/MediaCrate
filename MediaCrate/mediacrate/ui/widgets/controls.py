@@ -77,19 +77,6 @@ class ComboPopupDelegate(QStyledItemDelegate):
         painter.drawRect(rect)
 
         left_pad = max(2, int(round(rect.height() * 0.25)))
-        if is_selected:
-            marker_width = max(3, int(round(rect.height() * 0.10)))
-            marker_inset = max(2, int(round(rect.height() * 0.24)))
-            marker_rect = QRect(
-                int(rect.left() + 2),
-                int(rect.top() + max(1, int(round(rect.height() * 0.12)))),
-                marker_width,
-                max(2, int(rect.height() - (marker_inset * 2))),
-            )
-            painter.setBrush(self._accent)
-            painter.drawRoundedRect(QRectF(marker_rect), marker_width / 2.0, marker_width / 2.0)
-            left_pad += marker_width + max(2, int(round(rect.height() * 0.14)))
-
         text_rect = rect.adjusted(left_pad, 0, -max(2, int(round(rect.height() * 0.16))), 0)
         text_color = QColor(self._text_color)
         if not is_enabled:

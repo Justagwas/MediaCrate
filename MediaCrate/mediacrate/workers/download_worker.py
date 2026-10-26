@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base_worker import BaseWorker
 from ..core.download_service import DownloadService, sanitize_error_text
+from ..core.download_results import DownloadResultBuffer
 from ..core.models import DownloadJob, DownloadSummary
 
 
@@ -23,6 +24,7 @@ class DownloadWorker(BaseWorker):
         super().__init__()
         self._service = service
         self._jobs = jobs
+        self.result_buffer = DownloadResultBuffer(jobs)
         self._concurrency = max(1, int(concurrency))
         self._retry_count = max(0, int(retry_count))
         self._retry_profile = str(retry_profile or "basic").strip().lower()
@@ -41,6 +43,7 @@ class DownloadWorker(BaseWorker):
                 progress_cb=self._on_progress,
                 status_cb=self._on_status,
                 log_cb=self._on_log,
+                result_cb=self.result_buffer.record,
                 retry_count=self._retry_count,
                 retry_profile=self._retry_profile,
                 skip_existing_files=self._skip_existing_files,
@@ -51,6 +54,8 @@ class DownloadWorker(BaseWorker):
             )
 
         def on_result(summary: DownloadSummary) -> None:
+            for result in summary.results:
+                self.result_buffer.record(result)
             self.finishedSummary.emit(summary)
 
         def on_error(exc: Exception) -> None:
@@ -65,7 +70,7 @@ class DownloadWorker(BaseWorker):
                     skipped=0,
                     cancelled=0,
                     retried=0,
-                    results=[],
+                    results=self.result_buffer.snapshot(),
                     error=message,
                 )
             )

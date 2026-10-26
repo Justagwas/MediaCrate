@@ -81,11 +81,13 @@ def record_partial_candidates(output_path: str) -> None:
         return
     with _MANIFEST_LOCK:
         paths = _read_manifest()
+        original = paths.copy()
         for candidate in candidates:
             normalized = _normalize_path_value(candidate)
             if normalized:
                 paths.add(normalized)
-        _write_manifest(paths)
+        if paths != original:
+            _write_manifest(paths)
 
 
 def discard_partial_candidates(output_path: str) -> None:

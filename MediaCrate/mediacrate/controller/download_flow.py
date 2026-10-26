@@ -498,23 +498,20 @@ class DownloadFlow:
                 retryable_failed_entry_ids=retryable_failed_entry_ids,
             )
 
-        detail = str(result.error or "").strip()
-        controller._record_download_history(
-            state,
-            url=str(result.url or controller._download_url_by_job.get(job_id, "")),
-            job_id=job_id,
-            output_path=str(result.output_path or ""),
-            details=detail,
-        )
         return updated_entries
 
     @staticmethod
     def recover_failed_summary(controller: DownloadFlowController, summary: DownloadSummary) -> DownloadSummary:
         counts = {state: 0 for state in TERMINAL_DOWNLOAD_STATES}
         results: list[DownloadResult] = []
+        captured = {result.job_id: result for result in summary.results}
         stopped = bool(getattr(controller, "_download_stop_requested", False))
         for job_id, state in list(controller._download_state_by_job.items()):
-            normalized = normalize_download_state(state)
+            result = captured.get(job_id)
+            normalized = normalize_download_state(result.state if result is not None else state)
+            if result is not None:
+                results.append(result)
+                DownloadFlow.on_download_status(controller, job_id, normalized)
             if normalized not in TERMINAL_DOWNLOAD_STATES:
                 normalized = DownloadState.CANCELLED.value if stopped else DownloadState.ERROR.value
                 DownloadFlow.on_download_status(controller, job_id, normalized)

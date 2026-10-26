@@ -26,6 +26,7 @@ from .core.config import (
     save_config,
 )
 from .core.batch_utils import build_download_signature
+from .core.batch_scheduler import effective_batch_concurrency
 from .core.dependency_service import DependencyService, resolve_ffmpeg_binaries
 from .controller import persistence as state_persistence
 from .controller.batch_logic import (
@@ -955,7 +956,7 @@ class AppController(QObject):
                 result_state=normalized_state,
                 output_path=str(output_path or ""),
             )
-            if deleted_count > 0:
+            if deleted_count > 0 and not getattr(self, "_closing", False):
                 self.window.append_log(
                     f"History disabled: deleted {deleted_count} unfinished .part file(s)."
                 )
@@ -968,10 +969,46 @@ class AppController(QObject):
             output_path=str(output_path or ""),
             details=str(details or ""),
         )
+        if getattr(self, "_history_batch_active", False):
+            self._history_batch_entries.append(new_entry)
+            return
         self._download_history.insert(0, new_entry)
         self._download_history = self._download_history[:HISTORY_MAX_ENTRIES]
         self._save_download_history()
         self._refresh_history_view()
+
+    def _persist_download_results(self, results: list[DownloadResult], *, save: bool = True) -> None:
+        recorded = getattr(self, "_download_recorded_job_ids", None)
+        if recorded is None:
+            recorded = self._download_recorded_job_ids = set()
+        self._history_batch_active = True
+        self._history_batch_entries: list[DownloadHistoryEntry] = []
+        try:
+            for result in results:
+                if result.job_id in recorded:
+                    continue
+                self._record_download_history(
+                    result.state,
+                    url=result.url or self._download_url_by_job.get(result.job_id, ""),
+                    job_id=result.job_id,
+                    output_path=result.output_path,
+                    details=result.error,
+                )
+                recorded.add(result.job_id)
+        finally:
+            self._history_batch_active = False
+        if self._history_batch_entries:
+            self._download_history = [*reversed(self._history_batch_entries), *self._download_history][:HISTORY_MAX_ENTRIES]
+            self._history_batch_entries = []
+            if save:
+                self._save_download_history()
+            if not getattr(self, "_closing", False):
+                self._refresh_history_view()
+
+    def _flush_download_result_buffer(self, *, save: bool = True) -> None:
+        buffer = getattr(self, "_download_result_buffer", None)
+        if buffer is not None:
+            self._persist_download_results(buffer.snapshot(), save=save)
 
     def _stop_dependency_workers(self) -> None:
         for worker in list(self._dependency_workers.values()):
@@ -1216,6 +1253,7 @@ class AppController(QObject):
         self._close_wait_notice_shown = False
         self._apply_pending_format_selection()
         self._flush_config_save()
+        self._flush_download_result_buffer(save=False)
         self._save_download_history()
         if hasattr(self, "_thumbnail_flow"):
             self._thumbnail_flow.clear_cache()
@@ -3496,20 +3534,20 @@ class AppController(QObject):
             self.window.append_log(
                 f"Balanced batch scheduling: {requested_concurrency} -> {effective_concurrency}"
             )
-        return effective_concurrency, speed_limit_kbps
+        return max(1, requested_concurrency), speed_limit_kbps
 
     def _create_download_worker(
         self,
         *,
         jobs: list[DownloadJob],
         payload: dict[str, object],
-        effective_concurrency: int,
+        requested_concurrency: int,
         speed_limit_kbps: int,
     ) -> DownloadWorker:
         return DownloadWorker(
             self.download_service,
             jobs,
-            effective_concurrency,
+            requested_concurrency,
             retry_count=int(payload.get("batch_retry_count", self.config.batch_retry_count)),
             retry_profile=str(payload.get("retry_profile", self.config.retry_profile or RetryProfile.BASIC.value)),
             skip_existing_files=bool(payload.get("skip_existing_files", self.config.skip_existing_files)),
@@ -3545,7 +3583,7 @@ class AppController(QObject):
             return
         self._download_stop_requested = False
         self._initialize_download_runtime(jobs=jobs, payload=payload, job_to_entry=job_to_entry)
-        effective_concurrency, speed_limit_kbps = self._resolve_download_worker_runtime_settings(
+        requested_concurrency, speed_limit_kbps = self._resolve_download_worker_runtime_settings(
             payload=payload,
             job_count=len(jobs),
         )
@@ -3553,9 +3591,11 @@ class AppController(QObject):
         worker = self._create_download_worker(
             jobs=jobs,
             payload=payload,
-            effective_concurrency=effective_concurrency,
+            requested_concurrency=requested_concurrency,
             speed_limit_kbps=speed_limit_kbps,
         )
+        self._download_result_buffer = worker.result_buffer
+        self._download_recorded_job_ids = set()
         self._connect_download_worker(thread=thread, worker=worker)
         self.window.append_log("Downloading...")
         self._download_thread = thread
@@ -4024,16 +4064,9 @@ class AppController(QObject):
         return bool(self._probe_thread and self._probe_thread.isRunning())
 
     def _effective_batch_concurrency(self, requested: int, job_count: int, *, speed_limit_kbps: int, adaptive_enabled: bool) -> int:
-        clamped = max(1, int(requested))
-        if (not adaptive_enabled) or job_count <= 1:
-            return min(clamped, max(1, int(job_count)))
-        if speed_limit_kbps > 0:
-            return min(clamped, 2, max(1, int(job_count)))
-        if job_count >= 24:
-            return min(clamped, 6)
-        if job_count >= 12:
-            return min(clamped, 5)
-        return min(clamped, max(1, int(job_count)))
+        return effective_batch_concurrency(
+            requested, job_count, speed_limit_kbps=speed_limit_kbps, adaptive_enabled=adaptive_enabled,
+        )
 
     def start_downloads(self) -> None:
         if getattr(self, "_closing", False) or getattr(self, "_update_shutdown", False):
@@ -4170,8 +4203,12 @@ class AppController(QObject):
         return []
 
     def _on_download_summary(self, summary: DownloadSummary) -> None:
+        if getattr(self, "_closing", False):
+            self._persist_download_results(summary.results)
+            return
         if summary.error:
             summary = DownloadFlow.recover_failed_summary(self, summary)
+        self._persist_download_results(summary.results)
         self._record_single_completion_state(summary)
         updated_entries = False
         retryable_failed_entry_ids: list[str] = []
@@ -4201,6 +4238,7 @@ class AppController(QObject):
         return retry_entries
 
     def _on_download_finished(self) -> None:
+        self._flush_download_result_buffer()
         DownloadFlow.on_download_finished(self)
         self._refresh_overall_download_progress()
         self.window.set_controls_busy(False)

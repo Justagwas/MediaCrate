@@ -48,6 +48,46 @@ SingleProgressCallback = Callable[[float, str], None]
 BatchProgressCallback = Callable[[str, float, str], None]
 StatusCallback = Callable[[str, str], None]
 LogCallback = Callable[[str], None]
+_FINAL_PATH_PREFIX = "MEDIACRATE_FINAL_PATH:"
+
+
+def _normalized_output_path(path: str) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+class _DownloadAttempt:
+    def __init__(self) -> None:
+        self.output_path = ""
+        self.final_path = ""
+        self.last_error = ""
+        self.skipped_paths: set[str] = set()
+        self.tracked_paths: set[str] = set()
+        self._seen_paths: set[str] = set()
+
+    def track(self, path: str, *, final: bool = False) -> None:
+        if not path:
+            return
+        if path not in self._seen_paths:
+            normalized = _normalized_output_path(path)
+            if normalized not in self.tracked_paths:
+                self.tracked_paths.add(normalized)
+                record_partial_candidates(normalized)
+            self._seen_paths.add(path)
+        self.output_path = path
+        if final:
+            self.final_path = path
+
+    @property
+    def resolved_path(self) -> str:
+        return self.final_path or self.output_path
+
+    @property
+    def skipped_final(self) -> bool:
+        return bool(self.resolved_path and _normalized_output_path(self.resolved_path) in self.skipped_paths)
+
+    def discard_partials(self) -> None:
+        for path in self.tracked_paths:
+            discard_partial_candidates(path)
 
 _IMPORTANT_LOG_TOKENS = (
     "error:",
@@ -1242,15 +1282,11 @@ class DownloadService:
         self._active_metadata_processes: set[subprocess.Popen[str]] = set()
         self._active_lock = threading.Lock()
         self._control_condition = threading.Condition()
-        self._control_change_counter = 0
         self._active_job_processes: dict[str, subprocess.Popen[str]] = {}
         self._paused_job_ids: set[str] = set()
         self._stopped_job_ids: set[str] = set()
         self._batch_lock = threading.Lock()
-        self._active_batch_queue: queue.Queue[object] | None = None
-        self._active_batch_pending_jobs = 0
         self._active_batch_status_cb: StatusCallback | None = None
-        self._active_batch_accepting = False
         self._batch_scheduler: BatchScheduler | None = None
 
     def enqueue_batch_job(self, job: DownloadJob) -> bool:
@@ -1276,7 +1312,6 @@ class DownloadService:
 
     def _notify_control_changed(self) -> None:
         with self._control_condition:
-            self._control_change_counter += 1
             self._control_condition.notify_all()
 
     def _wait_for_retry_window(
@@ -1801,7 +1836,7 @@ class DownloadService:
             "--print",
             "before_dl:filepath",
             "--print",
-            "after_move:filepath",
+            f"after_move:{_FINAL_PATH_PREFIX}%(filepath)j",
         ]
 
         ffmpeg_path, ffprobe_path = resolve_ffmpeg_binaries()
@@ -2002,24 +2037,33 @@ class DownloadService:
         line: object,
         *,
         log_cb: LogCallback | None,
-        last_error: str,
-        output_path: str,
-        saw_already_downloaded: bool,
-    ) -> tuple[str, str, bool, str]:
+        attempt: _DownloadAttempt,
+    ) -> str:
         clean = sanitize_error_text(line)
         if not clean:
-            return last_error, output_path, saw_already_downloaded, ""
+            return ""
+        if clean.startswith(_FINAL_PATH_PREFIX):
+            try:
+                path = json.loads(clean[len(_FINAL_PATH_PREFIX):])
+                if isinstance(path, str):
+                    attempt.track(path, final=True)
+            except (TypeError, ValueError):
+                pass
+            return ""
         if log_cb and _is_important_log_line(clean):
             log_cb(clean)
-        if "has already been downloaded" in clean.lower():
-            saw_already_downloaded = True
+        skipped = re.match(r"^\[download\]\s+(.+) has already been downloaded", clean, re.IGNORECASE)
+        if skipped:
+            path = skipped.group(1).strip().strip('"')
+            attempt.skipped_paths.add(_normalized_output_path(path))
+            attempt.track(path)
+            return clean
         candidate_path = self._parse_output_path_from_line(clean)
         if candidate_path:
-            output_path = candidate_path
-            record_partial_candidates(output_path)
-            return last_error, output_path, saw_already_downloaded, clean
-        last_error = clean
-        return last_error, output_path, saw_already_downloaded, clean
+            attempt.track(candidate_path)
+        else:
+            attempt.last_error = clean
+        return clean
 
     def _resolve_terminal_result(
         self,
@@ -2027,30 +2071,24 @@ class DownloadService:
         *,
         return_code: int,
         progress_cb: SingleProgressCallback | None,
-        saw_already_downloaded: bool,
-        output_path: str,
-        last_error: str,
+        attempt: _DownloadAttempt,
     ) -> DownloadResult:
         if return_code == 0:
             if progress_cb:
                 progress_cb(100.0, "Done")
-            discard_partial_candidates(output_path)
-            if saw_already_downloaded:
-                return self._make_result(job, state=DownloadState.SKIPPED.value, output_path=output_path)
-            return self._make_result(job, state=DownloadState.DONE.value, output_path=output_path)
+            attempt.discard_partials()
+            state = DownloadState.SKIPPED.value if attempt.skipped_final else DownloadState.DONE.value
+            return self._make_result(job, state=state, output_path=attempt.resolved_path)
         return self._make_result(
             job,
             state=DownloadState.ERROR.value,
-            output_path=output_path,
-            error=_friendly_format_error(job, last_error or f"yt-dlp exited with {return_code}"),
+            output_path=attempt.resolved_path,
+            error=_friendly_format_error(job, attempt.last_error or f"yt-dlp exited with {return_code}"),
         )
 
     @staticmethod
     def _is_rename_collision_result(result: DownloadResult) -> bool:
-        if result.state == DownloadState.SKIPPED.value:
-            return True
-        error = sanitize_error_text(result.error).lower()
-        return bool(error and ("already been downloaded" in error or "already exists" in error))
+        return result.state == DownloadState.SKIPPED.value
 
     def _run_with_rename_retries(
         self,
@@ -2095,7 +2133,7 @@ class DownloadService:
         speed_limit_kbps: int = 0,
     ) -> DownloadResult:
         output_template_for_part_tracking = ""
-        tracked_output_paths: set[str] = set()
+        attempt = _DownloadAttempt()
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
         force_no_overwrite = normalized_conflict_policy == "rename"
         try:
@@ -2110,12 +2148,8 @@ class DownloadService:
             )
         except Exception as exc:
             return self._make_result(job, state=DownloadState.ERROR.value, error=str(exc))
-        tracked_output_paths.add(output_template_for_part_tracking)
-        record_partial_candidates(output_template_for_part_tracking)
-
-        output_path = ""
-        last_error = ""
-        saw_already_downloaded = False
+        attempt.track(output_template_for_part_tracking)
+        attempt.output_path = ""
         post_processing_notified = False
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -2156,10 +2190,10 @@ class DownloadService:
                 interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
                 if interrupt_state == DownloadState.CANCELLED.value:
                     self._kill_process_tree(process)
-                    return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=output_path)
+                    return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=attempt.resolved_path)
                 if interrupt_state == DownloadState.PAUSED.value:
                     self._kill_process_tree(process)
-                    return self._make_result(job, state=DownloadState.PAUSED.value, output_path=output_path)
+                    return self._make_result(job, state=DownloadState.PAUSED.value, output_path=attempt.resolved_path)
 
                 try:
                     queued_line = line_queue.get(timeout=0.1)
@@ -2171,15 +2205,11 @@ class DownloadService:
                     break
                 line = str(queued_line or "")
 
-                last_error, output_path, saw_already_downloaded, clean = self._consume_download_line(
+                clean = self._consume_download_line(
                     line,
                     log_cb=log_cb,
-                    last_error=last_error,
-                    output_path=output_path,
-                    saw_already_downloaded=saw_already_downloaded,
+                    attempt=attempt,
                 )
-                if output_path:
-                    tracked_output_paths.add(output_path)
                 if (not post_processing_notified) and _is_post_processing_line(clean):
                     post_processing_notified = True
                     if progress_cb:
@@ -2198,20 +2228,15 @@ class DownloadService:
             return_code = process.wait()
             interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
             if interrupt_state:
-                return self._make_result(job, state=interrupt_state, output_path=output_path)
+                return self._make_result(job, state=interrupt_state, output_path=attempt.resolved_path)
             return self._resolve_terminal_result(
                 job,
                 return_code=return_code,
                 progress_cb=progress_cb,
-                saw_already_downloaded=saw_already_downloaded,
-                output_path=output_path,
-                last_error=last_error,
+                attempt=attempt,
             )
         finally:
             self._unregister_process(process, job.job_id)
-            if process.poll() == 0:
-                for tracked_path in tracked_output_paths:
-                    discard_partial_candidates(tracked_path)
             try:
                 if process.stdout:
                     process.stdout.close()
@@ -2297,36 +2322,28 @@ class DownloadService:
         normalized_conflict_policy = normalize_conflict_policy(conflict_policy)
         if normalized_conflict_policy == "rename" and int(rename_number) > 0:
             output_template = _with_rename_number(output_template, int(rename_number))
-        record_partial_candidates(output_template)
+        attempt = _DownloadAttempt()
+        attempt.track(output_template)
+        attempt.output_path = ""
         rate_limit = max(0, int(speed_limit_kbps))
 
-        output_path = ""
-        last_error = ""
-        saw_already_downloaded = False
-        tracked_output_paths = {output_template}
-
-        def capture_output_candidate(payload: object) -> None:
-            nonlocal output_path
+        def capture_output_candidate(payload: object, *, final: bool = False) -> None:
             if not isinstance(payload, dict):
                 return
-            for key in ("filename", "filepath", "tmpfilename", "_filename"):
+            for key in ("tmpfilename", "_filename", "filename", "filepath"):
                 value = str(payload.get(key) or "").strip()
                 if value:
-                    output_path = value
-                    tracked_output_paths.add(output_path)
-                    record_partial_candidates(output_path)
-                    break
+                    attempt.track(value, final=final and key == "filepath")
+
+        def postprocessor_hook(payload: dict[str, Any]) -> None:
+            if payload.get("status") == "finished":
+                capture_output_candidate(
+                    payload.get("info_dict"),
+                    final=payload.get("postprocessor") == "MoveFilesAfterDownload",
+                )
 
         def consume_message(message: object) -> str:
-            nonlocal last_error, saw_already_downloaded, output_path
-            last_error, output_path, saw_already_downloaded, clean = self._consume_download_line(
-                message,
-                log_cb=log_cb,
-                last_error=last_error,
-                output_path=output_path,
-                saw_already_downloaded=saw_already_downloaded,
-            )
-            return clean
+            return self._consume_download_line(message, log_cb=log_cb, attempt=attempt)
 
         class _YdlLogger:
             def __init__(self) -> None:
@@ -2377,6 +2394,7 @@ class DownloadService:
             "format": selector,
             "outtmpl": output_template,
             "progress_hooks": [progress_hook],
+            "postprocessor_hooks": [postprocessor_hook],
             "logger": logger,
         }
         final_ext = _final_output_extension(job.format_choice)
@@ -2439,39 +2457,35 @@ class DownloadService:
             with YoutubeDL(ydl_opts) as ydl:
                 result_code = int(ydl.download([coerce_http_url(job.url)]))
         except _InProcessCancelled:
-            return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=output_path)
+            return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=attempt.resolved_path)
         except _InProcessPaused:
-            return self._make_result(job, state=DownloadState.PAUSED.value, output_path=output_path)
+            return self._make_result(job, state=DownloadState.PAUSED.value, output_path=attempt.resolved_path)
         except Exception as exc:
             error_text = sanitize_error_text(exc)
             if _INPROCESS_CANCELLED_SENTINEL in error_text:
-                return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=output_path)
+                return self._make_result(job, state=DownloadState.CANCELLED.value, output_path=attempt.resolved_path)
             if _INPROCESS_PAUSED_SENTINEL in error_text:
-                return self._make_result(job, state=DownloadState.PAUSED.value, output_path=output_path)
-            fallback_error = logger.last_error_text or last_error or error_text
+                return self._make_result(job, state=DownloadState.PAUSED.value, output_path=attempt.resolved_path)
+            fallback_error = logger.last_error_text or attempt.last_error or error_text
             return self._make_result(
                 job,
                 state=DownloadState.ERROR.value,
-                output_path=output_path,
+                output_path=attempt.resolved_path,
                 error=_friendly_format_error(job, fallback_error),
             )
 
         interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
         if interrupt_state:
-            return self._make_result(job, state=interrupt_state, output_path=output_path)
+            return self._make_result(job, state=interrupt_state, output_path=attempt.resolved_path)
 
-        fallback_error = logger.last_error_text or last_error or f"yt-dlp exited with {result_code}"
+        fallback_error = logger.last_error_text or attempt.last_error or f"yt-dlp exited with {result_code}"
+        attempt.last_error = fallback_error
         result = self._resolve_terminal_result(
             job,
             return_code=result_code,
             progress_cb=progress_cb,
-            saw_already_downloaded=saw_already_downloaded,
-            output_path=output_path,
-            last_error=fallback_error,
+            attempt=attempt,
         )
-        if result.state in {DownloadState.DONE.value, DownloadState.SKIPPED.value}:
-            for tracked_path in tracked_output_paths:
-                discard_partial_candidates(tracked_path)
         return result
 
     def _run_single_inprocess(
@@ -2577,28 +2591,13 @@ class DownloadService:
             speed_limit_kbps=speed_limit_kbps,
         )
 
-    @staticmethod
-    def _batch_take_next_item(
-        jobs_queue: queue.Queue[object],
-        *,
-        stop_sentinel: object,
-    ) -> tuple[DownloadJob | None, bool]:
-        current_item = jobs_queue.get()
-        if current_item is stop_sentinel:
-            jobs_queue.task_done()
-            return None, True
-        if not isinstance(current_item, DownloadJob):
-            jobs_queue.task_done()
-            return None, False
-        return current_item, False
-
     def _batch_interrupt_or_requeue(
         self,
         *,
         job: DownloadJob,
         cancel_token: threading.Event,
         status_cb: StatusCallback | None,
-        jobs_queue: queue.Queue[object],
+        jobs_queue: BatchScheduler,
     ) -> tuple[DownloadResult | None, bool]:
         interrupt_state = self._resolve_interrupt_state(job.job_id, cancel_token)
         if interrupt_state == DownloadState.CANCELLED.value:
@@ -2663,7 +2662,7 @@ class DownloadService:
         self,
         *,
         job: DownloadJob,
-        jobs_queue: queue.Queue[object],
+        jobs_queue: BatchScheduler,
         cancel_token: threading.Event,
         progress_cb: BatchProgressCallback | None,
         status_cb: StatusCallback | None,
@@ -2762,27 +2761,6 @@ class DownloadService:
                 )
             retried_attempts_increment += 1
 
-    def _batch_complete_job(
-        self,
-        *,
-        count_as_complete: bool,
-        jobs_queue: queue.Queue[object],
-        stop_sentinel: object,
-        max_workers: int,
-    ) -> int:
-        pending_after_complete = -1
-        if count_as_complete:
-            with self._batch_lock:
-                self._active_batch_pending_jobs = max(0, self._active_batch_pending_jobs - 1)
-                pending_after_complete = self._active_batch_pending_jobs
-        if pending_after_complete == 0:
-            with self._batch_lock:
-                self._active_batch_accepting = False
-            for _ in range(max_workers):
-                jobs_queue.put(stop_sentinel)
-            self._notify_control_changed()
-        return pending_after_complete
-
     @staticmethod
     def _batch_store_result(
         *,
@@ -2794,11 +2772,6 @@ class DownloadService:
         with ordered_results_lock:
             ordered_results[job_id] = result
 
-    def _batch_wait_for_control_change(self, *, cancel_token: threading.Event) -> None:
-        with self._control_condition:
-            if not cancel_token.is_set():
-                self._control_condition.wait(timeout=0.1)
-
     def run_batch(
         self,
         jobs: list[DownloadJob],
@@ -2808,6 +2781,7 @@ class DownloadService:
         progress_cb: BatchProgressCallback | None = None,
         status_cb: StatusCallback | None = None,
         log_cb: LogCallback | None = None,
+        result_cb: Callable[[DownloadResult], None] | None = None,
         retry_count: int = 0,
         retry_profile: str = RetryProfile.BASIC.value,
         skip_existing_files: bool = False,
@@ -2832,13 +2806,14 @@ class DownloadService:
         progress_cb = safe_callback(progress_cb)
         status_cb = safe_callback(status_cb)
         log_cb = safe_callback(log_cb)
+        result_cb = safe_callback(result_cb)
 
         job_ids = {str(job.job_id or "").strip() for job in jobs if str(job.job_id or "").strip()}
         with self._active_lock:
             self._stopped_job_ids.difference_update(job_ids)
             self._paused_job_ids.difference_update(job_ids)
 
-        max_workers = max(1, min(int(concurrency), len(jobs)))
+        max_workers = max(1, int(concurrency))
         normalized_retry_profile = normalize_retry_profile(retry_profile)
         max_retries = retry_limit_for_profile(
             retry_count=max(0, int(retry_count)),
@@ -2848,7 +2823,10 @@ class DownloadService:
         ordered_results_lock = threading.Lock()
         retried_attempts_counter = [0]
         retried_attempts_lock = threading.Lock()
-        scheduler = BatchScheduler(self._control_condition, cancel_token, self._resolve_interrupt_state)
+        scheduler = BatchScheduler(
+            self._control_condition, cancel_token, self._resolve_interrupt_state,
+            concurrency=max_workers, speed_limit_kbps=speed_limit_kbps,
+        )
         jobs_queue = scheduler
         for job in jobs:
             if scheduler.reserve(job):
@@ -2910,6 +2888,8 @@ class DownloadService:
                     job_id=current.job_id,
                     result=result,
                 )
+                if result_cb:
+                    result_cb(result)
                 try:
                     if status_cb:
                         status_cb(current.job_id, normalize_download_state(result.state))
@@ -2924,9 +2904,6 @@ class DownloadService:
 
         with self._batch_lock:
             self._batch_scheduler = None
-            self._active_batch_accepting = False
-            self._active_batch_queue = None
-            self._active_batch_pending_jobs = 0
             self._active_batch_status_cb = None
 
         with self._active_lock:

@@ -28,7 +28,7 @@ class UpdateDialog(RestoreCursorOnHide, QDialog):
         self._gate_timer = QTimer(self)
         self._gate_timer.setInterval(250)
         self._gate_timer.timeout.connect(self._refresh_gate)
-        self.setWindowTitle(PRODUCT + " updates")
+        self.setWindowTitle("Updates")
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         self.setWindowIcon(parent.windowIcon())
@@ -128,7 +128,8 @@ QLabel#title {{ font: 700 {9 * scale:.1f}pt 'Segoe UI'; }}
 QLabel#detail {{ color: {palette['muted']}; }}
 QCheckBox {{ background: transparent; color: {palette['text']}; font: 600 {9 * scale:.1f}pt 'Segoe UI'; }}
 QPushButton {{ background: {palette['bg']}; color: {palette['text']}; border: 1px solid {palette['border']}; border-radius: {round(6 * scale)}px; padding: {round(5 * scale)}px {round(10 * scale)}px; font: 600 {9.5 * scale:.1f}pt 'Segoe UI'; min-height: {round(24 * scale)}px; }}
-QPushButton:hover, QPushButton:focus {{ background: {palette['accent']}; color: {palette['text']}; }}
+QPushButton:focus {{ border-color: {palette['accent']}; }}
+QPushButton:hover {{ background: {palette['accent']}; color: {palette['text']}; }}
 QPushButton:disabled {{ background: {palette['disabled']}; color: {palette['disabled_text']}; }}
 QPushButton#manualDownloadLink {{ background: transparent; color: {palette['text']}; border: 1px solid transparent; border-radius: 0; padding: {round(2 * scale)}px; font: 600 {8 * scale:.1f}pt 'Segoe UI'; text-decoration: underline; }}
 QPushButton#manualDownloadLink:hover, QPushButton#manualDownloadLink:focus {{ color: {palette['accent']}; border-color: {palette['accent']}; }}

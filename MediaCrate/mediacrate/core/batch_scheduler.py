@@ -3,8 +3,23 @@ from collections import deque
 from .models import DownloadState
 
 
+def effective_batch_concurrency(requested: int, job_count: int, *, speed_limit_kbps: int = 0,
+                                adaptive_enabled: bool = True) -> int:
+    limit = max(1, int(requested))
+    count = max(1, int(job_count))
+    if adaptive_enabled and count > 1:
+        if speed_limit_kbps > 0:
+            limit = min(limit, 2)
+        elif count >= 24:
+            limit = min(limit, 6)
+        elif count >= 12:
+            limit = min(limit, 5)
+    return min(limit, count)
+
+
 class BatchScheduler:
-    def __init__(self, condition, cancel_token, interrupt_state) -> None:
+    def __init__(self, condition, cancel_token, interrupt_state, *, concurrency: int = 1,
+                 speed_limit_kbps: int = 0) -> None:
         self.condition = condition
         self.cancel_token = cancel_token
         self.interrupt_state = interrupt_state
@@ -14,6 +29,8 @@ class BatchScheduler:
         self.jobs = {}
         self.pending = 0
         self.accepting = True
+        self.concurrency = concurrency
+        self.speed_limit_kbps = speed_limit_kbps
 
     def reserve(self, job) -> bool:
         with self.condition:
@@ -40,7 +57,10 @@ class BatchScheduler:
                     if key not in self.in_flight and self.interrupt_state(key, self.cancel_token) != DownloadState.PAUSED.value:
                         self.ready.append(job)
                         del self.parked[key]
-                while self.ready:
+                limit = effective_batch_concurrency(
+                    self.concurrency, len(self.jobs), speed_limit_kbps=self.speed_limit_kbps,
+                )
+                while self.ready and len(self.in_flight) < limit:
                     job = self.ready.popleft()
                     if self.interrupt_state(job.job_id, self.cancel_token) == DownloadState.PAUSED.value:
                         self.parked[job.job_id] = job
